@@ -121,6 +121,16 @@ function validate_serial_loops(names = String[])
     rr = serial_compare(Meta.parse(src_ret))
     check(!isempty(rr.serial) && relerr(rr.cpu, rr.gpu) <= 1e-13 && maximum(abs.(rr.cpu)) > 0, "returned scalar: the adjoint of an argument the loop assigns reaches the return (rel $(relerr(rr.cpu, rr.gpu)))")
 
+    # live-out scalars must have a value when the loop starts. The generator always hoists a definition, so this is a unit test of the gate itself
+    gate(src, v) = (kn = STADE.parse_kernel(Meta.parse(src)); lp = first(st for st in kn.body if st.kind == :for); STADE.cgen_serial_defined_before(kn.body, lp.body, v, Set(kn.sig.args)))
+    g_top = "function g1(x, y, n)\n    acc = 0.0\n    for i = 1:n\n        acc = acc + x[i]\n        y[i] = acc\n    end\n    return nothing\nend"
+    g_if = "function g2(x, y, n, f)\n    if f > 0\n        acc = 1.0\n    else\n        acc = 2.0\n    end\n    for i = 1:n\n        acc = acc + x[i]\n        y[i] = acc\n    end\n    return nothing\nend"
+    g_after = "function g3(x, y, n)\n    for i = 1:n\n        y[i] = x[i]\n    end\n    acc = 0.0\n    return nothing\nend"
+    check(gate(g_top, :acc) === true, "defined-before: a scalar set at the top level before the loop passes")
+    check(gate(g_if, :acc) === false, "defined-before: a scalar set only in the arms of an if before the loop fails")
+    check(gate(g_after, :acc) === false, "defined-before: a scalar set only after the loop fails")
+    check(gate(g_top, :n) === true && gate(g_top, :x) === true, "defined-before: a function argument passes")
+
     # 4: nest
     nest = Meta.parse(src_nest)
     rs = serial_compare(nest)
