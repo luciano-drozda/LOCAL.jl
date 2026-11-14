@@ -16737,8 +16737,17 @@ function val_generate_baseline(kernel, primal_expr::Expr;
                                 self_check::Bool = true, self_check_trials::Int = 2,
                                 self_check_epsilon::Float64 = 1e-6, self_check_rtol::Float64 = 1e-3,
                                 max_output_magnitude::Float64 = 1e6,
-                                divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing)
+                                divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing,
+                                int_pin::Union{Dict{Symbol,Int},Nothing} = nothing)
     divisible_by = divisible_by === nothing ? val_corpus_int_constraints(kernel.sig.name) : divisible_by
+# int_pin fixes the named integer arguments in every draw. int_lo and int_hi only bound a draw: the upper end is halved after each divergent
+# candidate, so a range that a kernel diverges on collapses to 1 (br_cg1d2 with 100 to 200 gave n = 1). A pinned argument is never narrowed.
+    if int_pin !== nothing
+        for a in keys(int_pin)
+            get(kernel.sig.kinds, a, :none) == :scalar_int ||
+                error("val_generate_baseline: int_pin names `$a`, which is not an integer scalar argument of $(kernel.sig.name)")
+        end
+    end
     primal_fn = val_compile(primal_expr)
     obs_fn = self_check ? val_compile(val_primal_observing_expr(kernel, primal_expr)) : nothing
     tangent_fn = self_check ? val_compile(val_build_tangent(kernel)) : nothing
@@ -16767,6 +16776,7 @@ function val_generate_baseline(kernel, primal_expr::Expr;
     cur_hi = int_hi
     for attempt in 1:attempts
         int_args = val_random_int_args(kernel.sig; lo = min(int_lo, cur_hi), hi = cur_hi, divisible_by = divisible_by)
+        int_pin === nothing || for (a, v) in int_pin; int_args[a] = v; end
         try
             grown = val_grow_shapes(kernel, primal_fn, int_args; start = grow_start, max_size = grow_max)
             values = val_random_values(kernel, grown.shapes, int_args; scale = scale, idx_cap = grown.idx_cap)
@@ -18768,12 +18778,13 @@ function stade_generate_baseline_file(in_path::String; yaml_path::Union{String,N
                                        scale::Float64 = 1.0, int_lo::Int = 3, int_hi::Int = 5,
                                        grow_max::Int = 512,
                                        self_check::Bool = true,
-                                       divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing)
+                                       divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing,
+                                       int_pin::Union{Dict{Symbol,Int},Nothing} = nothing)
     primal_expr = io_read_corpus_entry(in_path)
     kernel = parse_kernel(primal_expr)
     baseline = val_generate_baseline(kernel, primal_expr; scale = scale, int_lo = int_lo, int_hi = int_hi,
                                       grow_max = grow_max,
-                                      self_check = self_check, divisible_by = divisible_by)
+                                      self_check = self_check, divisible_by = divisible_by, int_pin = int_pin)
     yp = yaml_path === nothing ? io_default_yaml_path(in_path) : yaml_path
     io_write_baseline_yaml(yp, kernel.sig.name, baseline.int_args, baseline.values)
     return yp

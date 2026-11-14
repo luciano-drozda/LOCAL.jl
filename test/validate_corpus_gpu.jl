@@ -240,7 +240,7 @@ function gval_check_backend(kernel, int_args::Dict, values::Dict, seeds::Vector,
                              gen_out, plan_init, plan_gen, stack_arg_names::Vector{Symbol},
                              wrap, dev_to_host, atomic_macro;
                              mode::Symbol = :adjoint,
-                             tan_seeds::Vector = Any[], shtan_seeds::Vector = Any[], truth::Bool = false)
+                             tan_seeds::Vector = Any[], shtan_seeds::Vector = Any[], truth::Bool = false, truth_on_fail::Bool = false)
     cpu_gen_expr = mode == :hvp ? gen_out.hvp : gen_out.adjoint
     for h in vcat(get(plan_init, :helpers, Expr[]), get(plan_gen, :helpers, Expr[]))
         Core.eval(Main, h)
@@ -282,7 +282,9 @@ function gval_check_backend(kernel, int_args::Dict, values::Dict, seeds::Vector,
 
     max_err = 0.0
     n_changed = 0
-    tr_cpu = 0.0; tr_dev = 0.0; tr_ran = truth
+    # truth: BigFloat truth of every trial. truth_on_fail: only of a trial whose device result differs from the CPU one by more than rtol
+    want_truth = truth || truth_on_fail
+    tr_cpu = 0.0; tr_dev = 0.0; tr_ran = want_truth
     for (i_seed, seed) in enumerate(seeds)
         dvals = mode == :hvp ? tan_seeds[i_seed] : Dict{Symbol,Any}()
         dsd   = mode == :hvp ? shtan_seeds[i_seed] : Dict{Symbol,Any}()
@@ -307,11 +309,6 @@ function gval_check_backend(kernel, int_args::Dict, values::Dict, seeds::Vector,
                                for (a, ct) in cpu_tracked)
         ret_cpu = Base.invokelatest(cpu_gen_fn, cpu_args..., stacks_cpu...)
         ret_dev = Base.invokelatest(dev_gen_fn, dev_args..., stacks_dev...)
-        if truth && tr_ran
-            ec, ed, okb = gval_truth_trial(kernel, int_args, values, seed, gen_out, cpu_gen_expr, mode, dvals, dsd, stack_arg_names, cpu_tracked, dev_tracked, dev_to_host, ret_cpu, ret_dev, n_ret, get(plan_gen, :fresh, Symbol[]))
-            okb ? ((tr_cpu = max(tr_cpu, ec)); (tr_dev = max(tr_dev, ed))) : (tr_ran = false)
-        end
-
         m, n = gval_compare(cpu_tracked, dev_tracked, dev_to_host, pre)
         n_changed += n
         if n_ret > 0
@@ -322,9 +319,13 @@ function gval_check_backend(kernel, int_args::Dict, values::Dict, seeds::Vector,
             end
         end
         max_err = max(max_err, m)
+        if want_truth && tr_ran && (truth || m > rtol)
+            ec, ed, okb = gval_truth_trial(kernel, int_args, values, seed, gen_out, cpu_gen_expr, mode, dvals, dsd, stack_arg_names, cpu_tracked, dev_tracked, dev_to_host, ret_cpu, ret_dev, n_ret, get(plan_gen, :fresh, Symbol[]))
+            okb ? ((tr_cpu = max(tr_cpu, ec)); (tr_dev = max(tr_dev, ed))) : (tr_ran = false)
+        end
     end
     # the verdict of the BigFloat truth, as in the scripts of the GPU validators: at most 20 times the CPU error, or 1e-10, and never below rtol
-    truth_ok = truth && tr_ran && n_changed > 0 && tr_dev <= max(rtol, 20 * tr_cpu, 1.0e-10)
+    truth_ok = want_truth && tr_ran && n_changed > 0 && tr_dev <= max(rtol, 20 * tr_cpu, 1.0e-10)
     return (ok = max_err <= rtol && n_changed > 0, max_rel_err = max_err, rtol = rtol,
             elements_changed = n_changed, vacuous = n_changed == 0, truth_ok = truth_ok, tr_cpu = tr_cpu, tr_dev = tr_dev)
 end
@@ -340,7 +341,12 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
                               fresh_gradient::Bool = false,
-                              jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64, truth::Bool = false)
+                              jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
+                              truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}())
+    # truth: :off, :on_fail (the BigFloat truth decides a trial that differs from the CPU by more than rtol), :always; true and false mean :always and :off
+    tmode = truth === true ? :always : truth === false ? :off : truth
+    tmode in (:off, :on_fail, :always) || error("validate_corpus_gpu: truth must be a Bool or one of :off, :on_fail, :always, not $(repr(truth))")
+    want_truth = tmode != :off
     for f in readdir(dir)
         if endswith(f, "_b.jl") || endswith(f, "_d.jl") || endswith(f, "_hv.jl") ||
            endswith(f, ".yaml") || endswith(f, ".gpu.yaml") ||
@@ -357,6 +363,14 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
     jacc_atomic_macro = Expr(:., :Atomix, QuoteNode(Symbol("@atomic")))
 
     results = NamedTuple[]
+    # int_pin names integer arguments to fix; each kernel takes the pins it has, and a pin that no kernel in the run has is an error
+    pins_of = Dict{String,Dict{Symbol,Int}}()
+    for name in names
+        k0 = STADE.parse_kernel(STADE.io_read_corpus_entry(joinpath(dir, name * ".jl")))
+        pins_of[name] = Dict{Symbol,Int}(a => v for (a, v) in int_pin if get(k0.sig.kinds, a, :none) == :scalar_int)
+    end
+    unused = setdiff(keys(int_pin), union(Set{Symbol}(), (keys(d) for d in values(pins_of))...))
+    isempty(unused) || error("validate_corpus_gpu: int_pin names $(sort(collect(unused))), which no kernel in this run has as an integer argument")
     for name in names
         path = joinpath(dir, name * ".jl")
         # own namespace, not the CPU oracles' shared `.yaml` -- validate_zerotrip.jl
@@ -368,10 +382,14 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --
         # stencil_loss's adjoint was exact at i_n = 4 and wrong, differently on each run, from
         # i_n = 256 up. See test/validate_write_overlap.jl for the static gate on the same defect.
-        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max)
+        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
         primal_expr = STADE.io_read_corpus_entry(path)
         kernel = STADE.parse_kernel(primal_expr)
         baseline = STADE.io_read_baseline_yaml(yp)
+        # a baseline left by an earlier run keeps its own sizes: refuse it instead of validating a draw that is not the pinned one
+        for (a, v) in pins_of[name]
+            baseline.int_args[a] == v || error("validate_corpus_gpu: $yp holds $a = $(baseline.int_args[a]), not the pinned $v; delete it")
+        end
         STADE.val_coerce_int_arrays!(kernel, baseline.values)
 
         for mode in modes
@@ -424,8 +442,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                 r = gval_check_backend(kernel, baseline.int_args, baseline.values, seeds,
                                         gen_out, plan_init, plan_gen, stack_arg_names,
                                         CuArray, Array, cuda_backend.atomic_macro;
-                                        mode, tan_seeds, shtan_seeds, truth)
-                push!(results, (kernel = name, mode = mode, backend = :cuda, status = (r.ok || (truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, via_truth = !r.ok && truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
+                                        mode, tan_seeds, shtan_seeds, truth = tmode == :always, truth_on_fail = tmode == :on_fail)
+                push!(results, (kernel = name, mode = mode, backend = :cuda, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ","), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
             catch e
                 println("  !! ", name, " [", mode, "/cuda] ", first(sprint(showerror, e), 4000))
                 push!(results, (kernel = name, mode = mode, backend = :cuda, status = :gen_error, max_rel_err = NaN, elements_changed = 0))
@@ -456,8 +474,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                 r = gval_check_backend(kernel, baseline.int_args, baseline.values, seeds,
                                         gen_out, plan_init, plan_gen, stack_arg_names,
                                         x -> JACC.array(x), x -> JACC.to_host(x), jacc_atomic_macro;
-                                        mode, tan_seeds, shtan_seeds, truth)
-                push!(results, (kernel = name, mode = mode, backend = :jacc, status = (r.ok || (truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, via_truth = !r.ok && truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
+                                        mode, tan_seeds, shtan_seeds, truth = tmode == :always, truth_on_fail = tmode == :on_fail)
+                push!(results, (kernel = name, mode = mode, backend = :jacc, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ","), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
             catch e
                 println("  !! ", name, " [", mode, "/jacc] ", first(sprint(showerror, e), 4000))
                 push!(results, (kernel = name, mode = mode, backend = :jacc, status = :gen_error, max_rel_err = NaN, elements_changed = 0))
@@ -469,7 +487,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
     for r in results
         println(rpad("$(r.kernel) [$(r.mode)/$(r.backend)]", 38), " ", r.status,
                 isnan(r.max_rel_err) ? "" : "  max_rel_err=$(round(r.max_rel_err, sigdigits = 4))",
-                "  changed=$(r.elements_changed)")
+                "  changed=$(r.elements_changed)",
+                hasproperty(r, :ints) ? "  rtol=$(round(r.rtol, sigdigits = 3)) tr_cpu=$(round(r.tr_cpu, sigdigits = 3)) tr_dev=$(round(r.tr_dev, sigdigits = 3)) via_truth=$(r.via_truth) ints=$(r.ints)" : "")
     end
     bad = count(r -> r.status != :ok, results)
     println("\n", length(results) - bad, "/", length(results), " checks passed",
