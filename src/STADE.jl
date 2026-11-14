@@ -10196,6 +10196,145 @@ function cgen_kernel_def_ok(build)
     end
 end
 
+# ---- serial track: an order-dependent loop run by one device thread ----
+# A loop the gates keep on the host because its iterations must run in order (a recurrence, an in-place sweep, a running sum read in its own loop)
+# costs one scalar device access per array element it touches, about 10 us each on a V100. The same loop in ONE device thread runs in source order,
+# so its result is the host result, at about 0.15 us per element. The track applies to a loop with no parallel loop inside it (an inner loop that
+# would become a kernel keeps its host form: one thread would lose that parallelism). Scalars go in by value as kernel arguments. A scalar the loop
+# assigns and that a later statement reads comes back in one UInt64 box, one device-to-host copy per launch, holding the bits of the value.
+# cgen_body leaves a marker around the loop; cgen_serial_apply, the last pass of stade_gpu, turns it into the kernel and the launch, so no earlier
+# pass sees the kernel. Only a loop that assigns no boxed scalar qualifies: a boxed name is a device array, and a one-thread write to it is not a plain assignment.
+cgen_serial_stages() = (:scalar, :accread, :array, :rmw, :overlap, :kernel_def)
+cgen_serial_marker_name() = Symbol("@__stade_serial")
+
+# names a body reads before they are certainly assigned: the scalars (and arrays) the kernel must receive. `defined` holds the names assigned on every path so far.
+function cgen_serial_live_in(body::Vector{NamedTuple}, defined::Set{Symbol}, out::Set{Symbol})
+    defined = copy(defined)
+    note(vars) = for v in vars; v in defined || push!(out, v); end
+    for st in body
+        if st.kind == :assign
+            note(cgen_read_vars(st.rhs))
+            st.lhs isa Expr && note(cgen_read_vars(st.lhs))
+            st.lhs isa Symbol && push!(defined, st.lhs)
+        elseif st.kind == :if
+            note(cgen_read_vars(st.cond))
+            dt = cgen_serial_live_in(st.then, defined, out)
+            de = cgen_serial_live_in(st.els, defined, out)
+            defined = intersect(dt, de)
+        elseif st.kind == :for
+            note(cgen_read_vars(st.lo)); note(cgen_read_vars(st.hi)); note(cgen_read_vars(st.step))
+            # a loop may run zero times: what its body assigns is not certain afterwards
+            cgen_serial_live_in(st.body, union(defined, Set([st.var])), out)
+        elseif st.kind == :while
+            note(cgen_read_vars(st.cond))
+            cgen_serial_live_in(st.body, defined, out)
+        else
+            error("cgen_serial_live_in: unsupported statement kind $(st.kind)")
+        end
+    end
+    return defined
+end
+
+# `v` has a value on the host when the loop starts: a function argument, or assigned at the top level of an enclosing body before the statement holding the loop.
+# The copy-back statement reads `v` to learn its type, so a name that fails this test keeps the loop on the host.
+function cgen_serial_defined_before(root_body, target_body, v::Symbol, fn_args::Set{Symbol})
+    v in fn_args && return true
+    path = ii_find_ancestor_path(root_body, target_body, false)
+    path === nothing && return false
+    for (body, idx, _) in path
+        any(st -> st.kind == :assign && st.lhs === v, body[1:idx-1]) && return true
+    end
+    return false
+end
+
+function cgen_serial_plan(stmt, owner::Symbol, backend, reduce_vars::Set{Symbol}, fn_args::Set{Symbol}, box_reads::Set{Symbol}, boxable::Set{Symbol}, outer_defs, known_consts, root_body, reduction_threshold::Int, depth::Int)
+    cgen_contains_stackop(stmt.body) && return nothing
+    # the inner loops, host form, with the serial track off: a kernel or a reduction in there means a parallel loop the one thread would serialize
+    sk = Expr[]; sdec = NamedTuple[]
+    inner_backend = merge(backend, (serial_loops = false,))
+    body_exprs = cgen_body(stmt.body, sk, owner, inner_backend, copy(reduce_vars), fn_args; reduction_threshold, outer_defs, outer_known_consts = known_consts, root_body, decisions = sdec, boxable, box_reads, depth = depth + 1)
+    (isempty(sk) && all(d -> d.verdict === :host, sdec)) || return nothing
+    assigned = cgen_all_assigned_scalars(stmt.body)
+    boxed = union(reduce_vars, box_reads, get(backend, :serial_boxed, Set{Symbol}()))
+    isempty(intersect(assigned, boxed)) || return nothing
+    live_in = Set{Symbol}()
+    note(vars) = for v in vars; push!(live_in, v); end
+    note(cgen_read_vars(stmt.lo)); note(cgen_read_vars(stmt.hi)); note(cgen_read_vars(stmt.step))
+    cgen_serial_live_in(stmt.body, Set([stmt.var]), live_in)
+    delete!(live_in, stmt.var)
+    escapes = ii_escapes_nested(root_body, stmt.body, assigned)
+    outs = sort(collect(intersect(assigned, escapes)); by = string)
+    all(v -> cgen_serial_defined_before(root_body, stmt.body, v, fn_args), outs) || return nothing
+    args = sort(collect(union(live_in, outs)); by = string)
+    inner = NamedTuple[merge(d, (verdict = :serial,)) for d in sdec]
+    return (body = body_exprs, args = args, outs = outs, assigned = assigned, inner = inner)
+end
+
+cgen_serial_marker(stmt, plan) = Expr(:macrocall, cgen_serial_marker_name(), nothing, QuoteNode((args = plan.args, outs = plan.outs)),
+                                      emit_forloop(stmt.var, stmt.lo, stmt.hi, stmt.step, plan.body))
+
+# the marker's loop without its allowscalar wrappers: inside a kernel every statement is a device statement
+function cgen_serial_strip(e, asc)
+    e isa Expr || return e
+    if e.head === :macrocall
+        e.args[1] == asc || error("cgen_serial_apply: a serial loop holds the macro `$(e.args[1])`, which the kernel cannot take")
+        return Expr(:block, Any[cgen_serial_strip(a, asc) for a in e.args[3:end]]...)
+    end
+    return Expr(e.head, Any[cgen_serial_strip(a, asc) for a in e.args]...)
+end
+
+cgen_serial_helper_exprs() = Expr[
+    :(__stade_so_pack(v::Float64) = reinterpret(UInt64, v)),
+    :(__stade_so_pack(v::Integer) = reinterpret(UInt64, Int64(v))),
+    :(__stade_so_unpack(like::Float64, u::UInt64) = reinterpret(Float64, u)),
+    :(__stade_so_unpack(like::Integer, u::UInt64) = typeof(like)(reinterpret(Int64, u)))]
+
+# Last pass of stade_gpu with serial_loops: every marker becomes a one-thread kernel and its launch. Returns (host, kernels, helpers).
+function cgen_serial_apply(host::Expr, kernels::Vector{Expr}, backend)
+    (host.head === :function && length(host.args) == 2 && host.args[2] isa Expr && host.args[2].head === :block) || return (host, kernels, Expr[])
+    hname = host.args[1].args[1]
+    base = endswith(string(hname), backend.suffix) ? string(hname)[1:end-length(backend.suffix)] : string(hname)
+    newk = copy(kernels)
+    count = Ref(0)
+    uses_box = Ref(false)
+    function rewrite(e)
+        e isa Expr || return e
+        if e.head === :macrocall && e.args[1] === cgen_serial_marker_name()
+            meta = e.args[3].value
+            count[] += 1
+            n = count[]
+            kname = Symbol(backend.kernel_tag * "_serial_" * base * "_" * string(n) * "!")
+            boxn = Symbol("__so_", n); valn = Symbol("__sv_", n)
+            kargs = Any[meta.args...]
+            kbody = Any[cgen_serial_strip(e.args[4], backend.allowscalar_macro)]
+            stmts = Any[]
+            if !isempty(meta.outs)
+                uses_box[] = true
+                push!(kargs, :__so)
+                for (k, v) in enumerate(meta.outs)
+                    push!(kbody, Expr(:(=), Expr(:ref, :__so, k), Expr(:call, :__stade_so_pack, v)))
+                end
+                push!(stmts, Expr(:(=), boxn, Expr(:call, Expr(:curly, backend.arrtype, :UInt64), :undef, length(meta.outs))))
+            end
+            push!(kbody, emit_return_nothing())
+            push!(newk, Expr(:function, Expr(:call, kname, kargs...), Expr(:block, kbody...)))
+            largs = Any[meta.args...]
+            isempty(meta.outs) || push!(largs, boxn)
+            push!(stmts, Expr(:macrocall, backend.launch_macro, nothing, Expr(:(=), backend.threads_kw, 1), Expr(:(=), backend.blocks_kw, 1), Expr(:call, kname, largs...)))
+            if !isempty(meta.outs)
+                push!(stmts, Expr(:(=), valn, Expr(:call, :Array, boxn)))
+                for (k, v) in enumerate(meta.outs)
+                    push!(stmts, Expr(:(=), v, Expr(:call, :__stade_so_unpack, v, Expr(:ref, valn, k))))
+                end
+            end
+            return Expr(:block, stmts...)
+        end
+        return Expr(e.head, Any[rewrite(a) for a in e.args]...)
+    end
+    newhost = rewrite(host)
+    return (newhost, newk, uses_box[] ? cgen_serial_helper_exprs() : Expr[])
+end
+
 # ---- host-side body walk: splits device kernels off ----
 # Host-side body walk: splits off one device kernel per eligible iteration-independent loop; anything left over runs as ordinary host-side
 # Julia, wrapped in one allowscalar_macro block if a touched statement reads a device array (confirmed live-GPU crash otherwise).
@@ -10516,6 +10655,11 @@ function cgen_body(body::Vector{NamedTuple}, kernels::Vector{Expr}, owner::Symbo
             stage === :ok && !cgen_liveout_is_zeroed(stmt, root_body, cgen_collect_loop_vars(root_body, Set{Symbol}()), synth === nothing ? Dict{Symbol,Any}() : synth, gate.saveonly) && (stage = :liveout)
             eligible = stage === :ok
             verdict = :host
+            # serial track (stade_gpu(...; serial_loops = true)): a loop the gates keep on the host for its order, with no parallel loop inside, runs in one device thread
+            serial = nothing
+            if !eligible && local_red === nothing && get(backend, :serial_loops, false) === true && stage in cgen_serial_stages()
+                serial = cgen_serial_plan(stmt, owner, backend, reduce_vars, fn_args, box_reads, boxable, outer_defs, known_consts, root_body, reduction_threshold, depth)
+            end
             if eligible
                 red = cgen_idiomatic_scalar_reduction(stmt.body, stmt.var; hdr = stmt)
                 verdict = red !== nothing ? :reduction : :kernel
@@ -10610,6 +10754,11 @@ function cgen_body(body::Vector{NamedTuple}, kernels::Vector{Expr}, owner::Symbo
                                           cgen_trip_count(stmt.lo, stmt.step, stmt.hi),
                                           min(reduction_threshold, cgen_local_reduction_threshold())),
                                      Any[loop_branch], red_branch))
+            elseif serial !== nothing
+                verdict = :serial
+                push!(exprs, cgen_serial_marker(stmt, serial))
+                decisions === nothing || append!(decisions, serial.inner)
+                get(backend, :serial_log, nothing) === nothing || push!(backend.serial_log, serial.assigned)
             else
                 push!(exprs, emit_forloop(stmt.var, stmt.lo, stmt.hi, stmt.step, cgen_body(stmt.body, kernels, owner, backend, reduce_vars, fn_args; reduction_threshold, outer_defs, outer_known_consts = known_consts, root_body, decisions, boxable, box_reads, depth = depth + 1)))
             end
@@ -12066,7 +12215,10 @@ function cgen_emit(gk, backend; reduction_threshold::Int = cgen_reduction_thresh
     outer_defs = cgen_scalar_def_map(gk.body)
     decisions = NamedTuple[]
     boxable = cgen_boxable_locals(gk.body, fn_args)
-    host_body = cgen_body(gk.body, kernels, gk.name, backend, reduce_vars, fn_args; reduction_threshold, outer_defs, decisions, boxable)
+    # serial track: the loops it takes record what they assign (serial_log), and may not assign a scalar that ends up boxed (serial_boxed, filled by the extra pass below)
+    serial_on = get(backend, :serial_loops, false) === true
+    sbackend = serial_on ? merge(backend, (serial_log = Set{Symbol}[], serial_boxed = Set{Symbol}())) : backend
+    host_body = cgen_body(gk.body, kernels, gk.name, sbackend, reduce_vars, fn_args; reduction_threshold, outer_defs, decisions, boxable)
     # a loop that reads a boxed name needs the second pass (see cgen_box_read_names); one that reads none keeps the first
     box_reads = Set{Symbol}()
     settled = false
@@ -12077,9 +12229,19 @@ function cgen_emit(gk, backend; reduction_threshold::Int = cgen_reduction_thresh
         end
         box_reads = copy(reduce_vars)
         kernels = Expr[]; reduce_vars = Set{Symbol}(); decisions = NamedTuple[]
-        host_body = cgen_body(gk.body, kernels, gk.name, backend, reduce_vars, fn_args; reduction_threshold, outer_defs, decisions, boxable, box_reads)
+        serial_on && (sbackend = merge(backend, (serial_log = Set{Symbol}[], serial_boxed = Set{Symbol}())))
+        host_body = cgen_body(gk.body, kernels, gk.name, sbackend, reduce_vars, fn_args; reduction_threshold, outer_defs, decisions, boxable, box_reads)
     end
     settled || error("cgen_emit: the set of boxed scalars did not settle for $(gk.name)")
+    if serial_on && any(a -> !isempty(intersect(a, reduce_vars)), sbackend.serial_log)
+        # a serial loop assigns a scalar that another loop boxed: run the pass again with the final boxed set closed to the serial track
+        rv0 = copy(reduce_vars)
+        sbackend = merge(backend, (serial_log = Set{Symbol}[], serial_boxed = copy(rv0)))
+        kernels = Expr[]; reduce_vars = Set{Symbol}(); decisions = NamedTuple[]
+        host_body = cgen_body(gk.body, kernels, gk.name, sbackend, reduce_vars, fn_args; reduction_threshold, outer_defs, decisions, boxable, box_reads)
+        reduce_vars == rv0 || error("cgen_emit: the serial track changed the boxed scalars of $(gk.name)")
+        any(a -> !isempty(intersect(a, reduce_vars)), sbackend.serial_log) && error("cgen_emit: a serial loop of $(gk.name) assigns a boxed scalar")
+    end
     host_body = Any[cgen_host_box_refs(st, reduce_vars, backend.allowscalar_macro) for st in host_body]
     isempty(kernels) || pushfirst!(host_body, :(nthread_per_block = 256))
     # Every scalar cross-thread reduction free var must already be a 1-element device array
@@ -18530,7 +18692,7 @@ function cgen_colblock_apply(host::Expr, kernels::Vector{Expr}, backend; minN::I
 end
 
 function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(),
-                   warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, init_hosts = nothing)
+                   warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, init_hosts = nothing, serial_loops::Bool = false)
     shared_private === false && (backend = merge(backend, (shared_private = false,)))
     coarsen > 1 && backend.kernel_tag == "cuda" && (backend = merge(backend, (coarsen = Int(coarsen), coarsen_min = Int(coarsen_min), coarsen_fill = Int(coarsen_fill), coarsen_occ = Float64(coarsen_occ))))
     shared_private isa Bool || (backend = merge(backend, (private_min_ratio = Int(shared_private),)))
@@ -18539,6 +18701,9 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
     sync_free_reduce || (backend = merge(backend, (sync_free_reduce = false,)))
     reduce_block || (backend = merge(backend, (reduce_block = false,)))
     p = precision === nothing ? backend.default_precision : precision
+    # the serial track is written for CUDA and Float64: its UInt64 box holds the bits of a Float64
+    serial_on = serial_loops && backend.kernel_tag == "cuda" && p === Float64
+    serial_on && (backend = merge(backend, (serial_loops = true,)))
     if backend.precision_locked && p !== backend.default_precision
         error("stade_gpu: backend `$(backend.kernel_tag)` only supports precision=$(backend.default_precision) (got $(p)) -- $(backend.precision_lock_reason)")
     end
@@ -18558,16 +18723,18 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
     backend.kernel_tag == "cuda" && split_reduce >= 2 && ((host, kernels) = cgen_split_apply(host, kernels, Int(split_reduce), backend; min_inner = Int(split_min_inner), max_out = Int(split_max_out), gather = Int(split_gather), fallback = Int(split_fallback), coalesce = split_coalesce))
     backend.kernel_tag == "cuda" && row_block >= 1 && ((host, kernels) = cgen_rowblock_apply(host, kernels, backend; minN = Int(row_block)))
     backend.kernel_tag == "cuda" && col_block >= 1 && ((host, kernels) = cgen_colblock_apply(host, kernels, backend; minN = Int(col_block)))
+    helpers = plan.helpers
+    serial_on && ((host, kernels, shelp) = cgen_serial_apply(host, kernels, backend); helpers = vcat(helpers, shelp))
     fresh_check && (host = cgen_fresh_check(host, fresh))
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
-    p === Float64 && return (host = host, kernels = kernels, helpers = plan.helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
+    p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
     return (host = cgen_convert_precision(host, p),
             kernels = Expr[cgen_convert_precision(k, p) for k in kernels], helpers = plan.helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
 end
 
 stade_cuda(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), warp_atomics::Bool = true,
-           sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256) =
-    stade_gpu(expr, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block)
+           sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = false) =
+    stade_gpu(expr, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops)
 stade_amdgpu(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
     stade_gpu(expr, cgen_backend_amdgpu(); precision, reduction_threshold, inbounds, dead_scalars)
 stade_metal(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
@@ -18579,7 +18746,7 @@ stade_metal(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothi
 # reduction emits BOTH an atomic-accumulate kernel and a mapreduce call, and picks between them at run time on the
 # loop's own trip count; reduction_threshold sets where that switch happens.
 function stade_gpu_file(in_path::String, out_path::String, backend; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(),
-                        warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256)
+                        warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = false)
     defs = io_read_kernel_bundle(in_path)
     kernels = Expr[]
     hosts = Expr[]
@@ -18589,7 +18756,7 @@ function stade_gpu_file(in_path::String, out_path::String, backend; precision::U
     # two functions that take stacks may share one `initstacks_*`: neither may change it then
     nclaim = count(d -> d isa Expr && d.args[1] isa Expr && !startswith(string(d.args[1].args[1]), "initstacks_") && any(a -> a isa Symbol && endswith(string(a), "_stack"), d.args[1].args[2:end]), defs)
     for expr in defs
-        plan = stade_gpu(expr, backend; precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, init_hosts = (nclaim > 1 ? nothing : inits))
+        plan = stade_gpu(expr, backend; precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops, init_hosts = (nclaim > 1 ? nothing : inits))
         append!(kernels, plan.kernels)
         push!(hosts, plan.host)
         for h in plan.helpers
@@ -18609,8 +18776,8 @@ function stade_gpu_file(in_path::String, out_path::String, backend; precision::U
 end
 
 stade_cuda_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), warp_atomics::Bool = true,
-                sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256) =
-    stade_gpu_file(in_path, out_path, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block)
+                sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = false) =
+    stade_gpu_file(in_path, out_path, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops)
 stade_amdgpu_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
     stade_gpu_file(in_path, out_path, cgen_backend_amdgpu(); precision, reduction_threshold, inbounds, dead_scalars)
 stade_metal_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
@@ -19203,7 +19370,7 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
                                   keep_push_pop::Bool = false, fuse_ii_loops::Bool = false,
                                   mode::Symbol = :adjoint,
                                   reduction_threshold::Int = cgen_reduction_threshold_default(),
-                                  warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256)
+                                  warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = false)
     keep_push_pop &&
         error("stade_validate_gpu_file: keep_push_pop=true has no GPU target -- :stack mode's push!/pop! is inherently host-only")
     mode in (:adjoint, :hvp) ||
@@ -19217,13 +19384,13 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
 
     gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
                              stade_adjoint(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
-    gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block)
+    gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops)
     # reduction_threshold reaches the GPU parity oracle. Without it the choice had
     # no test that ran on a device: validate_corpus is CPU and
     # validate_offload counts loops. That is how a `dot` call no cuBLAS on
     # this cluster can execute, and a whole-array lowering of a partial
     # range, both survived in emitted code.
-    gpu_gen  = stade_gpu(mode == :hvp ? gen_out.hvp : gen_out.adjoint, backend; reduction_threshold = reduction_threshold, warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, init_hosts = Dict{Symbol,Expr}(gpu_init.host.args[1].args[1] => gpu_init.host))
+    gpu_gen  = stade_gpu(mode == :hvp ? gen_out.hvp : gen_out.adjoint, backend; reduction_threshold = reduction_threshold, warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, init_hosts = Dict{Symbol,Expr}(gpu_init.host.args[1].args[1] => gpu_init.host))
     gpu_init = merge(gpu_init, (host = cgen_shrink_stacks(gpu_init.host, gpu_gen.dead_stacks, gpu_gen.compact_stacks),))
     stack_arg_names = Symbol[a for a in gen_out.initstacks.args[1].args[2:end]]
     seeds = [val_random_values_like(kernel, baseline.values) for _ in 1:trials]
