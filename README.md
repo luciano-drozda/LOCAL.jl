@@ -1,61 +1,8 @@
-# STADE.jl 🏟️
+# LOCAL.jl
+
+**A fork of [STADE.jl](https://github.com/cerfacs/STADE.jl/)**
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22061808.svg)](https://doi.org/10.5281/zenodo.22061808)
-
-*Low entry ticket to Scalable Differentiable Computing*
-
-**Source Transformation Automatic Differentiation Engine** (STADE) generates source-verifiable GPU-ported (CUDA, AMDGPU, Metal, JACC)
-
-- Adjoints
-- Tangents
-- Hessian-vector products (hvp)
-- Primals
-
-of monoprocessor numerical kernels written using the Julia programming language.
-
-[Try STADE.jl out in our website!](https://cerfacs.github.io/STADE.jl)
-
-## Why STADE.jl ?
-
-This is a legitimate question since the Automatic Differentiation (AD) ecosystem in Julia is already rich (see [DifferentiationInterface.jl](https://github.com/JuliaDiff/DifferentiationInterface.jl)). In a nutshell, our motivations lean on obtaining:
-
-- **Auditable** adjoints / tangents / hvp\
-  STADE outputs human-readable Julia source code. This builds trust around AD tool usage to compute derivatives. It also eases debugging and development of new features.
-
-
-- **Reproducible** gradient-based experiments (e.g., AI models training)\
-  STADE-generated adjoints / tangents / hvp are bundled with primal source codes, such that numerical experiments are reproducible (up to MPI and atomic reductions on GPU) regardless of STADE availability or version in the machine they run.
-
-
-- **Accessible** scalable differentiable computing\
-  STADE generates GPU-ported adjoints / tangents / hvp from monoprocessor kernels, which are easy to craft and debug.
-
-
-For now, the aforementioned goals come at the cost of supporting only a subset of the language abstractions. In any case, STADE focuses on differentiable computing, which itself is a subset of differentiable programming. [Here are defined STADE-differentiable kernels.](https://github.com/cerfacs/STADE.jl/blob/main/claude/skill-stade.md)
-
-## First use
-
-```bash
-julia -e ' \
-begin
-  import Pkg
-  Pkg.add(url="https://github.com/cerfacs/STADE.jl")
-  using STADE
-  in_    = pkgdir(STADE, "test", "val-corpus", "affine_loss.jl")
-  outdir = mktempdir()
-  out_b  = joinpath(outdir, "affine_loss_b.jl")
-  out_c  = joinpath(outdir, "affine_loss_b_cuda.jl")
-  try
-    stade_adjoint_file(in_, out_b)
-    stade_cuda_file(out_b, out_c)
-    println(read(out_b, String))
-    println(read(out_c, String))
-  catch e
-    error("STADE.jl failed: $e")
-  end
-end
-'
-```
 
 ## Public API
 
