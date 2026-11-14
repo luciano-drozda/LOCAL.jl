@@ -112,6 +112,8 @@ function validate_atomic_guarantee(dir::String = joinpath(@__DIR__, "val-corpus"
             gen = mode == :hvp ? STADE.stade_hvp(pe; keep_push_pop = false) : STADE.stade_adjoint(pe; keep_push_pop = false)
             plan = STADE.stade_gpu(mode == :hvp ? gen.hvp : gen.adjoint, backend; inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0)
             for k in plan.kernels
+                # a serial kernel runs in one thread: its plain accumulations cannot race
+                startswith(string(k.args[1].args[1]), "cuda_serial_") && continue
                 kernels_seen += 1
                 sites = Dict{Symbol,Vector{NamedTuple}}()
                 aga_sites!(sites, k.args[2], backend.atomic_macro)

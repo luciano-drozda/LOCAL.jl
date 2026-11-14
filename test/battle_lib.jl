@@ -380,7 +380,7 @@ end
 
 # ---------------------------------------------------------------- generation in each mode and backend
 const BT_PIN_CUDA = (warp_atomics = false, shared_private = false, coarsen = 0, row_block = 0, col_block = 0,
-                     reduce_block = false, inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0)
+                     reduce_block = false, inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0, serial_loops = false)
 const BT_PIN_JACC = (inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0)
 
 function bt_mode_expr(primal::Expr, mode::Symbol; fuse::Bool = true)
@@ -393,7 +393,7 @@ end
 function bt_plan(expr::Expr, backend::Symbol, config::Symbol)
     if backend === :cuda
         return config === :pinned ? STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); BT_PIN_CUDA...) :
-                                    STADE.stade_gpu(expr, STADE.cgen_backend_cuda())
+                                    STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); serial_loops = false)
     else
         return config === :pinned ? STADE.stade_jacc(expr; BT_PIN_JACC...) : STADE.stade_jacc(expr)
     end

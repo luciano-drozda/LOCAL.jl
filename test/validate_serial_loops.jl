@@ -47,28 +47,33 @@ function serial_kernel_names(plan)
 end
 
 # gradient of the CPU adjoint and of the stand-in GPU host function for one kernel and one draw. Returns (cpu, gpu, serial kernel names, plan)
-function serial_compare(primal::Expr; serial::Bool = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}())
+function serial_compare(primal::Expr; serial::Bool = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint)
     kernel = STADE.parse_kernel(primal)
     Random.seed!(seed)
     baseline = STADE.val_generate_baseline(kernel, primal; int_lo = int_lo, int_hi = int_hi, grow_max = 512)
     int_args = merge(baseline.int_args, int_override)
-    gen = STADE.stade_adjoint(primal; keep_push_pop = false, fuse_ii_loops = true)
+    gen = mode == :hvp ? STADE.stade_hvp(primal; keep_push_pop = false, fuse_ii_loops = true) : STADE.stade_adjoint(primal; keep_push_pop = false, fuse_ii_loops = true)
+    cpu_expr = mode == :hvp ? gen.hvp : gen.adjoint
     stack_arg_names = Symbol[a for a in gen.initstacks.args[1].args[2:end]]
     sd = STADE.val_random_values_like(kernel, baseline.values)
+    td = mode == :hvp ? STADE.val_random_values_like(kernel, baseline.values) : nothing
+    tsd = mode == :hvp ? STADE.val_random_values_like(kernel, baseline.values) : nothing
+    call(af, inf) = mode == :hvp ? STADE.val_call_hv(af, inf, kernel, int_args, baseline.values, sd, td, tsd; stack_arg_names) :
+                                   STADE.val_call_adjoint(af, inf, kernel, int_args, baseline.values, sd; stack_arg_names)
     cm = Module()
     Core.eval(cm, :(using LinearAlgebra))
-    Core.eval(cm, gen.adjoint); Core.eval(cm, gen.initstacks)
-    cpu = STADE.val_call_adjoint(getfield(cm, gen.adjoint.args[1].args[1]), getfield(cm, gen.initstacks.args[1].args[1]), kernel, int_args, baseline.values, sd; stack_arg_names)
+    Core.eval(cm, cpu_expr); Core.eval(cm, gen.initstacks)
+    cpu = call(getfield(cm, cpu_expr.args[1].args[1]), getfield(cm, gen.initstacks.args[1].args[1]))
     fl = gpu_flags(serial)
     plan_init = STADE.stade_gpu(gen.initstacks, STADE.cgen_backend_cuda(); fl...)
-    plan_gen = STADE.stade_gpu(gen.adjoint, STADE.cgen_backend_cuda(); fl..., init_hosts = Dict{Symbol,Expr}(plan_init.host.args[1].args[1] => plan_init.host))
+    plan_gen = STADE.stade_gpu(cpu_expr, STADE.cgen_backend_cuda(); fl..., init_hosts = Dict{Symbol,Expr}(plan_init.host.args[1].args[1] => plan_init.host))
     plan_init = merge(plan_init, (host = STADE.cgen_shrink_stacks(plan_init.host, plan_gen.dead_stacks, plan_gen.compact_stacks),))
     for h in plan_gen.helpers; Core.eval(SerialStub, h); end
     for k in plan_init.kernels; Core.eval(SerialStub, k); end
     Core.eval(SerialStub, plan_init.host)
     for k in plan_gen.kernels; Core.eval(SerialStub, k); end
     Core.eval(SerialStub, plan_gen.host)
-    gpu = STADE.val_call_adjoint(getfield(SerialStub, plan_gen.host.args[1].args[1]), getfield(SerialStub, plan_init.host.args[1].args[1]), kernel, int_args, baseline.values, sd; stack_arg_names)
+    gpu = call(getfield(SerialStub, plan_gen.host.args[1].args[1]), getfield(SerialStub, plan_init.host.args[1].args[1]))
     return (cpu = cpu, gpu = gpu, serial = serial_kernel_names(plan_gen), plan = plan_gen)
 end
 
@@ -146,7 +151,7 @@ function validate_serial_loops(names = String[])
     # 1: corpus
     paths = corpus_paths()
     sel = isempty(names) ? sort(collect(keys(paths))) : names
-    nser = 0; nskip = 0; nerr = 0; worst = 0.0
+    nser = 0; nskip = 0; nerr = 0; worst = 0.0; nhvp = 0; worsth = 0.0
     for n in sel
         haskey(paths, n) || (println("FAIL unknown kernel $n"); ok = false; continue)
         primal = STADE.io_read_corpus_entry(paths[n])
@@ -166,12 +171,20 @@ function validate_serial_loops(names = String[])
             continue
         end
         isempty(res.serial) && (nskip += 1; continue)
+        hres = try serial_compare(primal; seed = Int(sum(Int.(codeunits(n)))), mode = :hvp) catch e; e end
+        if hres isa Exception
+            ok = false; println("FAIL $n [hvp]: ", first(sprint(showerror, hres), 160))
+        else
+            nhvp += 1; eh = relerr(hres.cpu, hres.gpu); worsth = max(worsth, eh)
+            maximum(abs.(hres.cpu); init = 0.0) > 0 || (ok = false; println("FAIL $n [hvp]: the CPU result is all zero"))
+            eh <= 1e-12 || (ok = false; println("FAIL $n [hvp]: serial kernels $(length(hres.serial)), differs from the CPU HVP, rel $eh"))
+        end
         nser += 1
         e = relerr(res.cpu, res.gpu); worst = max(worst, e)
         maximum(abs.(res.cpu); init = 0.0) > 0 || (ok = false; println("FAIL $n: the CPU gradient is all zero, the draw carries no signal"))
         e <= 1e-12 || (ok = false; println("FAIL $n: serial kernels $(length(res.serial)), gradient differs from the CPU adjoint, rel $e"))
     end
-    println("corpus: $(length(sel)) kernels, $nser with a serial kernel (worst rel $worst), $nskip without, $nerr errors")
+    println("corpus: $(length(sel)) kernels, $nser with a serial kernel in the adjoint (worst rel $worst), $nhvp HVP checked (worst rel $worsth), $nskip without, $nerr errors")
     check(isempty(names) ? nser >= 30 : nser >= 0, "corpus: the serial track met at least 30 kernels (it saw something)")
     println(ok ? "ALL OK" : "FAILED")
     return ok

@@ -18725,7 +18725,13 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
     backend.kernel_tag == "cuda" && row_block >= 1 && ((host, kernels) = cgen_rowblock_apply(host, kernels, backend; minN = Int(row_block)))
     backend.kernel_tag == "cuda" && col_block >= 1 && ((host, kernels) = cgen_colblock_apply(host, kernels, backend; minN = Int(col_block)))
     helpers = plan.helpers
-    serial_on && ((host, kernels, shelp) = cgen_serial_apply(host, kernels, backend); helpers = vcat(helpers, shelp))
+    if serial_on
+        nk0 = length(kernels)
+        (host, kernels, shelp) = cgen_serial_apply(host, kernels, backend)
+        helpers = vcat(helpers, shelp)
+        # the serial kernels are new: they get the dead-scalar pass the other kernels got before the later passes
+        dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
+    end
     fresh_check && (host = cgen_fresh_check(host, fresh))
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)

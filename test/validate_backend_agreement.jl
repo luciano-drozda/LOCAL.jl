@@ -201,7 +201,7 @@ function validate_backend_agreement(dir::String = joinpath(@__DIR__, "val-corpus
                                  STADE.stade_adjoint(primal; keep_push_pop = false, fuse_ii_loops = true)
             expr = mode == :hvp ? gen.hvp : gen.adjoint
             cu = STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0, shared_private = false,
-                                 reduce_block = false, row_block = 0)
+                                 reduce_block = false, row_block = 0, serial_loops = false)   # the serial track is CUDA only: JACC has no counterpart
             ja = STADE.stade_jacc(expr; inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0)
 
             problems = String[]
