@@ -324,8 +324,9 @@ function gval_check_backend(kernel, int_args::Dict, values::Dict, seeds::Vector,
             okb ? ((tr_cpu = max(tr_cpu, ec)); (tr_dev = max(tr_dev, ed))) : (tr_ran = false)
         end
     end
-    # the verdict of the BigFloat truth, as in the scripts of the GPU validators: at most 20 times the CPU error, or 1e-10, and never below rtol
-    truth_ok = want_truth && tr_ran && n_changed > 0 && tr_dev <= max(rtol, 20 * tr_cpu, 1.0e-10)
+    # the verdict of the BigFloat truth: the device result is at most 20 times as far from it as the CPU result, and never held below rtol.
+    # No absolute floor: one of 1e-10 would pass a real error of 1e-11 on a kernel whose CPU result is exact (v0.5.25).
+    truth_ok = want_truth && tr_ran && n_changed > 0 && tr_dev <= max(rtol, 20 * tr_cpu)
     return (ok = max_err <= rtol && n_changed > 0, max_rel_err = max_err, rtol = rtol,
             elements_changed = n_changed, vacuous = n_changed == 0, truth_ok = truth_ok, tr_cpu = tr_cpu, tr_dev = tr_dev)
 end
