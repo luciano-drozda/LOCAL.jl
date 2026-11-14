@@ -10262,7 +10262,8 @@ function cgen_serial_plan(stmt, owner::Symbol, backend, reduce_vars::Set{Symbol}
     note(cgen_read_vars(stmt.lo)); note(cgen_read_vars(stmt.hi)); note(cgen_read_vars(stmt.step))
     cgen_serial_live_in(stmt.body, Set([stmt.var]), live_in)
     delete!(live_in, stmt.var)
-    escapes = ii_escapes_nested(root_body, stmt.body, assigned)
+    # a function argument that the loop assigns may be the value the function returns, and the return statement is not in the body: it is live-out
+    escapes = union(ii_escapes_nested(root_body, stmt.body, assigned), intersect(assigned, fn_args))
     outs = sort(collect(intersect(assigned, escapes)); by = string)
     all(v -> cgen_serial_defined_before(root_body, stmt.body, v, fn_args), outs) || return nothing
     args = sort(collect(union(live_in, outs)); by = string)

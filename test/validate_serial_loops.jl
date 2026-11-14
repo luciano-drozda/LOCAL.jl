@@ -78,6 +78,7 @@ relerr(a, b) = maximum(abs.(a .- b); init = 0.0) / max(1.0, maximum(abs.(a); ini
 src_carry = "function serial_carry(x, y, out, n)\n    acc = 0.0\n    for i = 1:n\n        acc = 0.5 * acc + x[i]\n        y[i] = acc * acc\n    end\n    out[1] = acc\n    return nothing\nend"
 src_nest = "function serial_nest(a, w, u, n, m)\n    for t = 1:n\n        for j = 1:m\n            u[j] = u[j] + a[j] * w[t]\n        end\n        w[t + 1] = 0.5 * w[t] + u[1]\n    end\n    return nothing\nend"
 src_zero = "function serial_zero(a, x, y, out, n)\n    acc = a[1]\n    for i = 1:n\n        acc = 0.5 * acc + x[i]\n        y[i] = acc\n    end\n    out[1] = 3.0 * acc\n    return nothing\nend"
+src_ret = "function serial_ret(y, x, c, n)\n    for i = 1:n\n        y[i + 1] = y[i] + c * x[i]\n    end\n    return nothing\nend"
 src_nocopy = "function serial_nocopy(x, y, n)\n    acc = 0.0\n    for i = 1:n\n        acc = 0.5 * acc + x[i]\n        y[i] = acc * acc\n    end\n    return nothing\nend"
 
 function corpus_paths()
@@ -115,6 +116,10 @@ function validate_serial_loops(names = String[])
     check(relerr(rn.cpu, rn.gpu) <= 1e-13, "copy-back: gradient equals the CPU adjoint (rel $(relerr(rn.cpu, rn.gpu)))")
     check(maximum(abs.(rn.cpu)) > 0, "copy-back: the gradient is not all zero")
     check(maximum(abs.(r.cpu)) > 0, "carry: the gradient is not all zero")
+
+    # the adjoint of a scalar argument is returned by the function, and no statement of the body reads it afterwards
+    rr = serial_compare(Meta.parse(src_ret))
+    check(!isempty(rr.serial) && relerr(rr.cpu, rr.gpu) <= 1e-13 && maximum(abs.(rr.cpu)) > 0, "returned scalar: the adjoint of an argument the loop assigns reaches the return (rel $(relerr(rr.cpu, rr.gpu)))")
 
     # 4: nest
     nest = Meta.parse(src_nest)
