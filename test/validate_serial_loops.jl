@@ -172,8 +172,8 @@ function validate_serial_loops(names = String[])
         end
         if res isa Exception
             msg = first(sprint(showerror, res), 160)
-            # a kernel that does not generate with keep_push_pop = false, or whose draw fails, is not a serial-track case
-            if occursin("keep_push_pop", msg) || occursin("val_generate_baseline", msg) || occursin("unsupported array rank", msg)
+            # a kernel that does not generate with keep_push_pop = false, that parse_kernel refuses (the refusal corpora), or whose draw fails, is not a serial-track case
+            if occursin("keep_push_pop", msg) || occursin("val_generate_baseline", msg) || occursin("unsupported array rank", msg) || startswith(msg, "parse_kernel:")
                 nskip += 1
             else
                 nerr += 1; ok = false; println("FAIL $n: ", msg)
