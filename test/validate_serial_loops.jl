@@ -7,7 +7,7 @@
 #   3. COPY-BACK: a scalar the loop assigns and a later statement reads comes back through the box; one that nothing reads does not.
 #   4. NEST: an order-dependent loop that holds a parallel loop keeps its host form, and the parallel loop stays a kernel.
 #   5. ZERO TRIP: n = 0 leaves the scalar as it was.
-#   6. DEFAULT: without the option no serial kernel exists and the generated code is the code of v0.5.25.
+#   6. DEFAULT: the option is on by default (v0.5.26); `serial_loops = false` gives no serial kernel and the generated code of v0.5.25.
 #
 #   julia validate_serial_loops.jl [kernel names...]      (no names: every corpus kernel; this takes some minutes, run it on a cluster node)
 
@@ -39,15 +39,15 @@ module SerialStub
 end
 
 # the passes of stade_gpu that need CUDA hardware (warp shuffles, shared memory, cuBLAS, block reductions) are off; the serial track is on or off
-gpu_flags(serial) = (warp_atomics = false, sync_free_reduce = false, reduce_block = false, shared_private = false, contraction = 0, split_reduce = 0,
-                     row_block = 0, col_block = 0, cublas = 0, serial_loops = serial)
+gpu_flags(serial) = merge((warp_atomics = false, sync_free_reduce = false, reduce_block = false, shared_private = false, contraction = 0, split_reduce = 0,
+                           row_block = 0, col_block = 0, cublas = 0), serial === nothing ? (;) : (serial_loops = serial,))
 
 function serial_kernel_names(plan)
     return [string(k.args[1].args[1]) for k in plan.kernels if startswith(string(k.args[1].args[1]), "cuda_serial_")]
 end
 
 # gradient of the CPU adjoint and of the stand-in GPU host function for one kernel and one draw. Returns (cpu, gpu, serial kernel names, plan)
-function serial_compare(primal::Expr; serial::Bool = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint)
+function serial_compare(primal::Expr; serial::Union{Bool,Nothing} = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint)
     kernel = STADE.parse_kernel(primal)
     Random.seed!(seed)
     baseline = STADE.val_generate_baseline(kernel, primal; int_lo = int_lo, int_hi = int_hi, grow_max = 512)
@@ -75,6 +75,14 @@ function serial_compare(primal::Expr; serial::Bool = true, seed::Int = 1, int_lo
     Core.eval(SerialStub, plan_gen.host)
     gpu = call(getfield(SerialStub, plan_gen.host.args[1].args[1]), getfield(SerialStub, plan_init.host.args[1].args[1]))
     return (cpu = cpu, gpu = gpu, serial = serial_kernel_names(plan_gen), plan = plan_gen)
+end
+
+# plan only, nothing runs: the serial kernels of the adjoint of one corpus kernel. Skips the draw and the two executions for a kernel with none.
+function serial_names_only(primal::Expr)
+    gen = STADE.stade_adjoint(primal; keep_push_pop = false, fuse_ii_loops = true)
+    pi = STADE.stade_gpu(gen.initstacks, STADE.cgen_backend_cuda(); gpu_flags(true)...)
+    pg = STADE.stade_gpu(gen.adjoint, STADE.cgen_backend_cuda(); gpu_flags(true)..., init_hosts = Dict{Symbol,Expr}(pi.host.args[1].args[1] => pi.host))
+    return serial_kernel_names(pg)
 end
 
 relerr(a, b) = maximum(abs.(a .- b); init = 0.0) / max(1.0, maximum(abs.(a); init = 0.0))
@@ -144,9 +152,11 @@ function validate_serial_loops(names = String[])
     nk = [string(k.args[1].args[1]) for k in rs.plan.kernels]
     check(any(k -> startswith(k, "cuda_kernel_"), nk) && isempty(rs.serial), "nest: the parallel inner loop stays a kernel and no serial kernel holds it (kernels: $(join(nk, ", ")))")
 
-    # 6: default
+    # 6: default on, and the rollback
     rd = serial_compare(carry; serial = false)
-    check(isempty(rd.serial) && relerr(rd.cpu, rd.gpu) <= 1e-13, "default: no serial kernel without the option, gradient unchanged")
+    check(isempty(rd.serial) && relerr(rd.cpu, rd.gpu) <= 1e-13, "rollback: serial_loops = false gives no serial kernel, gradient unchanged")
+    rdef = serial_compare(carry; serial = nothing)
+    check(!isempty(rdef.serial) && relerr(rdef.cpu, rdef.gpu) <= 1e-13, "default: with the keyword left out the serial track is on")
 
     # 1: corpus
     paths = corpus_paths()
@@ -156,7 +166,7 @@ function validate_serial_loops(names = String[])
         haskey(paths, n) || (println("FAIL unknown kernel $n"); ok = false; continue)
         primal = STADE.io_read_corpus_entry(paths[n])
         res = try
-            serial_compare(primal; seed = Int(sum(Int.(codeunits(n)))))
+            isempty(serial_names_only(primal)) ? (serial = String[], cpu = Float64[], gpu = Float64[]) : serial_compare(primal; seed = Int(sum(Int.(codeunits(n)))))
         catch e
             e
         end
