@@ -40,7 +40,7 @@ function validate_skip_empty(dir::String = joinpath(@__DIR__, "val-corpus"); onl
         primal = STADE.io_read_corpus_entry(joinpath(dir, name * ".jl"))
         g = mode == :hvp ? STADE.stade_hvp(primal; keep_push_pop = false) : STADE.stade_adjoint(primal; keep_push_pop = false)
         for (lab, ex) in (("initstacks", g.initstacks), (string(mode), mode == :hvp ? g.hvp : g.adjoint))
-            on = STADE.stade_gpu(ex, cuda; inbounds = false); off = STADE.stade_gpu(ex, cuda; inbounds = false, skip_empty = false)
+            on = STADE.stade_gpu(ex, cuda; inbounds = false, glue_kernels = false); off = STADE.stade_gpu(ex, cuda; inbounds = false, skip_empty = false, glue_kernels = false)
             empties_off = [k.args[1].args[1] for k in off.kernels if k.head === :function && STADE.cgen_empty_body(k.args[2])]
             empties_on = [k.args[1].args[1] for k in on.kernels if k.head === :function && STADE.cgen_empty_body(k.args[2])]
             total += length(empties_off)

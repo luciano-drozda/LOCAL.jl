@@ -89,7 +89,7 @@ function validate_boxed_reset(; verbose = true, only = String[])
         nm in names || continue
         b = joinpath(tmp, nm * "_b.jl"); c = joinpath(tmp, nm * "_b_cuda.jl")
         STADE.stade_adjoint_file(joinpath(dir, nm * ".jl"), b; keep_push_pop = false, fuse_ii_loops = true)
-        STADE.stade_cuda_file(b, c; serial_loops = false)
+        STADE.stade_cuda_file(b, c; serial_loops = false, glue_kernels = false)
         t = read(c, String)
         t = t[first(findfirst("function $(nm)_b_cuda", t)):end]
         r = findfirst("\nfunction ", t[2:end]); r === nothing || (t = t[1:first(r)])

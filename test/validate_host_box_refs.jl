@@ -49,7 +49,7 @@ function validate_host_box_refs(; verbose = true)
             g = mode == :hvp ? STADE.stade_hvp(e; keep_push_pop = false) : STADE.stade_adjoint(e; keep_push_pop = false)
             gk = mode == :hvp ? g.hvp : g.adjoint
             pi_ = STADE.stade_gpu(g.initstacks, bk)
-            pg = STADE.stade_gpu(gk, bk; init_hosts = Dict{Symbol,Expr}(pi_.host.args[1].args[1] => pi_.host))
+            pg = STADE.stade_gpu(gk, bk; glue_kernels = false, init_hosts = Dict{Symbol,Expr}(pi_.host.args[1].args[1] => pi_.host))
             t = STADE.io_expr_to_source(pg.host)
             boxed = Set(Symbol(m.captures[1]) for m in eachmatch(r"(\w+) = CuArray\(\[\1\]\)", t))
             for v in boxed

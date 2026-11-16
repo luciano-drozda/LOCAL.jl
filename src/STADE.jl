@@ -10336,6 +10336,354 @@ function cgen_serial_apply(host::Expr, kernels::Vector{Expr}, backend)
     return (newhost, newk, uses_box[] ? cgen_serial_helper_exprs() : Expr[])
 end
 
+# ---- glue kernels (stade_gpu(...; glue_kernels = true), CUDA and Float64) ----
+# A `CUDA.@allowscalar begin ... end` block of the host function is the glue between two kernels: each scalar read or write in it is a host-device copy (about 10 us).
+# This pass runs the statements of such a block that touch the device as one one-thread kernel (no copy, launched like any other kernel) and keeps on the host
+# what only the host can do. A Float64 scalar that is assigned by glue and read only by glue and as a kernel argument (`alpha = rs[1] / s[1]`) becomes a one-element
+# device box with the same name, and the kernels that took it by value read `alpha[1]`. A scalar the host reads itself (an if, a bound, an index) stays on the host.
+cgen_glue_pure_calls() = Set{Symbol}([:+, :-, :*, :/, :^, :%, :div, :mod, :max, :min, :abs, :sqrt, :exp, :log, :log10, :sin, :cos, :tan, :asin, :acos, :atan, :sinh, :cosh, :tanh, :sign, :floor, :ceil, :trunc])
+
+# a statement that the kernel can run: numbers, symbols, array reads and the arithmetic calls
+function cgen_glue_dev_ok(e, calls::Set{Symbol})
+    e isa Number && return true
+    e isa Symbol && return true
+    e isa Expr || return false
+    if e.head === :ref
+        return all(a -> cgen_glue_dev_ok(a, calls), e.args)
+    elseif e.head === :call
+        e.args[1] isa Symbol && e.args[1] in calls || return false
+        return all(a -> cgen_glue_dev_ok(a, calls), e.args[2:end])
+    end
+    return false
+end
+
+# the symbols an expression reads (call heads excluded)
+function cgen_glue_syms!(out::Set{Symbol}, e)
+    if e isa Symbol
+        push!(out, e)
+    elseif e isa Expr
+        if e.head === :call
+            foreach(a -> cgen_glue_syms!(out, a), e.args[2:end])
+        else
+            foreach(a -> cgen_glue_syms!(out, a), e.args)
+        end
+    end
+    return out
+end
+
+# the expression is Float64 whatever its operands are: a float literal, a `/`, or a float math function
+function cgen_glue_float_evident(e)
+    e isa Float64 && return true
+    e isa Expr || return false
+    if e.head === :call && e.args[1] isa Symbol && e.args[1] in (:/, :sqrt, :exp, :log, :log10, :sin, :cos, :tan, :asin, :acos, :atan, :sinh, :cosh, :tanh)
+        return true
+    end
+    return any(cgen_glue_float_evident, e.args)
+end
+
+# the statements of a glue block, without line numbers
+cgen_glue_stmts(blk::Expr) = Any[a for a in blk.args if !(a isa LineNumberNode)]
+
+function cgen_glue_is_block(e, asc)
+    return e isa Expr && e.head === :macrocall && length(e.args) == 3 && e.args[1] == asc && e.args[3] isa Expr && e.args[3].head === :block
+end
+
+# one scan of the host function: the glue blocks in order, where each symbol is used outside them, and the launches
+function cgen_glue_scan(host::Expr, backend)
+    asc = backend.allowscalar_macro
+    blocks = Vector{Any}[]
+    host_uses = Dict{Symbol,Int}()
+    host_assigned = Set{Symbol}()
+    launches = Tuple{Symbol,Vector{Any}}[]
+    launch_uses = Dict{Symbol,Int}()
+    bump(v) = (host_uses[v] = get(host_uses, v, 0) + 1)
+    function scan_syms(e)
+        for v in cgen_glue_syms!(Set{Symbol}(), e); bump(v); end
+    end
+    function walk(e)
+        if e isa Symbol
+            bump(e)
+        elseif e isa Expr
+            if cgen_glue_is_block(e, asc)
+                push!(blocks, cgen_glue_stmts(e.args[3]))
+            elseif e.head === :macrocall && e.args[1] == backend.launch_macro
+                for a in e.args[3:end]
+                    if a isa Expr && a.head === :call && a.args[1] isa Symbol
+                        push!(launches, (a.args[1], Any[x for x in a.args[2:end]]))
+                        for x in a.args[2:end]; x isa Symbol ? (launch_uses[x] = get(launch_uses, x, 0) + 1) : scan_syms(x); end
+                    else
+                        scan_syms(a)
+                    end
+                end
+            elseif e.head === :macrocall
+                foreach(walk, e.args[3:end])
+            elseif e.head === :(=) && e.args[1] isa Symbol
+                push!(host_assigned, e.args[1]); walk(e.args[2])
+            elseif e.head === :for && e.args[1] isa Expr && e.args[1].head === :(=)
+                e.args[1].args[1] isa Symbol && push!(host_assigned, e.args[1].args[1])
+                walk(e.args[1].args[2]); walk(e.args[2])
+            elseif e.head === :call
+                foreach(walk, e.args[2:end])
+            else
+                foreach(walk, e.args)
+            end
+        end
+        return nothing
+    end
+    # `v = 0.0` declarations in the straight-line prefix of the function body are not host writes: a box starts at 0.0 and takes their place
+    zero_decls = Set{Symbol}()
+    skip = Set{UInt}()
+    for st in host.args[2].args
+        st isa LineNumberNode && continue
+        (st isa Expr && st.head === :(=)) || break
+        if st.args[1] isa Symbol && st.args[2] isa Float64 && st.args[2] == 0.0 && !(st.args[1] in zero_decls)
+            push!(zero_decls, st.args[1]); push!(skip, objectid(st))
+        end
+    end
+    for st in host.args[2].args
+        objectid(st) in skip && continue
+        walk(st)
+    end
+    return (blocks = blocks, host_uses = host_uses, host_assigned = host_assigned, launches = launches, zero_decls = zero_decls, launch_uses = launch_uses)
+end
+
+# labels of one block: :p (pure host, no device data), :d (device), :h (host with device reads)
+function cgen_glue_label(st, C::Set{Symbol}, calls::Set{Symbol})
+    (st isa Expr && st.head === :(=)) || return :h
+    lhs, rhs = st.args
+    syms = cgen_glue_syms!(Set{Symbol}(), rhs)
+    dev_data = cgen_expr_has_ref(rhs) || !isempty(intersect(syms, C))
+    if lhs isa Symbol
+        cgen_glue_dev_ok(rhs, calls) || return :h
+        lhs in C && return :d
+        return dev_data ? :d : :p
+    elseif lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol
+        return cgen_glue_dev_ok(lhs, calls) && cgen_glue_dev_ok(rhs, calls) ? :d : :h
+    end
+    return :h
+end
+
+# placement of one block: the pure statements that can move to the front, and the runs of the rest in order.
+# returns (hoisted, runs) with runs a vector of (kind, statements) and kind :d or :h
+function cgen_glue_place(stmts::Vector{Any}, labels::Vector{Symbol})
+    hoisted = Any[]; runs = Tuple{Symbol,Vector{Any}}[]
+    written = Set{Symbol}(); readset = Set{Symbol}()
+    for (st, lb) in zip(stmts, labels)
+        syms = st isa Expr && st.head === :(=) ? cgen_glue_syms!(Set{Symbol}(), st.args[2]) : cgen_glue_syms!(Set{Symbol}(), st)
+        lhs = st isa Expr && st.head === :(=) ? st.args[1] : nothing
+        kind = lb
+        if lb === :p && lhs isa Symbol && isempty(intersect(syms, written)) && !(lhs in readset) && !(lhs in written)
+            push!(hoisted, st); continue
+        end
+        kind = lb === :d ? :d : :h
+        if isempty(runs) || runs[end][1] !== kind
+            push!(runs, (kind, Any[]))
+        end
+        push!(runs[end][2], st)
+        if lhs isa Symbol
+            push!(written, lhs)
+            union!(readset, syms)
+        else
+            union!(readset, cgen_glue_syms!(Set{Symbol}(), st))
+        end
+    end
+    return (hoisted, runs)
+end
+
+# the first mention of v in the statements, in order, is a plain assignment that does not read v (or there is none): the statements do not depend on an earlier value of v
+function cgen_glue_first_is_def(stmts, v::Symbol)
+    for st in stmts
+        if st isa Expr && st.head === :(=)
+            lhs, rhs = st.args
+            in_rhs = v in cgen_glue_syms!(Set{Symbol}(), rhs)
+            in_lhs_idx = lhs isa Expr && v in cgen_glue_syms!(Set{Symbol}(), lhs)
+            (in_rhs || in_lhs_idx) && return false
+            lhs === v && return true
+        else
+            v in cgen_glue_syms!(Set{Symbol}(), st) && return false
+        end
+    end
+    return true
+end
+
+function cgen_glue_apply(host::Expr, kernels::Vector{Expr}, backend)
+    (host.head === :function && length(host.args) == 2 && host.args[2] isa Expr && host.args[2].head === :block) || return (host, kernels)
+    asc = backend.allowscalar_macro
+    calls = cgen_glue_pure_calls()
+    params = Set{Symbol}(a isa Symbol ? a : (a isa Expr && a.head === :(::) ? a.args[1] : :_) for a in host.args[1].args[2:end])
+    sc = cgen_glue_scan(host, backend)
+    blocks = sc.blocks
+    isempty(blocks) && return (host, kernels)
+    kdef = Dict{Symbol,Int}(k.args[1].args[1] => i for (i, k) in enumerate(kernels))
+    # candidates: a plain scalar that glue assigns, proven Float64, that the host itself never touches
+    assigned_in = Dict{Symbol,Vector{Any}}()
+    for blk in blocks, st in blk
+        st isa Expr && st.head === :(=) && st.args[1] isa Symbol && push!(get!(assigned_in, st.args[1], Any[]), st.args[2])
+    end
+    C = Set{Symbol}()
+    for (v, rhss) in assigned_in
+        v in params && continue
+        v in sc.host_assigned && continue
+        get(sc.host_uses, v, 0) == 0 || continue
+        any(cgen_glue_float_evident, rhss) || continue
+        push!(C, v)
+    end
+    sites = Dict{Symbol,Vector{Vector{Any}}}()
+    for (kn, args) in sc.launches
+        push!(get!(sites, kn, Vector{Any}[]), args)
+    end
+    function assigns_param(kn, pn)
+        found = Ref(false)
+        function w(e)
+            e isa Expr || return
+            (e.head === :(=) && e.args[1] === pn) && (found[] = true)
+            foreach(w, e.args)
+        end
+        w(kernels[kdef[kn]].args[2])
+        return found[]
+    end
+    forced_h = Set{UInt}()
+    labelsof(C) = [Symbol[objectid(st) in forced_h ? :h : cgen_glue_label(st, C, calls) for st in blk] for blk in blocks]
+    changed = true
+    while changed
+        changed = false
+        # a candidate that a launch cannot take as a box leaves the set: the callee is no kernel of this function, assigns the parameter, or another site passes a value there
+        for (kn, ss) in sites
+            npos = maximum(length(a) for a in ss)
+            for pos in 1:npos
+                cs = Symbol[a[pos] for a in ss if pos <= length(a) && a[pos] isa Symbol && a[pos] in C]
+                isempty(cs) && continue
+                good = haskey(kdef, kn) && length(cs) == length(ss)
+                if good
+                    kp = kernels[kdef[kn]].args[1].args[2:end]
+                    good = pos <= length(kp) && kp[pos] isa Symbol && !assigns_param(kn, kp[pos])
+                end
+                if !good
+                    for v in cs; delete!(C, v); end
+                    changed = true
+                end
+            end
+        end
+        labels = labelsof(C)
+        placed = [cgen_glue_place(blocks[b], labels[b]) for b in eachindex(blocks)]
+        # a local of a kernel must not be seen outside its run
+        for b in eachindex(blocks)
+            for (kind, rst) in placed[b][2]
+                kind === :d || continue
+                inrun = Set{UInt}(objectid(x) for x in rst)
+                for st in rst
+                    (st isa Expr && st.head === :(=) && st.args[1] isa Symbol) || continue
+                    v = st.args[1]
+                    v in C && continue
+                    bad = get(sc.host_uses, v, 0) > 0 || get(sc.launch_uses, v, 0) > 0 || v in params || v in sc.host_assigned || !cgen_glue_first_is_def(rst, v)
+                    for st2 in blocks[b]
+                        (objectid(st2) in inrun) && continue
+                        v in cgen_glue_syms!(Set{Symbol}(), st2) && (bad = true)
+                    end
+                    for b2 in eachindex(blocks)
+                        b2 == b && continue
+                        cgen_glue_first_is_def(blocks[b2], v) || (bad = true)
+                    end
+                    if bad && !(objectid(st) in forced_h)
+                        push!(forced_h, objectid(st)); changed = true
+                    end
+                end
+            end
+        end
+        # a candidate that a statement left on the host mentions is a host use
+        labels = labelsof(C)
+        for b in eachindex(blocks), (st, lb) in zip(blocks[b], labels[b])
+            lb === :d && continue
+            for v in intersect(cgen_glue_syms!(Set{Symbol}(), st), C)
+                delete!(C, v); changed = true
+            end
+            (st isa Expr && st.head === :(=) && st.args[1] isa Symbol && st.args[1] in C) && (delete!(C, st.args[1]); changed = true)
+        end
+    end
+    labels = labelsof(C)
+    placed = [cgen_glue_place(blocks[b], labels[b]) for b in eachindex(blocks)]
+    any(p -> any(r -> r[1] === :d, p[2]), placed) || return (host, kernels)
+    # ---- rewrite ----
+    hname = host.args[1].args[1]
+    base = endswith(string(hname), backend.suffix) ? string(hname)[1:end-length(backend.suffix)] : string(hname)
+    newk = copy(kernels)
+    nglue = Ref(0)
+    boxref(e) = e isa Symbol && e in C ? Expr(:ref, e, 1) : (e isa Expr ? Expr(e.head, Any[boxref(a) for a in e.args]...) : e)
+    # a call head must stay a symbol: boxref only touches symbols that are candidate names
+    function kernel_for(rst)
+        nglue[] += 1
+        kname = Symbol(backend.kernel_tag * "_glue_" * base * "_" * string(nglue[]) * "!")
+        body = Any[]
+        defined = Set{Symbol}(); free = Symbol[]
+        function note_reads(e)
+            for v in cgen_glue_syms!(Set{Symbol}(), e)
+                (v in defined) || v in free || push!(free, v)
+            end
+        end
+        for st in rst
+            lhs, rhs = st.args
+            note_reads(rhs)
+            if lhs isa Symbol
+                if lhs in C
+                    (lhs in defined) || lhs in free || push!(free, lhs)
+                    push!(body, Expr(:(=), Expr(:ref, lhs, 1), boxref(rhs)))
+                else
+                    push!(defined, lhs)
+                    push!(body, Expr(:(=), lhs, boxref(rhs)))
+                end
+            else
+                note_reads(lhs)
+                push!(body, Expr(:(=), boxref(lhs), boxref(rhs)))
+            end
+        end
+        # the free symbols that are candidates are boxes; every other free symbol is an array or a host value passed as it is
+        push!(body, emit_return_nothing())
+        push!(newk, Expr(:function, Expr(:call, kname, free...), Expr(:block, body...)))
+        return Expr(:macrocall, backend.launch_macro, nothing, Expr(:(=), backend.threads_kw, 1), Expr(:(=), backend.blocks_kw, 1), Expr(:call, kname, free...))
+    end
+    bi = Ref(0)
+    function rewrite(e)
+        e isa Expr || return e
+        if cgen_glue_is_block(e, asc)
+            bi[] += 1
+            b = bi[]
+            (hoisted, runs) = placed[b]
+            out = Any[]
+            append!(out, hoisted)
+            for (kind, rst) in runs
+                if kind === :d
+                    push!(out, kernel_for(rst))
+                else
+                    needs = any(st -> cgen_expr_has_ref(st) || !isempty(intersect(cgen_glue_syms!(Set{Symbol}(), st), C)), rst)
+                    push!(out, needs ? Expr(:macrocall, asc, nothing, Expr(:block, rst...)) : Expr(:block, rst...))
+                end
+            end
+            return Expr(:block, out...)
+        end
+        return Expr(e.head, Any[rewrite(a) for a in e.args]...)
+    end
+    newhost = rewrite(host)
+    # the boxes, at the top of the function; the kernels that took a candidate by value read its box
+    boxes = Any[Expr(:(=), v, Expr(:call, backend.arrtype, Expr(:vect, 0.0))) for v in sort(collect(C); by = string)]
+    rest = Any[st for st in newhost.args[2].args if !(st isa Expr && st.head === :(=) && st.args[1] isa Symbol && st.args[1] in C && st.args[1] in sc.zero_decls && st.args[2] isa Float64 && st.args[2] == 0.0)]
+    newhost = Expr(:function, newhost.args[1], Expr(:block, boxes..., rest...))
+    for (kn, ss) in sites
+        haskey(kdef, kn) || continue
+        kp = Any[a for a in kernels[kdef[kn]].args[1].args[2:end]]
+        pos_box = Set{Int}(pos for args in ss for (pos, a) in enumerate(args) if a isa Symbol && a in C)
+        isempty(pos_box) && continue
+        pn = Set{Symbol}(kp[pos] for pos in pos_box)
+        function sub(e)
+            e isa Symbol && e in pn && return Expr(:ref, e, 1)
+            e isa Expr || return e
+            return Expr(e.head, Any[sub(a) for a in e.args]...)
+        end
+        k = kernels[kdef[kn]]
+        newk[kdef[kn]] = Expr(:function, k.args[1], sub(k.args[2]))
+    end
+    return (newhost, newk)
+end
+
 # ---- host-side body walk: splits device kernels off ----
 # Host-side body walk: splits off one device kernel per eligible iteration-independent loop; anything left over runs as ordinary host-side
 # Julia, wrapped in one allowscalar_macro block if a touched statement reads a device array (confirmed live-GPU crash otherwise).
@@ -18693,7 +19041,7 @@ function cgen_colblock_apply(host::Expr, kernels::Vector{Expr}, backend; minN::I
 end
 
 function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(),
-                   warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, init_hosts = nothing, serial_loops::Bool = true)
+                   warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, init_hosts = nothing, serial_loops::Bool = true, glue_kernels::Bool = false)
     shared_private === false && (backend = merge(backend, (shared_private = false,)))
     coarsen > 1 && backend.kernel_tag == "cuda" && (backend = merge(backend, (coarsen = Int(coarsen), coarsen_min = Int(coarsen_min), coarsen_fill = Int(coarsen_fill), coarsen_occ = Float64(coarsen_occ))))
     shared_private isa Bool || (backend = merge(backend, (private_min_ratio = Int(shared_private),)))
@@ -18704,6 +19052,7 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
     p = precision === nothing ? backend.default_precision : precision
     # the serial track is written for CUDA and Float64: its UInt64 box holds the bits of a Float64
     serial_on = serial_loops && backend.kernel_tag == "cuda" && p === Float64
+    glue_on = glue_kernels && backend.kernel_tag == "cuda" && p === Float64
     serial_on && (backend = merge(backend, (serial_loops = true,)))
     if backend.precision_locked && p !== backend.default_precision
         error("stade_gpu: backend `$(backend.kernel_tag)` only supports precision=$(backend.default_precision) (got $(p)) -- $(backend.precision_lock_reason)")
@@ -18732,6 +19081,11 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
         # the serial kernels are new: they get the dead-scalar pass the other kernels got before the later passes
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
+    if glue_on
+        nk0 = length(kernels)
+        (host, kernels) = cgen_glue_apply(host, kernels, backend)
+        dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
+    end
     fresh_check && (host = cgen_fresh_check(host, fresh))
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
@@ -18740,8 +19094,8 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
 end
 
 stade_cuda(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), warp_atomics::Bool = true,
-           sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true) =
-    stade_gpu(expr, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops)
+           sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true, glue_kernels::Bool = false) =
+    stade_gpu(expr, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops, glue_kernels)
 stade_amdgpu(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
     stade_gpu(expr, cgen_backend_amdgpu(); precision, reduction_threshold, inbounds, dead_scalars)
 stade_metal(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
@@ -18753,7 +19107,7 @@ stade_metal(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothi
 # reduction emits BOTH an atomic-accumulate kernel and a mapreduce call, and picks between them at run time on the
 # loop's own trip count; reduction_threshold sets where that switch happens.
 function stade_gpu_file(in_path::String, out_path::String, backend; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(),
-                        warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true)
+                        warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true, glue_kernels::Bool = false)
     defs = io_read_kernel_bundle(in_path)
     kernels = Expr[]
     hosts = Expr[]
@@ -18763,7 +19117,7 @@ function stade_gpu_file(in_path::String, out_path::String, backend; precision::U
     # two functions that take stacks may share one `initstacks_*`: neither may change it then
     nclaim = count(d -> d isa Expr && d.args[1] isa Expr && !startswith(string(d.args[1].args[1]), "initstacks_") && any(a -> a isa Symbol && endswith(string(a), "_stack"), d.args[1].args[2:end]), defs)
     for expr in defs
-        plan = stade_gpu(expr, backend; precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops, init_hosts = (nclaim > 1 ? nothing : inits))
+        plan = stade_gpu(expr, backend; precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops, glue_kernels, init_hosts = (nclaim > 1 ? nothing : inits))
         append!(kernels, plan.kernels)
         push!(hosts, plan.host)
         for h in plan.helpers
@@ -18783,8 +19137,8 @@ function stade_gpu_file(in_path::String, out_path::String, backend; precision::U
 end
 
 stade_cuda_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), warp_atomics::Bool = true,
-                sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true) =
-    stade_gpu_file(in_path, out_path, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops)
+                sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true, glue_kernels::Bool = false) =
+    stade_gpu_file(in_path, out_path, cgen_backend_cuda(); precision, reduction_threshold, warp_atomics, sync_free_reduce, reduce_block, hoist_atomics, shared_private, gather_stencil, coarsen, coarsen_min, coarsen_fill, coarsen_occ, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_gather, contraction, reuse_stored, dead_stack, fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty, row_block, col_block, serial_loops, glue_kernels)
 stade_amdgpu_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
     stade_gpu_file(in_path, out_path, cgen_backend_amdgpu(); precision, reduction_threshold, inbounds, dead_scalars)
 stade_metal_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), inbounds::Bool = true, dead_scalars::Bool = true) =
@@ -19377,7 +19731,7 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
                                   keep_push_pop::Bool = false, fuse_ii_loops::Bool = false,
                                   mode::Symbol = :adjoint,
                                   reduction_threshold::Int = cgen_reduction_threshold_default(),
-                                  warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true)
+                                  warp_atomics::Bool = true, sync_free_reduce::Bool = true, reduce_block::Bool = true, hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, shared_private::Union{Bool,Integer} = true, coarsen::Integer = 1, coarsen_min::Integer = 256, coarsen_fill::Integer = 65536, coarsen_occ::Real = 0.6, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_gather::Integer = 4, contraction::Integer = 256, reuse_stored::Integer = 1, dead_stack::Integer = 2, fresh_gradient::Bool = false, fresh_check::Bool = false, split_coalesce::Bool = true, cublas::Int = 67108864, skip_empty::Bool = true, row_block::Integer = 256, col_block::Integer = 256, serial_loops::Bool = true, glue_kernels::Bool = false)
     keep_push_pop &&
         error("stade_validate_gpu_file: keep_push_pop=true has no GPU target -- :stack mode's push!/pop! is inherently host-only")
     mode in (:adjoint, :hvp) ||
@@ -19391,13 +19745,13 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
 
     gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
                              stade_adjoint(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
-    gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops)
+    gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, glue_kernels = glue_kernels)
     # reduction_threshold reaches the GPU parity oracle. Without it the choice had
     # no test that ran on a device: validate_corpus is CPU and
     # validate_offload counts loops. That is how a `dot` call no cuBLAS on
     # this cluster can execute, and a whole-array lowering of a partial
     # range, both survived in emitted code.
-    gpu_gen  = stade_gpu(mode == :hvp ? gen_out.hvp : gen_out.adjoint, backend; reduction_threshold = reduction_threshold, warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, init_hosts = Dict{Symbol,Expr}(gpu_init.host.args[1].args[1] => gpu_init.host))
+    gpu_gen  = stade_gpu(mode == :hvp ? gen_out.hvp : gen_out.adjoint, backend; reduction_threshold = reduction_threshold, warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, glue_kernels = glue_kernels, init_hosts = Dict{Symbol,Expr}(gpu_init.host.args[1].args[1] => gpu_init.host))
     gpu_init = merge(gpu_init, (host = cgen_shrink_stacks(gpu_init.host, gpu_gen.dead_stacks, gpu_gen.compact_stacks),))
     stack_arg_names = Symbol[a for a in gen_out.initstacks.args[1].args[2:end]]
     seeds = [val_random_values_like(kernel, baseline.values) for _ in 1:trials]

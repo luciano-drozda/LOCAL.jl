@@ -162,7 +162,7 @@ function validate_plain_read(; verbose = true, only = String[], values = true)
         for (lab, src) in (("primal", path), ("adjoint", b), ("hvp", joinpath(tmp, nm * "_h.jl")))
             lab == "primal" || ha === nothing && continue
             c = joinpath(tmp, nm * "_$lab" * "_cuda.jl"); j = joinpath(tmp, nm * "_$lab" * "_jacc.jl")
-            STADE.stade_cuda_file(src, c); STADE.stade_jacc_file(src, j)
+            STADE.stade_cuda_file(src, c; glue_kernels = false); STADE.stade_jacc_file(src, j)
             tc = read(c, String); tj = read(j, String)
             bc, rc = pv_check_boxes(tc, say, "$nm $lab CUDA")
             bj, rj = pv_check_boxes(tj, say, "$nm $lab JACC")

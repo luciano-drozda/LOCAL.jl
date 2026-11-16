@@ -164,7 +164,7 @@ function dp_unit_checks()
             stores, reads = dp_count(after, Set(stacks))
             ok_stores = want === :none ? (stores == 0 && reads == 0) : want === :some ? (stores > 0 && reads > 0) : true
             check(worst == 0.0 && ok_stores, "$(label): max difference $(worst), $(stores) stack store(s) and $(reads) read(s) left (want $(want))")
-            plan = STADE.stade_gpu(adj.adjoint, STADE.cgen_backend_cuda(); init_hosts = ih)
+            plan = STADE.stade_gpu(adj.adjoint, STADE.cgen_backend_cuda(); glue_kernels = false, init_hosts = ih)
             host = occursin("allowscalar", STADE.io_expr_to_source(plan.host))
             leaves && check(!host, "$(label): the forward loop is a device kernel")
         catch e
@@ -205,7 +205,7 @@ end""")
     ENV["STADE_DEAD_POPS"] = "0"
     try
         adj, ih = dp_adjoint(DP_UNIT[1][5])
-        plan = STADE.stade_gpu(adj.adjoint, STADE.cgen_backend_cuda(); init_hosts = ih)
+        plan = STADE.stade_gpu(adj.adjoint, STADE.cgen_backend_cuda(); glue_kernels = false, init_hosts = ih)
         check(occursin("allowscalar", STADE.io_expr_to_source(plan.host)), "STADE_DEAD_POPS=0 keeps the host loop")
     finally
         old === nothing ? delete!(ENV, "STADE_DEAD_POPS") : (ENV["STADE_DEAD_POPS"] = old)

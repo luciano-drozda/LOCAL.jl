@@ -39,15 +39,15 @@ module SerialStub
 end
 
 # the passes of stade_gpu that need CUDA hardware (warp shuffles, shared memory, cuBLAS, block reductions) are off; the serial track is on or off
-gpu_flags(serial) = merge((warp_atomics = false, sync_free_reduce = false, reduce_block = false, shared_private = false, contraction = 0, split_reduce = 0,
-                           row_block = 0, col_block = 0, cublas = 0), serial === nothing ? (;) : (serial_loops = serial,))
+gpu_flags(serial, glue = nothing) = merge((warp_atomics = false, sync_free_reduce = false, reduce_block = false, shared_private = false, contraction = 0, split_reduce = 0,
+                           row_block = 0, col_block = 0, cublas = 0), serial === nothing ? (;) : (serial_loops = serial,), glue === nothing ? (;) : (glue_kernels = glue,))
 
 function serial_kernel_names(plan)
     return [string(k.args[1].args[1]) for k in plan.kernels if startswith(string(k.args[1].args[1]), "cuda_serial_")]
 end
 
 # gradient of the CPU adjoint and of the stand-in GPU host function for one kernel and one draw. Returns (cpu, gpu, serial kernel names, plan)
-function serial_compare(primal::Expr; serial::Union{Bool,Nothing} = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint)
+function serial_compare(primal::Expr; serial::Union{Bool,Nothing} = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint, glue::Union{Bool,Nothing} = nothing)
     kernel = STADE.parse_kernel(primal)
     Random.seed!(seed)
     baseline = STADE.val_generate_baseline(kernel, primal; int_lo = int_lo, int_hi = int_hi, grow_max = 512)
@@ -64,11 +64,11 @@ function serial_compare(primal::Expr; serial::Union{Bool,Nothing} = true, seed::
     Core.eval(cm, :(using LinearAlgebra))
     Core.eval(cm, cpu_expr); Core.eval(cm, gen.initstacks)
     cpu = call(getfield(cm, cpu_expr.args[1].args[1]), getfield(cm, gen.initstacks.args[1].args[1]))
-    fl = gpu_flags(serial)
+    fl = gpu_flags(serial, glue)
     plan_init = STADE.stade_gpu(gen.initstacks, STADE.cgen_backend_cuda(); fl...)
     plan_gen = STADE.stade_gpu(cpu_expr, STADE.cgen_backend_cuda(); fl..., init_hosts = Dict{Symbol,Expr}(plan_init.host.args[1].args[1] => plan_init.host))
     plan_init = merge(plan_init, (host = STADE.cgen_shrink_stacks(plan_init.host, plan_gen.dead_stacks, plan_gen.compact_stacks),))
-    for h in plan_gen.helpers; Core.eval(SerialStub, h); end
+    for h in vcat(plan_init.helpers, plan_gen.helpers); Core.eval(SerialStub, h); end
     for k in plan_init.kernels; Core.eval(SerialStub, k); end
     Core.eval(SerialStub, plan_init.host)
     for k in plan_gen.kernels; Core.eval(SerialStub, k); end
