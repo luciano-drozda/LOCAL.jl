@@ -8,7 +8,7 @@
 #   4. ZERO TRIP: m = 0 and m = 1 give the CPU result.
 #   5. ORDER: a device read between two writes of the same cell sees the first write (the pass keeps the order of the statements of a block).
 #   6. CORPUS: every corpus kernel whose plan holds a glue kernel gives the CPU gradient and the CPU Hv, and the glue kernels removed scalar blocks.
-#   7. DEFAULT: `glue_kernels = false` gives no glue kernel and the host function of the serial track alone.
+#   7. DEFAULT: glue_kernels is on by default (v0.5.26); `glue_kernels = false` gives no glue kernel and the host function of the serial track alone.
 #
 #   julia validate_glue_kernels.jl [kernel names...]      (no names: every corpus kernel; run it on a cluster node)
 
@@ -98,6 +98,8 @@ function validate_glue_kernels(names = String[])
     # 7: the rollback
     rd = serial_compare(Meta.parse(src_gbasic); serial = true, glue = false)
     check(isempty(glue_names(rd.plan)) && relerr(rd.cpu, rd.gpu) <= 1e-12, "rollback: glue_kernels = false gives no glue kernel")
+    rdef = serial_compare(Meta.parse(src_gbasic); serial = true, glue = nothing)
+    check(!isempty(glue_names(rdef.plan)) && relerr(rdef.cpu, rdef.gpu) <= 1e-12, "default: glue_kernels is on when the caller does not say")
 
     # 6: corpus
     paths = corpus_paths()

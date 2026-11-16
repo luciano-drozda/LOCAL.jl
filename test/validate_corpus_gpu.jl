@@ -341,7 +341,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               only::Union{Vector{String},Nothing} = nothing,
                               int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
-                              fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = false,
+                              fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true,
                               jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
                               truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}())
     # truth: :off, :on_fail (the BigFloat truth decides a trial that differs from the CPU by more than rtol), :always; true and false mean :always and :off
