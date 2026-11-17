@@ -392,9 +392,12 @@ function bt_mode_expr(primal::Expr, mode::Symbol; fuse::Bool = true)
 end
 function bt_plan(expr::Expr, backend::Symbol, config::Symbol)
     if backend === :cuda
+        # :glue is :pinned with the glue kernels on (the serial track stays off: JACC has none; JACC glue is off by default in stade_jacc)
+        config === :glue && return STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); merge(BT_PIN_CUDA, (glue_kernels = true,))...)
         return config === :pinned ? STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); BT_PIN_CUDA...) :
                                     STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); serial_loops = false, glue_kernels = false)
     else
+        config === :glue && return STADE.stade_jacc(expr; merge(BT_PIN_JACC, (glue_kernels = true,))...)
         return config === :pinned ? STADE.stade_jacc(expr; BT_PIN_JACC...) : STADE.stade_jacc(expr)
     end
 end
