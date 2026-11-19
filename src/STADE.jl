@@ -17245,7 +17245,8 @@ function val_grow_shapes(kernel, primal_fn::Function, int_args::Dict{Symbol,Int}
         end
         idx_cap *= growth
     end
-    error("val_grow_shapes: could not find a working array size/index range up to $max_size for $(sig.name)")
+    error("val_grow_shapes: could not find a working array size/index range up to $max_size for $(sig.name) " *
+          "(every array gets the same length N, so a kernel that indexes by a product of integer arguments, `(e - 1) * nfeat + f`, needs N at or above that product: raise grow_max)")
 end
 
 # Orchestrates a full random baseline: random ints, a compiled primal probed to find safe array sizes, then
@@ -17334,7 +17335,8 @@ function val_generate_baseline(kernel, primal_expr::Expr;
                     cur_hi = max(1, div(cur_hi + 1, 2))
                     error("candidate baseline's own primal output is non-finite or too large " *
                           "(max|y|=$(maximum(abs.(y0); init = 0.0))) -- likely a diverging relaxation " *
-                          "under random, physically meaningless inputs")
+                          "under random, physically meaningless inputs, or an output that grows with the integer arguments by design " *
+                          "(a sum of squares over a large draw): raise max_output_magnitude")
                 end
                 f_jvp = (x, d) -> begin
                     vals = val_unflatten(kernel, int_args, values, x)
@@ -19321,14 +19323,14 @@ end
 # once, hand-edit the result, then validate repeatedly against it.
 function stade_generate_baseline_file(in_path::String; yaml_path::Union{String,Nothing} = nothing,
                                        scale::Float64 = 1.0, int_lo::Int = 3, int_hi::Int = 5,
-                                       grow_max::Int = 512,
+                                       grow_max::Int = 512, max_output_magnitude::Float64 = 1e6,
                                        self_check::Bool = true,
                                        divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing,
                                        int_pin::Union{Dict{Symbol,Int},Nothing} = nothing)
     primal_expr = io_read_corpus_entry(in_path)
     kernel = parse_kernel(primal_expr)
     baseline = val_generate_baseline(kernel, primal_expr; scale = scale, int_lo = int_lo, int_hi = int_hi,
-                                      grow_max = grow_max,
+                                      grow_max = grow_max, max_output_magnitude = max_output_magnitude,
                                       self_check = self_check, divisible_by = divisible_by, int_pin = int_pin)
     yp = yaml_path === nothing ? io_default_yaml_path(in_path) : yaml_path
     io_write_baseline_yaml(yp, kernel.sig.name, baseline.int_args, baseline.values)

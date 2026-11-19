@@ -38,6 +38,7 @@
 # kernels by name.
 
 include(joinpath(@__DIR__, "..", "src", "STADE.jl"))
+include(joinpath(@__DIR__, "gval_notes.jl"))   # gval_narrowed_note
 
 # The generated code (both CUDA's and JACC's) refers to CUDA.*, JACC.*,
 # and Atomix.* by name. Core.eval'ing it into Main needs these already
@@ -339,7 +340,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               write_generated::Bool = true,
                               modes::Vector{Symbol} = [:adjoint, :hvp],
                               only::Union{Vector{String},Nothing} = nothing,
-                              int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512,
+                              int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512, max_output_magnitude::Float64 = 1e6,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
                               fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = false,
                               jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
@@ -383,7 +384,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --
         # stencil_loss's adjoint was exact at i_n = 4 and wrong, differently on each run, from
         # i_n = 256 up. See test/validate_write_overlap.jl for the static gate on the same defect.
-        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
+        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
         primal_expr = STADE.io_read_corpus_entry(path)
         kernel = STADE.parse_kernel(primal_expr)
         baseline = STADE.io_read_baseline_yaml(yp)
@@ -444,7 +445,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                                         gen_out, plan_init, plan_gen, stack_arg_names,
                                         CuArray, Array, cuda_backend.atomic_macro;
                                         mode, tan_seeds, shtan_seeds, truth = tmode == :always, truth_on_fail = tmode == :on_fail)
-                push!(results, (kernel = name, mode = mode, backend = :cuda, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ","), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
+                push!(results, (kernel = name, mode = mode, backend = :cuda, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ",") * gval_narrowed_note(baseline.int_args, pins_of[name], int_lo), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
             catch e
                 println("  !! ", name, " [", mode, "/cuda] ", first(sprint(showerror, e), 4000))
                 push!(results, (kernel = name, mode = mode, backend = :cuda, status = :gen_error, max_rel_err = NaN, elements_changed = 0))
@@ -476,7 +477,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                                         gen_out, plan_init, plan_gen, stack_arg_names,
                                         x -> JACC.array(x), x -> JACC.to_host(x), jacc_atomic_macro;
                                         mode, tan_seeds, shtan_seeds, truth = tmode == :always, truth_on_fail = tmode == :on_fail)
-                push!(results, (kernel = name, mode = mode, backend = :jacc, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ","), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
+                push!(results, (kernel = name, mode = mode, backend = :jacc, status = (r.ok || (want_truth && r.truth_ok)) ? :ok : (r.vacuous ? :VACUOUS : :FAIL), max_rel_err = r.max_rel_err, elements_changed = r.elements_changed, rtol = r.rtol, ints = join(["$k=$v" for (k, v) in sort(collect(baseline.int_args))], ",") * gval_narrowed_note(baseline.int_args, pins_of[name], int_lo), via_truth = !r.ok && want_truth && r.truth_ok, tr_cpu = r.tr_cpu, tr_dev = r.tr_dev))
             catch e
                 println("  !! ", name, " [", mode, "/jacc] ", first(sprint(showerror, e), 4000))
                 push!(results, (kernel = name, mode = mode, backend = :jacc, status = :gen_error, max_rel_err = NaN, elements_changed = 0))
