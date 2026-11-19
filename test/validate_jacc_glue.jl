@@ -12,6 +12,74 @@
 
 include(joinpath(@__DIR__, "validate_glue_kernels.jl"))
 
+
+# a kernel whose HVP launches take more than jgen_max_splat_args() = 32 free variables, so the JACC launch packs them in one tuple (`__jargs_*`), and whose
+# loops accumulate into scalars that the planner boxes (alpha, beta and their adjoints). The tuple must hold the boxes: a box read as a value (`alphab[1]`)
+# makes the kernel atomic-add into a Float64 (v0.5.26: InvalidIRError on a device, a MethodError on the stand-in).
+src_jpack = raw"""
+# sv_pcg2d(b, dg, x, r, z, p, Ap, rz, s, t, nx, ny, maxit, tol2)
+#
+# Conjugate gradient with a diagonal preconditioner on the 2D five-point Laplacian
+# (nx by ny grid flattened row by row, zero border), at most maxit iterations.
+#
+# b: right-hand side of length nx * ny, zero on the border
+# dg: diagonal of the preconditioner, length nx * ny, nonzero
+# x: solution of length nx * ny, starts at zero
+# r: residual work array of length nx * ny
+# z: preconditioned residual work array of length nx * ny
+# p: search direction work array of length nx * ny
+# Ap: matrix-vector product work array of length nx * ny
+# rz: length-1 array holding r.z
+# s: length-1 array holding p.Ap
+# t: length-1 array holding the new r.z
+# nx: number of rows
+# ny: number of columns
+# maxit: iteration cap
+# tol2: tolerance on r.z
+function sv_pcg2d(b, dg, x, r, z, p, Ap, rz, s, t, nx, ny, maxit, tol2)
+    ni = nx - 2
+    nj = ny - 2
+    rz[1] = 0.0
+    for c = 1:nx * ny
+        r[c] = b[c]
+        z[c] = b[c] / dg[c]
+        p[c] = z[c]
+        x[c] = 0.0
+        Ap[c] = 0.0
+        rz[1] += b[c] * z[c]
+    end
+    for k = 1:maxit
+        if rz[1] > tol2
+            # matrix-vector product on the interior
+            for idx = 1:ni * nj
+                i = div(idx - 1, nj) + 2
+                j = mod(idx - 1, nj) + 2
+                c = (i - 1) * ny + j
+                Ap[c] = 4.0 * p[c] - p[c - 1] - p[c + 1] - p[c - ny] - p[c + ny]
+            end
+            s[1] = 0.0
+            for c = 1:nx * ny
+                s[1] += p[c] * Ap[c]
+            end
+            alpha = rz[1] / s[1]
+            t[1] = 0.0
+            for c = 1:nx * ny
+                x[c] += alpha * p[c]
+                r[c] -= alpha * Ap[c]
+                z[c] = r[c] / dg[c]
+                t[1] += r[c] * z[c]
+            end
+            beta = t[1] / rz[1]
+            for c = 1:nx * ny
+                p[c] = z[c] + beta * p[c]
+            end
+            rz[1] = t[1]
+        end
+    end
+    return nothing
+end
+"""
+
 module JStub
     module JACC
         array(x) = copy(x)
@@ -42,6 +110,15 @@ jacc_glue_names(plan) = [string(k.args[1].args[1]) for k in plan.kernels if star
 jacc_flags(glue) = (warp_atomics = false, split_reduce = 0, jacc_contraction = 0, reduction_threshold = typemax(Int) ÷ 2, glue_kernels = glue)
 
 # gradient of the CPU adjoint and of the stand-in JACC host function for one kernel and one draw. Returns (cpu, gpu, plan)
+# the argument tuples of the packed launches (`__jargs_* = (...)`) in a host expression
+function jacc_packed_tuples(e)
+    out = Expr[]
+    walk(x) = x isa Expr ? (x.head === :(=) && x.args[1] isa Symbol && startswith(String(x.args[1]), "__jargs_") && x.args[2] isa Expr && x.args[2].head === :tuple && push!(out, x.args[2]);
+                             foreach(walk, x.args)) : nothing
+    walk(e)
+    return out
+end
+
 function jacc_compare(primal::Expr; glue::Bool = true, seed::Int = 1, int_lo::Int = 3, int_hi::Int = 5, int_override::Dict{Symbol,Int} = Dict{Symbol,Int}(), mode::Symbol = :adjoint)
     kernel = STADE.parse_kernel(primal)
     Random.seed!(seed)
@@ -149,6 +226,19 @@ function validate_jacc_glue(names = String[])
     ok &= jacc_glue_case("order", src_gorder)
     for mm in (0, 1)
         ok &= jacc_glue_case("zero trip m = $mm", src_gbasic; ints = Dict(:m => mm), modes = (:adjoint,), expect_glue = mm > 0)
+    end
+
+
+    # packed launch with boxed scalars (HVP of a diagonally preconditioned CG: 35 free variables in one kernel), glue off and on
+    for gl in (false, true)
+        r = jacc_compare(Meta.parse(src_jpack); mode = :hvp, glue = gl)
+        e = relerr(r.cpu, r.gpu)
+        packed = !isempty(jacc_packed_tuples(r.plan.host))
+        tups = jacc_packed_tuples(r.plan.host)
+        ref_in_tuple = any(t -> any(x -> x isa Expr && x.head === :ref && length(x.args) == 2 && x.args[2] == 1, t.args), tups)
+        check(packed, "packed launch (glue $(gl)): the plan has a packed argument tuple")
+        check(!ref_in_tuple, "packed launch (glue $(gl)): no boxed scalar is read as a value inside a packed tuple")
+        check(e <= 1e-12, "packed launch (glue $(gl)): the HVP equals the CPU one (rel $(e))")
     end
 
     # rollback and default

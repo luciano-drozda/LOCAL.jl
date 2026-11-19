@@ -12563,6 +12563,8 @@ function cgen_host_box_refs(e, vars::Set{Symbol}, asc, inside::Bool = false)
         end
         return Expr(h, args...)
     end
+    # the argument tuple of a packed launch (jgen_launch_expr) holds the boxes themselves, like the arguments of an unpacked launch
+    h == :(=) && length(e.args) == 2 && e.args[1] isa Symbol && startswith(String(e.args[1]), "__jargs_") && e.args[2] isa Expr && e.args[2].head == :tuple && return e
     uses(e) || return e
     return inside ? sub(e) : wrap(Expr(:block, sub(e)))
 end
