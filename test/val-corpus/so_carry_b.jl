@@ -1,9 +1,8 @@
 function initstacks_so_carry_b(i_n)
-    run_stack = Vector{Float64}(undef, max(0, div(i_n - 1, 1) + 1) + 1)
-    return run_stack
+    return nothing
 end
 
-function so_carry_b(x, xb, w, wb, y, yb, loss, lossb, i_n, i_nc, run_stack)
+function so_carry_b(x, xb, w, wb, y, yb, loss, lossb, i_n, i_nc)
     a = 0.0
     run = 0.0
     wv = 0.0
@@ -21,8 +20,6 @@ function so_carry_b(x, xb, w, wb, y, yb, loss, lossb, i_n, i_nc, run_stack)
             wv = w[(ci - 1) * 3 + 3]
             a = a + x[t + 2] * wv
         end
-        __idx_run_stack_2 = (t - 1) + 1
-        run_stack[__idx_run_stack_2] = run
         run = run * 0.5 + a
         y[t] = run
     end
@@ -30,26 +27,19 @@ function so_carry_b(x, xb, w, wb, y, yb, loss, lossb, i_n, i_nc, run_stack)
         __cse_0 = y[k]
         loss[1] = loss[1] + __cse_0 * __cse_0
     end
-    __icse_1 = max(0, div(i_n - 1, 1) + 1) + 1
-    __idx_run_stack_3 = __icse_1
-    run_stack[__idx_run_stack_3] = run
-    __idx_run_stack_0 = __icse_1
-    run = run_stack[__idx_run_stack_0]
     for k = i_n:-1:1
-        __cse_2 = y[k] * lossb[1]
-        yb[k] = yb[k] + __cse_2
-        yb[k] = yb[k] + __cse_2
+        __cse_1 = y[k] * lossb[1]
+        yb[k] = yb[k] + __cse_1
+        yb[k] = yb[k] + __cse_1
     end
     for t = i_n:-1:1
         __oldb_0 = yb[t]
         yb[t] = 0.0
         runb = runb + __oldb_0
-        __idx_run_stack_0 = (t - 1) + 1
-        run = run_stack[__idx_run_stack_0]
-        __oldb_2 = runb
+        __oldb_0 = runb
         runb = 0.0
-        runb = runb + 0.5__oldb_2
-        ab = ab + __oldb_2
+        runb = runb + 0.5__oldb_0
+        ab = ab + __oldb_0
         for ci = i_nc:-1:1
             wv = w[(ci - 1) * 3 + 3]
             xb[t + 2] = xb[t + 2] + wv * ab

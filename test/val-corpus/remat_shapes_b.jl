@@ -1,11 +1,10 @@
 function initstacks_remat_shapes_b(i_n, i_nc)
     wv_stack = Vector{Float64}(undef, ((((((((((((((((((((max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1) * max(0, div(2 - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1)) + max(0, div(i_n - 1, 1) + 1))
     branch_stack = Vector{Int64}(undef, max(0, div(i_n - 1, 1) + 1) * max(0, div(i_nc - 1, 1) + 1))
-    u_stack = Vector{Float64}(undef, max(0, div(i_n - 1, 1) + 1) + max(0, div(i_n - 1, 1) + 1))
-    return (wv_stack, branch_stack, u_stack)
+    return (wv_stack, branch_stack)
 end
 
-function remat_shapes_b(x, xb, w, wb, y, yb, z, zb, u, ub, loss, lossb, s, sb, i_n, i_nc, wv_stack, branch_stack, u_stack)
+function remat_shapes_b(x, xb, w, wb, y, yb, z, zb, u, ub, loss, lossb, s, sb, i_n, i_nc, wv_stack, branch_stack)
     a = 0.0
     sc = 0.0
     wv = 0.0
@@ -192,37 +191,33 @@ function remat_shapes_b(x, xb, w, wb, y, yb, z, zb, u, ub, loss, lossb, s, sb, i
         wv_stack[__idx_wv_stack_0] = wv
         __cse_54 = u[t]
         wv = __cse_54
-        __idx_u_stack_3 = __icse_53
-        u_stack[__idx_u_stack_3] = __cse_54
         __cse_55 = x[t]
         u[t] = __cse_54 * 0.5 + __cse_55
         a = wv * wv * __cse_55
-        __idx_wv_stack_7 = (__icse_52 + __icse_49) + __icse_53
-        wv_stack[__idx_wv_stack_7] = wv
+        __idx_wv_stack_5 = (__icse_52 + __icse_49) + __icse_53
+        wv_stack[__idx_wv_stack_5] = wv
         wv = u[t]
         a = a + wv * wv * x[t + 1]
         z[6i_n + t] = a
     end
     for t = 1:i_n
-        __icse_56 = max(0, div(i_n - 1, 1) + 1)
-        __icse_57 = (t - 1) + 1
-        __idx_u_stack_0 = __icse_56 + __icse_57
-        u_stack[__idx_u_stack_0] = u[1]
-        __cse_58 = x[t]
-        __cse_59 = x[t + 1]
-        u[1] = __cse_58 * 0.5 + __cse_59
-        __icse_60 = max(0, div(i_nc - 1, 1) + 1)
-        __icse_61 = __icse_56 * __icse_60
-        __icse_62 = ((((((((((((((((((__icse_61 + __icse_56) + __icse_61) + __icse_61) + __icse_56) + __icse_61) + __icse_56) + __icse_61) + __icse_56 * __icse_60 * max(0, div(2 - 1, 1) + 1)) + __icse_61) + __icse_61) + __icse_61) + __icse_61) + __icse_61) + __icse_61) + __icse_56) + __icse_61) + __icse_56) + __icse_56) + __icse_56
-        __idx_wv_stack_3 = __icse_62 + __icse_57
-        wv_stack[__idx_wv_stack_3] = wv
+        __cse_56 = x[t]
+        __cse_57 = x[t + 1]
+        u[1] = __cse_56 * 0.5 + __cse_57
+        __icse_58 = max(0, div(i_n - 1, 1) + 1)
+        __icse_59 = max(0, div(i_nc - 1, 1) + 1)
+        __icse_60 = __icse_58 * __icse_59
+        __icse_61 = ((((((((((((((((((__icse_60 + __icse_58) + __icse_60) + __icse_60) + __icse_58) + __icse_60) + __icse_58) + __icse_60) + __icse_58 * __icse_59 * max(0, div(2 - 1, 1) + 1)) + __icse_60) + __icse_60) + __icse_60) + __icse_60) + __icse_60) + __icse_60) + __icse_58) + __icse_60) + __icse_58) + __icse_58) + __icse_58
+        __icse_62 = (t - 1) + 1
+        __idx_wv_stack_1 = __icse_61 + __icse_62
+        wv_stack[__idx_wv_stack_1] = wv
         __cse_63 = u[1]
         wv = __cse_63
-        a = wv * wv * __cse_58
-        __idx_wv_stack_7 = (__icse_62 + __icse_56) + __icse_57
-        wv_stack[__idx_wv_stack_7] = wv
+        a = wv * wv * __cse_56
+        __idx_wv_stack_5 = (__icse_61 + __icse_58) + __icse_62
+        wv_stack[__idx_wv_stack_5] = wv
         wv = __cse_63 * 2.0
-        a = a + wv * wv * __cse_59
+        a = a + wv * wv * __cse_57
         z[7i_n + t] = a
     end
     for m = 1:8i_n
@@ -263,12 +258,10 @@ function remat_shapes_b(x, xb, w, wb, y, yb, z, zb, u, ub, loss, lossb, s, sb, i
         __oldb_2 = wvb
         wvb = 0.0
         ub[1] = ub[1] + __oldb_2
-        __idx_u_stack_0 = __icse_67 + __icse_71
-        u[1] = u_stack[__idx_u_stack_0]
-        __oldb_2 = ub[1]
+        __oldb_0 = ub[1]
         ub[1] = 0.0
-        xb[t] = xb[t] + 0.5__oldb_2
-        xb[t + 1] = xb[t + 1] + __oldb_2
+        xb[t] = xb[t] + 0.5__oldb_0
+        xb[t + 1] = xb[t + 1] + __oldb_0
     end
     for t = i_n:-1:1
         __oldb_0 = zb[6i_n + t]
@@ -294,12 +287,10 @@ function remat_shapes_b(x, xb, w, wb, y, yb, z, zb, u, ub, loss, lossb, s, sb, i
         wvb = wvb + __cse_79
         wvb = wvb + __cse_79
         xb[t] = xb[t] + (wv * wv) * __oldb_0
-        __idx_u_stack_0 = __icse_78
-        u[t] = u_stack[__idx_u_stack_0]
-        __oldb_2 = ub[t]
+        __oldb_0 = ub[t]
         ub[t] = 0.0
-        ub[t] = ub[t] + 0.5__oldb_2
-        xb[t] = xb[t] + __oldb_2
+        ub[t] = ub[t] + 0.5__oldb_0
+        xb[t] = xb[t] + __oldb_0
         __idx_wv_stack_0 = __icse_77 + __icse_78
         wv = wv_stack[__idx_wv_stack_0]
         __oldb_2 = wvb

@@ -1,34 +1,24 @@
-function initstacks_fixed_sweeps_b(i_n)
-    y_stack = Vector{Float64}(undef, max(0, div(3 - 1, 1) + 1) * max(0, div(i_n - 1, 1) + 1))
-    return y_stack
+function initstacks_fixed_sweeps_b()
+    return nothing
 end
 
-function fixed_sweeps_hv(y, yb, x, xb, i_n, yd, ybd, xd, xbd, y_stack)
-    y_stack_d = Vector{Float64}(undef, length(y_stack))
+function fixed_sweeps_hv(y, yb, x, xb, i_n, yd, ybd, xd, xbd)
     for i_k = 1:3
         for i_i = 1:i_n
-            __idx_y_stack_0 = ((i_i - 1) + (i_k - 1) * (div(i_n - 1, 1) + 1)) + 1
-            __cse_0d = yd[i_i]
-            __cse_0 = y[i_i]
-            y_stack_d[__idx_y_stack_0] = __cse_0d
-            y_stack[__idx_y_stack_0] = __cse_0
-            yd[i_i] = 0.5__cse_0d + xd[i_i]
-            y[i_i] = 0.5__cse_0 + x[i_i]
+            yd[i_i] = 0.5 * yd[i_i] + xd[i_i]
+            y[i_i] = 0.5 * y[i_i] + x[i_i]
         end
     end
     for i_k = 3:-1:1
         for i_i = i_n:-1:1
-            __idx_y_stack_0 = ((i_i - 1) + (i_k - 1) * (div(i_n - 1, 1) + 1)) + 1
-            yd[i_i] = y_stack_d[__idx_y_stack_0]
-            y[i_i] = y_stack[__idx_y_stack_0]
-            __oldb_2d = ybd[i_i]
-            __oldb_2 = yb[i_i]
+            __oldb_0d = ybd[i_i]
+            __oldb_0 = yb[i_i]
             ybd[i_i] = 0.0
             yb[i_i] = 0.0
-            ybd[i_i] = ybd[i_i] + 0.5__oldb_2d
-            yb[i_i] = yb[i_i] + 0.5__oldb_2
-            xbd[i_i] = xbd[i_i] + __oldb_2d
-            xb[i_i] = xb[i_i] + __oldb_2
+            ybd[i_i] = ybd[i_i] + 0.5__oldb_0d
+            yb[i_i] = yb[i_i] + 0.5__oldb_0
+            xbd[i_i] = xbd[i_i] + __oldb_0d
+            xb[i_i] = xb[i_i] + __oldb_0
         end
     end
     return nothing
