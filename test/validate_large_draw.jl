@@ -8,7 +8,12 @@
 # This test shows each cause, shows the knob that lifts it, and that a run that asked for large integers and got small ones now says so.
 #   julia validate_large_draw.jl
 isdefined(Main, :STADE) || include(joinpath(@__DIR__, "..", "src", "STADE.jl"))
-include(joinpath(@__DIR__, "gval_notes.jl"))
+# validate_corpus_gpu.jl runs on include, so the helper is read out of its text
+let src = read(joinpath(@__DIR__, "validate_corpus_gpu.jl"), String)
+    a = findfirst("# ---- begin gval_narrowed_note", src); b = findfirst("# ---- end gval_narrowed_note ----", src)
+    (a === nothing || b === nothing) && error("validate_large_draw: gval_narrowed_note block not found in validate_corpus_gpu.jl")
+    include_string(Main, src[first(a):last(b)])
+end
 
 function validate_large_draw()
     ok = true

@@ -38,7 +38,6 @@
 # kernels by name.
 
 include(joinpath(@__DIR__, "..", "src", "STADE.jl"))
-include(joinpath(@__DIR__, "gval_notes.jl"))   # gval_narrowed_note
 
 # The generated code (both CUDA's and JACC's) refers to CUDA.*, JACC.*,
 # and Atomix.* by name. Core.eval'ing it into Main needs these already
@@ -79,6 +78,15 @@ end
 # an array, so `wrap` applies only when the entry is an array. `wrap`
 # is `identity` on the CPU side, and CuArray or JACC.array on the
 # device side.
+# ---- begin gval_narrowed_note (validate_large_draw.jl reads this block out of the file, which runs on include) ----
+# A draw asks for integers of at least int_lo; the baseline generator halves the upper end of the range after a candidate whose output is too large
+# or diverges, so a run that asked for a large draw can come back with small integers. The row says so instead of passing as a large one.
+function gval_narrowed_note(int_args::Dict, pinned::Dict, int_lo::Int)
+    low = sort([String(a) for (a, v) in int_args if !haskey(pinned, a) && v < int_lo])
+    return isempty(low) ? "" : " narrowed=" * join(low, ",") * "<" * string(int_lo)
+end
+# ---- end gval_narrowed_note ----
+
 function gval_stack_extra(names::Vector{Symbol}, int_args::Dict, values::Dict, wrap)
     return Any[haskey(int_args, n) ? int_args[n] :
                (values[n] isa AbstractArray ? wrap(deepcopy(values[n])) : values[n])
