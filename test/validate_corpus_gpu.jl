@@ -348,7 +348,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               write_generated::Bool = true,
                               modes::Vector{Symbol} = [:adjoint, :hvp],
                               only::Union{Vector{String},Nothing} = nothing,
-                              int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512, max_output_magnitude::Float64 = 1e6,
+                              int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512, max_output_magnitude::Float64 = 1e6, scale::Float64 = 1.0,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
                               fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = false,
                               jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
@@ -392,7 +392,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --
         # stencil_loss's adjoint was exact at i_n = 4 and wrong, differently on each run, from
         # i_n = 256 up. See test/validate_write_overlap.jl for the static gate on the same defect.
-        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
+        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, scale = scale, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
         primal_expr = STADE.io_read_corpus_entry(path)
         kernel = STADE.parse_kernel(primal_expr)
         baseline = STADE.io_read_baseline_yaml(yp)
