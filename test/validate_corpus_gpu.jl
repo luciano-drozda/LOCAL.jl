@@ -392,7 +392,14 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --
         # stencil_loss's adjoint was exact at i_n = 4 and wrong, differently on each run, from
         # i_n = 256 up. See test/validate_write_overlap.jl for the static gate on the same defect.
-        isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, scale = scale, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
+        # a kernel that cannot get a baseline (rank-2 arrays, a draw that never avoids a domain error) is reported and skipped: it must not drop the kernels after it
+        try
+            isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, scale = scale, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
+        catch e
+            println("  !! ", name, " [baseline] ", first(sprint(showerror, e), 4000))
+            push!(results, (kernel = name, mode = :baseline, backend = :baseline, status = :no_baseline, max_rel_err = NaN, elements_changed = 0))
+            continue
+        end
         primal_expr = STADE.io_read_corpus_entry(path)
         kernel = STADE.parse_kernel(primal_expr)
         baseline = STADE.io_read_baseline_yaml(yp)
