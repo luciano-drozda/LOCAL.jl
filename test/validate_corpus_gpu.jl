@@ -350,7 +350,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               only::Union{Vector{String},Nothing} = nothing,
                               int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512, max_output_magnitude::Float64 = 1e6, scale::Float64 = 1.0,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
-                              fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = false,
+                              fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = false, jacc_async_wait::Bool = true,
                               jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
                               truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}())
     # truth: :off, :on_fail (the BigFloat truth decides a trial that differs from the CPU by more than rtol), :always; true and false mean :always and :off
@@ -464,8 +464,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         if run_jacc
             try
                 # split_min_inner = 0 and a large split_max_out force the shared-memory twin onto every kernel the split accepts, whatever the corpus sizes
-                plan_init = STADE.stade_jacc(gen_out.initstacks; split_reduce = jacc_split_reduce, split_min_inner = jacc_split_min_inner, split_max_out = jacc_split_max_out, warp_atomics = jacc_warp, jacc_contraction = jacc_contraction, jacc_tile_fill = jacc_tile_fill, glue_kernels = jacc_glue, jacc_async = jacc_async)
-                plan_gen  = STADE.stade_jacc(gen_expr; reduction_threshold, split_reduce = jacc_split_reduce, split_min_inner = jacc_split_min_inner, split_max_out = jacc_split_max_out, warp_atomics = jacc_warp, jacc_contraction = jacc_contraction, jacc_dead_pops = jacc_dead_pops, jacc_tile_fill = jacc_tile_fill, init_hosts = Dict{Symbol,Expr}(gen_out.initstacks.args[1].args[1] => gen_out.initstacks), glue_kernels = jacc_glue, jacc_async = jacc_async)
+                plan_init = STADE.stade_jacc(gen_out.initstacks; split_reduce = jacc_split_reduce, split_min_inner = jacc_split_min_inner, split_max_out = jacc_split_max_out, warp_atomics = jacc_warp, jacc_contraction = jacc_contraction, jacc_tile_fill = jacc_tile_fill, glue_kernels = jacc_glue, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait)
+                plan_gen  = STADE.stade_jacc(gen_expr; reduction_threshold, split_reduce = jacc_split_reduce, split_min_inner = jacc_split_min_inner, split_max_out = jacc_split_max_out, warp_atomics = jacc_warp, jacc_contraction = jacc_contraction, jacc_dead_pops = jacc_dead_pops, jacc_tile_fill = jacc_tile_fill, init_hosts = Dict{Symbol,Expr}(gen_out.initstacks.args[1].args[1] => gen_out.initstacks), glue_kernels = jacc_glue, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait)
                 if write_generated
                     open(joinpath(dir, name * suffix * "_jacc.jl"), "w") do f
                         for h in vcat(plan_init.helpers, plan_gen.helpers)

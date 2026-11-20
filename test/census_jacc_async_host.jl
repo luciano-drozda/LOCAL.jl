@@ -41,6 +41,7 @@ function async_audited_forms()
         "call:JACC.zeros" => "allocates and fills on the same stream; probed after a launch",
         "call:CUDA.CuArray{Float64}" => "a host to device copy on the same stream (the form of JACC.array)",
         "call:CUDA.unsafe_free!" => "the free is ordered on the stream; probed (free, reallocate, fill, then read the kernel result)",
+        "call:JACC.synchronize" => "the exit wait (`jacc_async_wait`): waits for the stream once, before every return of the host function",
         "call:JACC.default_backend" => "a query, no device access",
         "call:Base.cld" => "integer arithmetic",
     )
@@ -65,6 +66,32 @@ function async_unaudited(forms::Dict{String,Int}; aud::Dict{String,String} = asy
         end
     end
     return out
+end
+
+# The returns of a host function that do not directly follow the exit wait (`JACC.synchronize()`). With `jacc_async_wait` there must be none: a return that skips the wait gives the
+# caller a result whose kernels may still run.
+function async_unwaited_returns(e)
+    n = Ref(0)
+    wait = Expr(:call, Expr(:., :JACC, QuoteNode(:synchronize)))
+    function walk(x)
+        x isa Expr || return
+        if x.head === :block
+            stmts = Any[a for a in x.args if !(a isa LineNumberNode)]
+            for (i, a) in enumerate(stmts)
+                if a isa Expr && a.head === :return
+                    (i > 1 && stmts[i - 1] == wait) || (n[] += 1)
+                    foreach(walk, a.args)   # the return itself is judged here, only its value is walked
+                else
+                    walk(a)
+                end
+            end
+            return
+        end
+        x.head === :return && (n[] += 1)   # a return outside a block has no statement before it
+        foreach(walk, x.args)
+    end
+    walk(e)
+    return n[]
 end
 
 function census_walk!(e, forms::Dict{String,Int}; in_launch::Bool = false, async_launches::Ref{Int} = Ref(0), sync_launches::Ref{Int} = Ref(0))
@@ -110,6 +137,8 @@ function census_kernel(name, primal)
             a = Ref(0); s = Ref(0)
             census_walk!(pl.host, out; async_launches = a, sync_launches = s)
             nasync += a[]; nsync += s[]
+            nun = async_unwaited_returns(pl.host)
+            nun > 0 && (out["UNWAITED return"] = get(out, "UNWAITED return", 0) + nun)
         end
     end
     return out, nasync, nsync
@@ -136,6 +165,7 @@ function main(names)
     end
     println("FORMS ", join(["$k=$v" for (k, v) in sort(collect(merged))], " | "))
     ua = async_unaudited(merged)
+    haskey(merged, "UNWAITED return") && push!(ua, "UNWAITED return ($(merged["UNWAITED return"]))")
     isempty(ua) || println("UNAUDITED ", join(ua, " | "))
     println("TOTALS kernels=$nk errors=$nerr async_launches=$tot_async waiting_launches=$tot_sync")
     return isempty(ua)

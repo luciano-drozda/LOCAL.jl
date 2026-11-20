@@ -16430,6 +16430,8 @@ end
 # JACC's default launch synchronizes the stream after every kernel (CUDA.@sync). `sync = false` leaves the kernels in the stream; kernels of one stream run in order, so the
 # next launch needs no wait, and any read of a device array from the host (JACC.to_host, Array(x), a scalar read) waits for the stream by itself. What changes is the return of the
 # generated host function: it returns when the last kernel is queued, not finished. A caller that times it, or hands a device array to another stream, synchronizes first.
+# `jacc_async_wait = true` (the default with `jacc_async = true`) removes that burden: the host function waits once, at its exit (`jgen_async_exit_wait`), so the launches inside stay
+# asynchronous and the caller sees finished kernels. `jacc_async_wait = false` is the v0.5.26 behavior above.
 # Measured on a V100: 2 to 7 percent of the adjoint of unet2, transformer and mlp3_push, more for a kernel of many short launches.
 function jgen_async_launches(e)
     e isa Expr || return e
@@ -16440,6 +16442,31 @@ function jgen_async_launches(e)
         return Expr(:call, e.args[1], Expr(:parameters, e.args[2].args..., Expr(:kw, :sync, false)), e.args[3:end]...)
     end
     return Expr(e.head, Any[jgen_async_launches(a) for a in e.args]...)
+end
+
+# Every `return` of the host function first waits for the stream. A return value is computed before the wait (it can be a host scalar read from the device, which waits itself). A
+# function that falls off its end returns the value of its last statement, so that statement is treated the same way. An exception leaves the queue as it is: a failed call has no result.
+function jgen_async_exit_wait(host::Expr)
+    host.head === :function || return host
+    wait = Expr(:call, Expr(:., :JACC, QuoteNode(:synchronize)))
+    function rew(e)
+        e isa Expr || return e
+        if e.head === :return
+            v = isempty(e.args) ? :nothing : rew(e.args[1])
+            return Expr(:block, Expr(:(=), :__jr, v), wait, Expr(:return, :__jr))
+        end
+        return Expr(e.head, Any[rew(a) for a in e.args]...)
+    end
+    body = rew(host.args[2])
+    if !(body isa Expr && body.head === :block && !isempty(body.args))
+        body = Expr(:block, body)
+    end
+    last_stmt = body.args[end]
+    # a tail `return` is already rewritten into a block that waits; anything else is waited for here
+    if !(last_stmt isa Expr && last_stmt.head === :block && length(last_stmt.args) == 3 && last_stmt.args[2] == wait)
+        body.args[end] = Expr(:block, Expr(:(=), :__jr, last_stmt), wait, :__jr)
+    end
+    return Expr(:function, host.args[1], body)
 end
 
 jgen_split_backend_flag() = :__stade_jcu
@@ -19163,7 +19190,7 @@ stade_metal_file(in_path::String, out_path::String; precision::Union{Nothing, Ty
 # locked default here for the same reason: Float64 unless the caller asks otherwise.
 # On JACC a matched reduction becomes one
 # JACC.@parallel_reduce call instead of @parallel_for + Atomix.@atomic.
-function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64, glue_kernels::Bool = false, init_hosts = nothing)
+function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_async_wait::Bool = true, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64, glue_kernels::Bool = false, init_hosts = nothing)
     dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))
     merge_accum && (expr = cgen_merge_accum(expr))
     plan = jgen_emit(cgen_gather_stencil(cgen_ingest(expr), gather_stencil); reduction_threshold, hoist_atomics)
@@ -19177,6 +19204,7 @@ function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}}
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
     jacc_async && (host = jgen_async_launches(host))
+    jacc_async && jacc_async_wait && (host = jgen_async_exit_wait(host))
     warp_atomics && (kernels = Expr[jgen_contraction_tile_kernel(k) ? k : jgen_warp_atomics(k) for k in kernels])
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     helpers = any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) ? cgen_warp_helper_exprs(; jacc = true) : Expr[]
@@ -19186,7 +19214,7 @@ function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}}
             kernels = Expr[cgen_convert_precision(k, p) for k in kernels], helpers = helpers)
 end
 
-function stade_jacc_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64, glue_kernels::Bool = false)
+function stade_jacc_file(in_path::String, out_path::String; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_async_wait::Bool = true, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64, glue_kernels::Bool = false)
     defs = io_read_kernel_bundle(in_path)
     kernels = Expr[]
     hosts = Expr[]
@@ -19195,7 +19223,7 @@ function stade_jacc_file(in_path::String, out_path::String; precision::Union{Not
     nclaim = count(d -> d isa Expr && d.args[1] isa Expr && !startswith(string(d.args[1].args[1]), "initstacks_") && any(a -> a isa Symbol && endswith(string(a), "_stack"), d.args[1].args[2:end]), defs)
     inits = Dict{Symbol,Expr}(d.args[1].args[1] => d for d in defs if d isa Expr && d.head === :function && d.args[1] isa Expr && d.args[1].head === :call && startswith(string(d.args[1].args[1]), "initstacks_"))
     for expr in defs
-        plan = stade_jacc(expr; precision, reduction_threshold, hoist_atomics, gather_stencil, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_coalesce, warp_atomics, jacc_async, jacc_contraction, jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits), glue_kernels)
+        plan = stade_jacc(expr; precision, reduction_threshold, hoist_atomics, gather_stencil, inbounds, dead_scalars, merge_accum, split_reduce, split_fallback, split_min_inner, split_max_out, split_coalesce, warp_atomics, jacc_async, jacc_async_wait, jacc_contraction, jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits), glue_kernels)
         for h in plan.helpers
             any(x -> x == h, helpers) || push!(helpers, h)
         end
@@ -19827,7 +19855,7 @@ function stade_validate_jacc_file(in_path::String, out_path::String;
                                    self_check::Bool = true,
                                    keep_push_pop::Bool = false, fuse_ii_loops::Bool = false,
                                    mode::Symbol = :adjoint,
-                                   reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64)
+                                   reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = false, jacc_async_wait::Bool = true, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64)
     keep_push_pop &&
         error("stade_validate_jacc_file: keep_push_pop=true has no GPU target -- :stack mode's push!/pop! is inherently host-only")
     mode in (:adjoint, :hvp) ||
@@ -19842,8 +19870,8 @@ function stade_validate_jacc_file(in_path::String, out_path::String;
     gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
                              stade_adjoint(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
     backend = val_jacc_backend()
-    jacc_init = stade_jacc(gen_out.initstacks; hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, jacc_async = jacc_async, jacc_contraction = jacc_contraction)
-    jacc_gen  = stade_jacc(mode == :hvp ? gen_out.hvp : gen_out.adjoint; reduction_threshold = reduction_threshold, hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, jacc_async = jacc_async, jacc_contraction = jacc_contraction, jacc_dead_pops = jacc_dead_pops, jacc_tile_fill = jacc_tile_fill, glue_kernels = glue_kernels, init_hosts = Dict{Symbol,Expr}(gen_out.initstacks.args[1].args[1] => gen_out.initstacks))
+    jacc_init = stade_jacc(gen_out.initstacks; hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait, jacc_contraction = jacc_contraction)
+    jacc_gen  = stade_jacc(mode == :hvp ? gen_out.hvp : gen_out.adjoint; reduction_threshold = reduction_threshold, hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait, jacc_contraction = jacc_contraction, jacc_dead_pops = jacc_dead_pops, jacc_tile_fill = jacc_tile_fill, glue_kernels = glue_kernels, init_hosts = Dict{Symbol,Expr}(gen_out.initstacks.args[1].args[1] => gen_out.initstacks))
     stack_arg_names = Symbol[a for a in gen_out.initstacks.args[1].args[2:end]]
     seeds = [val_random_values_like(kernel, baseline.values) for _ in 1:trials]
     tan_seeds   = mode == :hvp ? [val_random_values_like(kernel, baseline.values) for _ in 1:trials] : Any[]
