@@ -140,7 +140,7 @@ function validate_scalar_acc(; verbose = true, only = String[])
         for (lab, src) in (("primal", path), ("adjoint", b))
             lab == "adjoint" && ha === nothing && continue
             c = joinpath(tmp, nm * "_$lab" * "_cuda.jl"); j = joinpath(tmp, nm * "_$lab" * "_jacc.jl")
-            STADE.stade_cuda_file(src, c; glue_kernels = false); STADE.stade_jacc_file(src, j)
+            STADE.stade_cuda_file(src, c; glue_kernels = false); STADE.stade_jacc_file(src, j; jacc_async = false, glue_kernels = false)
             bc = sa_check_boxes(read(c, String), say, "$nm $lab CUDA")
             bj = sa_check_boxes(read(j, String), say, "$nm $lab JACC")
             say(bc == bj, "$nm $lab: the CUDA and JACC outputs box different locals ($(sort(collect(bc))) vs $(sort(collect(bj))))")

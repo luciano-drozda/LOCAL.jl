@@ -381,7 +381,7 @@ end
 # ---------------------------------------------------------------- generation in each mode and backend
 const BT_PIN_CUDA = (warp_atomics = false, shared_private = false, coarsen = 0, row_block = 0, col_block = 0,
                      reduce_block = false, inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0, serial_loops = false, glue_kernels = false)
-const BT_PIN_JACC = (inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0)
+const BT_PIN_JACC = (inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0, jacc_async = false, glue_kernels = false)
 
 function bt_mode_expr(primal::Expr, mode::Symbol; fuse::Bool = true)
     mode === :primal && return primal
@@ -392,13 +392,13 @@ function bt_mode_expr(primal::Expr, mode::Symbol; fuse::Bool = true)
 end
 function bt_plan(expr::Expr, backend::Symbol, config::Symbol)
     if backend === :cuda
-        # :glue is :pinned with the glue kernels on (the serial track stays off: JACC has none; JACC glue is off by default in stade_jacc)
+        # :glue is :pinned with the glue kernels on (the serial track stays off: JACC has none; the battle suites pin JACC async and glue off, like CUDA serial and glue)
         config === :glue && return STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); merge(BT_PIN_CUDA, (glue_kernels = true,))...)
         return config === :pinned ? STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); BT_PIN_CUDA...) :
                                     STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); serial_loops = false, glue_kernels = false)
     else
         config === :glue && return STADE.stade_jacc(expr; merge(BT_PIN_JACC, (glue_kernels = true,))...)
-        return config === :pinned ? STADE.stade_jacc(expr; BT_PIN_JACC...) : STADE.stade_jacc(expr)
+        return config === :pinned ? STADE.stade_jacc(expr; BT_PIN_JACC...) : STADE.stade_jacc(expr; jacc_async = false, glue_kernels = false)
     end
 end
 # plan text for hashing and size

@@ -202,7 +202,7 @@ function validate_backend_agreement(dir::String = joinpath(@__DIR__, "val-corpus
             expr = mode == :hvp ? gen.hvp : gen.adjoint
             cu = STADE.stade_gpu(expr, STADE.cgen_backend_cuda(); inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0, shared_private = false,
                                  reduce_block = false, row_block = 0, serial_loops = false, glue_kernels = false)   # the serial track is CUDA only: JACC has no counterpart
-            ja = STADE.stade_jacc(expr; inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0)
+            ja = STADE.stade_jacc(expr; inbounds = false, dead_scalars = false, split_reduce = 0, warp_atomics = false, jacc_contraction = 0, jacc_async = false, glue_kernels = false)   # the twin compares host shape with CUDA, which has no async launches and, here, no glue kernels: both JACC defaults are pinned off
 
             problems = String[]
             cu_shapes = host_loop_shapes(cu.host)

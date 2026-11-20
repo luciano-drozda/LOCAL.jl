@@ -33,6 +33,7 @@ function jsp_init!()
         const FAIL = Ref{Any}(nothing)                  # an error message to raise from every twin launch
         const SPECS = Any[]
         default_backend() = BACKEND[]
+        synchronize() = nothing                         # the stand-in runs every launch to completion before it returns
         macro init_backend() nothing end
         struct LaunchSpec
             threads::Any

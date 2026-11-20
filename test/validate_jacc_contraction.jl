@@ -29,7 +29,7 @@ function jcn_run_body(src::String, entry::Symbol, args, contraction::Int; split:
     J.FAIL[] = nothing
     J.BACKEND[] = backend === :cuda ? J.CUDABackend() : J.OtherBackend()
     empty!(J.SPECS)
-    plan = STADE.stade_jacc(Meta.parse(src); inbounds = false, split_reduce = split, split_fallback = 0, split_min_inner = 0, split_max_out = 10^9, warp_atomics = warp, jacc_contraction = contraction, jacc_tile_fill = fill)
+    plan = STADE.stade_jacc(Meta.parse(src); inbounds = false, split_reduce = split, split_fallback = 0, split_min_inner = 0, split_max_out = 10^9, warp_atomics = warp, jacc_contraction = contraction, jacc_tile_fill = fill, jacc_async = false, glue_kernels = false)   # the twin is checked on its own host shape: jacc_contraction is opt-in, so the defaults it would meet (async launches, glue kernels) are pinned off
     kernels = mutate === nothing ? plan.kernels : mutate(plan.kernels)
     for k in kernels; Core.eval(Main, k); end
     Core.eval(Main, plan.host)

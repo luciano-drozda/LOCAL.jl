@@ -153,11 +153,11 @@ function validate_jacc_dead_pops(; phases = (:units, :file, :fill, :sabotage), s
             ("the pass is not applied in stade_jacc", "    dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))\n", ""),
             ("the switch is ignored", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))"),
             ("dead_scalars = false does not stop it", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", "jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))"),
-            ("the file driver passes no initstacks", "jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits))", "jacc_dead_pops, jacc_tile_fill)"),
+            ("the file driver passes no initstacks", "jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits), glue_kernels)", "jacc_dead_pops, jacc_tile_fill, glue_kernels)"),
             ("the fill gate is dropped", "    fill > 16 && (cond = Expr(:&&, cond, call(:>=, call(:min, d.Mh, d.Nh), min(cmin, fill))))\n", ""),
             ("the fill gate looks at one side only", "call(:>=, call(:min, d.Mh, d.Nh), min(cmin, fill))", "call(:>=, d.Nh, min(cmin, fill))"),
             ("the JACC forward twin ignores the fill", "t = cgen_contraction_emit(d; cmin, fill)", "t = cgen_contraction_emit(d; cmin)"),
-            ("the file driver ignores a shared initstacks", "jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits))", "jacc_dead_pops, jacc_tile_fill, init_hosts = inits)"),
+            ("the file driver ignores a shared initstacks", "jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits), glue_kernels)", "jacc_dead_pops, jacc_tile_fill, init_hosts = inits, glue_kernels)"),
         ]
         mktempdir() do tmp
             for (label, old, new) in cases[intersect(eachindex(cases), slice)]

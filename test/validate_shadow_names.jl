@@ -48,6 +48,8 @@ println(nm_ok ? "ok   " : "FAIL ", "message names both variables")
 for d in ("val-corpus", "battle-corpus", "int-state-corpus")
     dir = joinpath(@__DIR__, d); bad = String[]
     for f in sort(readdir(dir)); endswith(f, ".jl") || continue
+        # a stored generated file (`name_d.jl`, `name_b.jl`, `name_hv.jl` next to `name.jl`) holds shadow names by construction
+        any(sfx -> endswith(f, sfx * ".jl") && isfile(joinpath(dir, f[1:end-length(sfx)-3] * ".jl")), ("_hv", "_b", "_d")) && continue
         try STADE.parse_kernel(STADE.io_read_corpus_entry(joinpath(dir, f))) catch ex; occursin("shadow of", sprint(showerror, ex)) && push!(bad, f); end
     end
     global fails += isempty(bad) ? 0 : 1

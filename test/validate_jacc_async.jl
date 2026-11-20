@@ -64,11 +64,14 @@ function validate_jacc_async()
         aud = async_audited_forms(); delete!(aud, "macro:@allowscalar")
         haskey(forms, "macro:@allowscalar") && check(async_unaudited(forms; aud) == ["macro:@allowscalar"], "plans $n sabotage: without @allowscalar on the list, that form is reported")
     end
-    # the default is untouched: a plan without jacc_async has no `sync = false`
+    # the default is on (v0.5.26): asynchronous launches and one exit wait; `jacc_async = false` is the rollback
     gen = STADE.stade_adjoint(STADE.io_read_corpus_entry(paths["br_cg1d2"]); keep_push_pop = false, fuse_ii_loops = true)
     pd = STADE.stade_jacc(gen.adjoint)
     (fd, nad, _) = forms_of(pd.host)
-    check(nad == 0 && !haskey(fd, "call:JACC.synchronize"), "default: stade_jacc without jacc_async has no asynchronous launch and no exit wait")
+    check(nad > 0 && get(fd, "call:JACC.synchronize", 0) >= 1 && async_unwaited_returns(pd.host) == 0, "default: stade_jacc has asynchronous launches and an exit wait before every return")
+    po = STADE.stade_jacc(gen.adjoint; jacc_async = false)
+    (fo, nao, _) = forms_of(po.host)
+    check(nao == 0 && !haskey(fo, "call:JACC.synchronize"), "rollback: jacc_async = false has no asynchronous launch and no exit wait")
     pn = STADE.stade_jacc(gen.adjoint; jacc_async = true, jacc_async_wait = false)
     (fn, nan, _) = forms_of(pn.host)
     check(nan > 0 && !haskey(fn, "call:JACC.synchronize"), "jacc_async_wait = false: asynchronous launches, no exit wait (the behavior of 4g)")

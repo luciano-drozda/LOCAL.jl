@@ -5,7 +5,7 @@
 # is compared with the CPU one. The hardware passes (warp atomics, contraction, split reductions, block reductions) are off.
 #   1. the hand cases of validate_glue_kernels.jl (basic, host use, cross, order, zero trip), glue on against the CPU result
 #   2. the boxes are `JACC.array([0.0])`, the launches `JACC.@parallel_for range = 1`, and fewer @allowscalar statements remain
-#   3. the rollback: `glue_kernels = false` (the default of stade_jacc) gives no glue kernel
+#   3. the rollback: `glue_kernels = false` gives no glue kernel; the default (true since v0.5.26) gives one
 #   4. CORPUS: every corpus kernel whose JACC plan holds a glue kernel gives the CPU gradient and Hv
 #
 #   julia validate_jacc_glue.jl [kernel names...]      (no names: every corpus kernel; GLUE_SHARD=k/N runs every N-th kernel)
@@ -84,6 +84,7 @@ module JStub
     module JACC
         array(x) = copy(x)
         to_host(x) = copy(x)
+        synchronize() = nothing                         # the stand-in runs every launch to completion before it returns
         zeros(T, d...) = Base.zeros(T, d...)
         # `JACC.@parallel_for range = R [sync = false] f(args...)`: f(i, args...) for i in 1:R, in order
         macro parallel_for(a...)
@@ -201,6 +202,18 @@ function jacc_unit_tests()
     r6 = mk(h6, k6)
     check(boxed(r6, "alpha") && occursin("a[1]", string(r6[2][1])), "jacc unit: the position of a candidate is counted after the index parameter")
     check(!boxed(mk(h6, k6b), "alpha"), "jacc unit: a callee that assigns the parameter at that position keeps the scalar on the host")
+    # a glue kernel with more free variables than jgen_max_splat_args() takes them in one tuple: JACC splats its varargs, and past 32 the compiler emits a dynamic call (phc_saha_bisect HVP, V100)
+    for (na, packed) in ((3, false), (STADE.jgen_max_splat_args() - 1, false), (STADE.jgen_max_splat_args(), true), (35, true))
+        ss = join(["s$i" for i in 1:na], ", "); sm = join(["s$i[1]" for i in 1:na], " + ")
+        hp = "function f_jacc(x, $ss, n)\n    CUDA.@allowscalar begin\n        alpha = 1.0 / (1.0 + $sm)\n    end\n    $(launch("alpha, x, n"))\n    return nothing\nend"
+        rp = mk(hp, kern("x[1] = a * x[1]"))
+        gk = [k for k in rp[2] if startswith(string(k.args[1].args[1]), "jacc_glue_")]
+        txt = replace(string(rp[1]), r"\s+" => " ")
+        # free variables of the glue kernel: the na arrays and the box of alpha
+        want_sig = packed ? [:__jacc_i, :__jargs] : nothing
+        okp = length(gk) == 1 && (packed ? Any[gk[1].args[1].args[2:end]...] == want_sig && occursin("__jargs_", txt) && count(",", match(r"__jargs_\S+ = \(([^)]*)\)", txt).captures[1]) == na : !occursin("__jargs", txt) && length(gk[1].args[1].args) == na + 3)
+        check(okp, "jacc unit: a glue kernel with $(na + 1) free variables is $(packed ? "packed in one tuple" : "not packed")")
+    end
     return ok
 end
 
@@ -214,7 +227,7 @@ function validate_jacc_glue(names = String[])
     rb = jacc_compare(Meta.parse(src_gbasic))
     r0 = jacc_compare(Meta.parse(src_gbasic); glue = false)
     check(occursin("alpha = JACC.array([0.0])", flat(rb.plan.host)), "basic: alpha lives in a JACC device box")
-    check(occursin("JACC.@parallel_for range = 1 jacc_glue_", flat(rb.plan.host)), "basic: the glue kernel launches with range = 1")
+    check(occursin(r"JACC\.@parallel_for range = 1 (sync = false )?jacc_glue_", flat(rb.plan.host)), "basic: the glue kernel launches with range = 1")
     check(count_allowscalar(rb.plan) < count_allowscalar(r0.plan), "basic: fewer @allowscalar statements than without glue kernels ($(count_allowscalar(rb.plan)) against $(count_allowscalar(r0.plan)))")
     # every glue kernel takes the thread index first
     check(all(k -> k.args[1].args[2] === :__jacc_i, [k for k in rb.plan.kernels if startswith(string(k.args[1].args[1]), "jacc_glue_")]), "basic: every glue kernel takes __jacc_i first")
@@ -245,7 +258,9 @@ function validate_jacc_glue(names = String[])
     check(isempty(jacc_glue_names(r0.plan)) && relerr(r0.cpu, r0.gpu) <= 1e-12, "rollback: glue_kernels = false gives no glue kernel")
     gen = STADE.stade_adjoint(Meta.parse(src_gbasic); keep_push_pop = false, fuse_ii_loops = true)
     pdef = STADE.stade_jacc(gen.adjoint; warp_atomics = false, split_reduce = 0, jacc_contraction = 0)
-    check(isempty(jacc_glue_names(pdef)), "default: stade_jacc has no glue kernel until the caller asks")
+    check(!isempty(jacc_glue_names(pdef)), "default: stade_jacc runs the glue pass (glue_kernels = true)")
+    pnog = STADE.stade_jacc(gen.adjoint; warp_atomics = false, split_reduce = 0, jacc_contraction = 0, glue_kernels = false)
+    check(isempty(jacc_glue_names(pnog)), "rollback: glue_kernels = false on the same kernel gives no glue kernel")
 
     # corpus
     paths = corpus_paths()
