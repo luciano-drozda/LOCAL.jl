@@ -10506,10 +10506,6 @@ function cgen_glue_first_is_def(stmts, v::Symbol)
     return true
 end
 
-# the backend record of the JACC glue pass: the launch is `JACC.@parallel_for range = 1`, the kernels take the index first (`jacc_kernel_*!(__jacc_i, ...)`)
-jgen_glue_backend() = (allowscalar_macro = jgen_default_allowscalar_macro(), launch_macro = Expr(:., :JACC, QuoteNode(Symbol("@parallel_for"))),
-                       kernel_tag = "jacc", suffix = "_jacc", arrtype = Expr(:., :JACC, QuoteNode(:array)), threads_kw = :range, blocks_kw = :range)
-
 function cgen_glue_apply(host::Expr, kernels::Vector{Expr}, backend; jacc::Bool = false)
     (host.head === :function && length(host.args) == 2 && host.args[2] isa Expr && host.args[2].head === :block) || return (host, kernels)
     asc = backend.allowscalar_macro
@@ -16229,6 +16225,10 @@ jgen_host_fname(name::Symbol) = Symbol(string(name) * "_jacc")
 # JACC API: a future AMDGPU/Metal-backed image needs a different default.
 jgen_default_allowscalar_macro() = Expr(:., :CUDA, QuoteNode(Symbol("@allowscalar")))
 
+# the backend record of the JACC glue pass: the launch is `JACC.@parallel_for range = 1`, the kernels take the index first (`jacc_kernel_*!(__jacc_i, ...)`)
+jgen_glue_backend() = (allowscalar_macro = jgen_default_allowscalar_macro(), launch_macro = Expr(:., :JACC, QuoteNode(Symbol("@parallel_for"))),
+                       kernel_tag = "jacc", suffix = "_jacc", arrtype = Expr(:., :JACC, QuoteNode(:array)), threads_kw = :range, blocks_kw = :range)
+
 function jgen_emit(gk; reduction_threshold::Int = cgen_reduction_threshold_default(), allowscalar_macro = jgen_default_allowscalar_macro(), hoist_atomics::Bool = true)
     kernels = Expr[]
     reduce_vars = Set{Symbol}()
@@ -18626,12 +18626,34 @@ function stade_tangent_file(in_path::String, out_path::String; keep_push_pop::Bo
     return out_path
 end
 
+# With `keep_push_pop = false` a kernel whose ragged loop nest sits inside another ragged loop keeps `push!`/`pop!` calls in the generated
+# function (the tainted stacks of agen_layout_walk!). They run on the host, so a GPU adjoint pays one copy per element. Returns a one-line
+# note for the caller, or `nothing` when the function has none. Reads the generated function, so it cannot disagree with it.
+function agen_host_stack_note(kernel, generated_fn)
+    npush = Ref(0); npop = Ref(0)
+    function walk(x)
+        x isa Expr || return
+        if x.head === :call && !isempty(x.args)
+            x.args[1] === :push! && (npush[] += 1)
+            x.args[1] === :pop! && (npop[] += 1)
+        end
+        foreach(walk, x.args)
+    end
+    walk(generated_fn)
+    npush[] + npop[] == 0 && return nothing
+    off = agen_tier_b_offender(kernel)
+    why = off === nothing ? "a loop bound that changes inside a loop" : "the loop bound `$(off)`, assigned inside a loop that is nested in another loop with changing bounds"
+    return "keep_push_pop = false: `$(kernel.sig.name)` still has $(npush[]) push! and $(npop[]) pop! calls on the host ($(why)). On a GPU each stored value then goes through the host. " *
+           "Writing those loops with a constant bound and an `if X <= bound` mask removes them (README)."
+end
+
 function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
     generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
+    keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
     return out_path
 end
@@ -18641,6 +18663,7 @@ function stade_hvp_file(in_path::String, out_path::String; keep_push_pop::Bool=t
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
     generated = stade_hvp(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+    keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.hvp)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.hvp]))
     return out_path
 end
