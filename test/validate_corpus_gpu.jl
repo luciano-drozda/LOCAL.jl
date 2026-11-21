@@ -352,7 +352,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
                               fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = true, jacc_async_wait::Bool = true,
                               jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
-                              truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}())
+                              truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}(),
+                              float_range::Dict{Symbol,Tuple{Float64,Float64}} = Dict{Symbol,Tuple{Float64,Float64}}())
     # truth: :off, :on_fail (the BigFloat truth decides a trial that differs from the CPU by more than rtol), :always; true and false mean :always and :off
     tmode = truth === true ? :always : truth === false ? :off : truth
     tmode in (:off, :on_fail, :always) || error("validate_corpus_gpu: truth must be a Bool or one of :off, :on_fail, :always, not $(repr(truth))")
@@ -375,10 +376,14 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
     results = NamedTuple[]
     # int_pin names integer arguments to fix; each kernel takes the pins it has, and a pin that no kernel in the run has is an error
     pins_of = Dict{String,Dict{Symbol,Int}}()
+    ranges_of = Dict{String,Dict{Symbol,Tuple{Float64,Float64}}}()
     for name in names
         k0 = STADE.parse_kernel(STADE.io_read_corpus_entry(joinpath(dir, name * ".jl")))
         pins_of[name] = Dict{Symbol,Int}(a => v for (a, v) in int_pin if get(k0.sig.kinds, a, :none) == :scalar_int)
+        ranges_of[name] = Dict{Symbol,Tuple{Float64,Float64}}(a => v for (a, v) in float_range if get(k0.sig.kinds, a, :none) in (:scalar_float, :array_float))
     end
+    unused_r = setdiff(keys(float_range), union(Set{Symbol}(), (keys(d) for d in values(ranges_of))...))
+    isempty(unused_r) || error("validate_corpus_gpu: float_range names $(sort(collect(unused_r))), which no kernel in this run has as a float argument")
     unused = setdiff(keys(int_pin), union(Set{Symbol}(), (keys(d) for d in values(pins_of))...))
     isempty(unused) || error("validate_corpus_gpu: int_pin names $(sort(collect(unused))), which no kernel in this run has as an integer argument")
     for name in names
@@ -392,9 +397,9 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --
         # stencil_loss's adjoint was exact at i_n = 4 and wrong, differently on each run, from
         # i_n = 256 up. See test/validate_write_overlap.jl for the static gate on the same defect.
-        # a kernel that cannot get a baseline (rank-2 arrays, a draw that never avoids a domain error) is reported and skipped: it must not drop the kernels after it
+        # a kernel that cannot get a baseline (a draw that never avoids a domain error, unless float_range names a range that does) is reported and skipped: it must not drop the kernels after it
         try
-            isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, scale = scale, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name])
+            isfile(yp) || STADE.stade_generate_baseline_file(path; yaml_path = yp, int_lo = int_lo, int_hi = int_hi, grow_max = grow_max, max_output_magnitude = max_output_magnitude, scale = scale, int_pin = isempty(pins_of[name]) ? nothing : pins_of[name], float_range = isempty(ranges_of[name]) ? nothing : ranges_of[name])
         catch e
             println("  !! ", name, " [baseline] ", first(sprint(showerror, e), 4000))
             push!(results, (kernel = name, mode = :baseline, backend = :baseline, status = :no_baseline, max_rel_err = NaN, elements_changed = 0))

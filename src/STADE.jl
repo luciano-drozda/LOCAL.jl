@@ -17218,8 +17218,11 @@ function val_randn(rng, dims::Integer...)
     return A
 end
 
+# float_range names float arguments (scalars or arrays) to draw uniformly from [lo, hi] instead of from a normal: a kernel that takes a
+# logarithm or a square root of an input needs inputs of one sign, and a draw around zero fails it half the time (phc_colebrook).
 function val_random_values(kernel, shapes::Dict, int_args::Dict{Symbol,Int};
-                            scale::Float64 = 1.0, idx_cap::Union{Int,Nothing} = nothing)
+                            scale::Float64 = 1.0, idx_cap::Union{Int,Nothing} = nothing,
+                            float_range::Union{Dict{Symbol,Tuple{Float64,Float64}},Nothing} = nothing)
     sig = kernel.sig
     values = Dict{Symbol,Any}()
 # val_grow_shapes sizes every array_float/array_int arg's every dimension to the same N. array_int
@@ -17237,7 +17240,10 @@ function val_random_values(kernel, shapes::Dict, int_args::Dict{Symbol,Int};
     # coding anything about what the ratio means.
     for a in sig.args
         k = sig.kinds[a]
-        if k == :scalar_float
+        if float_range !== nothing && haskey(float_range, a)
+            lo, hi = float_range[a]
+            values[a] = k == :scalar_float ? lo + (hi - lo) * rand() : lo .+ (hi - lo) .* rand(shapes[a]...)
+        elseif k == :scalar_float
             values[a] = a in divisors ? scale * (1.0 + 0.1 * val_randn()) : scale * val_randn()
         elseif k == :array_float
             values[a] = a in divisors ? scale .* (1.0 .+ 0.1 .* val_randn(shapes[a]...)) : scale .* val_randn(shapes[a]...)
@@ -17254,7 +17260,8 @@ end
 # make a compressed-id argument scaled by a stride before indexing unsatisfiable at any N. Starting idx_cap
 # small and growing it outward still finds direct-indexing kernels' previous idx_cap==N solution immediately.
 function val_grow_shapes(kernel, primal_fn::Function, int_args::Dict{Symbol,Int};
-                          start::Int = 4, growth::Int = 2, max_size::Int = 512)
+                          start::Int = 4, growth::Int = 2, max_size::Int = 512,
+                          float_range::Union{Dict{Symbol,Tuple{Float64,Float64}},Nothing} = nothing)
     sig = kernel.sig
     ndims_of = Dict(a => val_arg_ndims(kernel, a) for a in sig.args
                      if sig.kinds[a] in (:array_float, :array_int))
@@ -17263,7 +17270,7 @@ function val_grow_shapes(kernel, primal_fn::Function, int_args::Dict{Symbol,Int}
         N = start
         while N <= max_size
             shapes = Dict(a => ntuple(_ -> N, ndims_of[a]) for a in keys(ndims_of))
-            trial = val_random_values(kernel, shapes, int_args; scale = 1.0, idx_cap = idx_cap)
+            trial = val_random_values(kernel, shapes, int_args; scale = 1.0, idx_cap = idx_cap, float_range = float_range)
             ok = try
                 call_args = Any[sig.kinds[a] == :scalar_int ? int_args[a] : deepcopy(trial[a]) for a in sig.args]
                 Base.invokelatest(primal_fn, call_args...)
@@ -17294,7 +17301,8 @@ function val_generate_baseline(kernel, primal_expr::Expr;
                                 self_check_epsilon::Float64 = 1e-6, self_check_rtol::Float64 = 1e-3,
                                 max_output_magnitude::Float64 = 1e6,
                                 divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing,
-                                int_pin::Union{Dict{Symbol,Int},Nothing} = nothing)
+                                int_pin::Union{Dict{Symbol,Int},Nothing} = nothing,
+                                float_range::Union{Dict{Symbol,Tuple{Float64,Float64}},Nothing} = nothing)
     divisible_by = divisible_by === nothing ? val_corpus_int_constraints(kernel.sig.name) : divisible_by
 # int_pin fixes the named integer arguments in every draw. int_lo and int_hi only bound a draw: the upper end is halved after each divergent
 # candidate, so a range that a kernel diverges on collapses to 1 (br_cg1d2 with 100 to 200 gave n = 1). A pinned argument is never narrowed.
@@ -17302,6 +17310,13 @@ function val_generate_baseline(kernel, primal_expr::Expr;
         for a in keys(int_pin)
             get(kernel.sig.kinds, a, :none) == :scalar_int ||
                 error("val_generate_baseline: int_pin names `$a`, which is not an integer scalar argument of $(kernel.sig.name)")
+        end
+    end
+    if float_range !== nothing
+        for (a, (lo, hi)) in float_range
+            get(kernel.sig.kinds, a, :none) in (:scalar_float, :array_float) ||
+                error("val_generate_baseline: float_range names `$a`, which is not a float argument of $(kernel.sig.name)")
+            lo <= hi || error("val_generate_baseline: float_range for `$a` has lo = $lo above hi = $hi")
         end
     end
     primal_fn = val_compile(primal_expr)
@@ -17334,8 +17349,8 @@ function val_generate_baseline(kernel, primal_expr::Expr;
         int_args = val_random_int_args(kernel.sig; lo = min(int_lo, cur_hi), hi = cur_hi, divisible_by = divisible_by)
         int_pin === nothing || for (a, v) in int_pin; int_args[a] = v; end
         try
-            grown = val_grow_shapes(kernel, primal_fn, int_args; start = grow_start, max_size = grow_max)
-            values = val_random_values(kernel, grown.shapes, int_args; scale = scale, idx_cap = grown.idx_cap)
+            grown = val_grow_shapes(kernel, primal_fn, int_args; start = grow_start, max_size = grow_max, float_range = float_range)
+            values = val_random_values(kernel, grown.shapes, int_args; scale = scale, idx_cap = grown.idx_cap, float_range = float_range)
             if sizing_fn !== nothing
                 # same arg-source convention as val_call_adjoint's
                 # stack_extra_args: an initstacks_* parameter is an int
@@ -18429,7 +18444,8 @@ io_gpu_yaml_path(in_path::String) = splitext(in_path)[1] * ".gpu.yaml"
 # a minimal, hand-written YAML subset -- no external dependency. Two
 # top-level mappings: `int_args:` (bare integers) and `values:` (a
 # scalar is a bare float, a 1-D array is a flow list `[a, b, c]`, a
-# 2-D array is a block sequence of flow-list rows). Simple enough for
+# 2-D array is a block sequence of flow-list rows, an array of rank 3 or more is a
+# `shape:` flow list and a `data:` flow list in column-major order). Simple enough for
 # a user to hand-edit their own baseline file in the same shape.
 function io_write_baseline_yaml(path::String, kernel_name::Symbol, int_args::Dict, values::Dict)
     lines = String["# baseline values for kernel: $(kernel_name)", "int_args:"]
@@ -18449,7 +18465,9 @@ function io_write_baseline_yaml(path::String, kernel_name::Symbol, int_args::Dic
                 push!(lines, "    - [" * join(v[i, :], ", ") * "]")
             end
         else
-            error("io_write_baseline_yaml: unsupported array rank for $(k)")
+            push!(lines, "  $(k):")
+            push!(lines, "    shape: [" * join(size(v), ", ") * "]")
+            push!(lines, "    data: [" * join(vec(v), ", ") * "]")
         end
     end
     open(path, "w") do f
@@ -18464,11 +18482,21 @@ function io_read_baseline_yaml(path::String)
     section = :none
     pending_key = nothing
     pending_rows = Vector{Float64}[]
+    pending_shape = nothing
+    pending_data = nothing
     function flush_pending!()
         if pending_key !== nothing
-            values[pending_key] = reduce(vcat, [permutedims(r) for r in pending_rows])
+            if pending_shape !== nothing || pending_data !== nothing
+                (pending_shape !== nothing && pending_data !== nothing && isempty(pending_rows)) || error("io_read_baseline_yaml: `$(pending_key)` needs both a shape and a data list, and no matrix rows")
+                length(pending_data) == prod(pending_shape) || error("io_read_baseline_yaml: `$(pending_key)` has $(length(pending_data)) data values for the shape $(pending_shape)")
+                values[pending_key] = reshape(pending_data, pending_shape...)
+            else
+                values[pending_key] = reduce(vcat, [permutedims(r) for r in pending_rows])
+            end
             pending_key = nothing
             pending_rows = Vector{Float64}[]
+            pending_shape = nothing
+            pending_data = nothing
         end
     end
     for raw in readlines(path)
@@ -18489,6 +18517,18 @@ function io_read_baseline_yaml(path::String)
                 pending_key === nothing && error("io_read_baseline_yaml: matrix row with no preceding key: $line")
                 push!(pending_rows, [parse(Float64, strip(t)) for t in split(mrow.captures[1], ",")])
                 continue
+            end
+            if pending_key !== nothing
+                mshape = match(r"^\s+shape\s*:\s*\[(.*)\]\s*$", line)
+                if mshape !== nothing
+                    pending_shape = [parse(Int, strip(t)) for t in split(mshape.captures[1], ",")]
+                    continue
+                end
+                mdata = match(r"^\s+data\s*:\s*\[(.*)\]\s*$", line)
+                if mdata !== nothing
+                    pending_data = [parse(Float64, strip(t)) for t in split(mdata.captures[1], ",")]
+                    continue
+                end
             end
             flush_pending!()
             mkeyonly = match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$", line)
@@ -19382,12 +19422,13 @@ function stade_generate_baseline_file(in_path::String; yaml_path::Union{String,N
                                        grow_max::Int = 512, max_output_magnitude::Float64 = 1e6,
                                        self_check::Bool = true,
                                        divisible_by::Union{Dict{Symbol,Int},Nothing} = nothing,
-                                       int_pin::Union{Dict{Symbol,Int},Nothing} = nothing)
+                                       int_pin::Union{Dict{Symbol,Int},Nothing} = nothing,
+                                       float_range::Union{Dict{Symbol,Tuple{Float64,Float64}},Nothing} = nothing)
     primal_expr = io_read_corpus_entry(in_path)
     kernel = parse_kernel(primal_expr)
     baseline = val_generate_baseline(kernel, primal_expr; scale = scale, int_lo = int_lo, int_hi = int_hi,
                                       grow_max = grow_max, max_output_magnitude = max_output_magnitude,
-                                      self_check = self_check, divisible_by = divisible_by, int_pin = int_pin)
+                                      self_check = self_check, divisible_by = divisible_by, int_pin = int_pin, float_range = float_range)
     yp = yaml_path === nothing ? io_default_yaml_path(in_path) : yaml_path
     io_write_baseline_yaml(yp, kernel.sig.name, baseline.int_args, baseline.values)
     return yp
