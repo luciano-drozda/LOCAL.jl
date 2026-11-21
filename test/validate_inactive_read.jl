@@ -1,10 +1,14 @@
-# Regression for v0.5.31 and v0.5.32. v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
+# Regression for v0.5.31, v0.5.32 and v0.5.33. v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
 # belongs to an ACTIVE operand.
 #   Defect: snap_fwd_walk! / agen_fwd_walk! gated the written variable on activity, but built the set of values read nonlinearly with no regard for
 #   activity. In `u = u + w * r` and `y = x / d` the call is nonlinear, so r and x counted as read although w and d were inactive (`independents`
 #   restricted), the partials that need them were never built, and every overwrite of r and x kept a snapshot nothing reads. A restricted-independents
 #   adjoint of a linear multigrid cycle taped 52,130 slots per cycle (n1 = 63) for nothing.
 #   Fix: snap_var_value_needed_act! / agen_var_value_needed_act! (twins), used by the two forward walks only.
+# v0.5.33: activity is varied AND useful (act_useful: the variable reaches a dependent). Defect: a variable that only steers a condition, or that is
+#   not a requested dependent, still got partials, so its operands kept snapshots nothing needed (the squared residual norm of a guarded solve kept the
+#   residual's tape). Fix: act_analyze = act_varied AND act_useful for the adjoint and HVP stages, lin_build_stmt builds no partial for an assignment
+#   to an inactive float, and the two forward walks read nothing from such a right-hand side. The tangent stages keep act_varied.
 # Part 1 counts the per-site decisions per variable, with the independents restricted and with the defaults (shapes that must keep their snapshots keep them).
 # Part 2 checks the restricted-independents adjoint on the independent components against (a) a central finite difference along a random direction,
 #   (b) the default-independents adjoint, (c) the exact tangent-adjoint dot-product identity, (d) the HVP against a finite difference of the adjoint,
@@ -31,16 +35,23 @@ const IR_CASES = Dict(
     "ir_inert"     => (indep = [:x],           expect = Dict(),                       same = Symbol[]),            # feeds an inactive array only: no snapshot
     "ir_time"      => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),                # time advanced in the loop, read in a forcing                # an inactive local built from constants, overwritten every sweep: same
     "ir_firstwrite" => (indep = [:x],          expect = Dict(:t => 1),                same = [:t]),                # an inactive local first assigned inside the loop: its first push precedes any assignment
+    "ur_norm"      => (indep = [:x, :r],       expect = Dict(:rn => 2),               same = Symbol[]),   # the norm only steers the guard: r loses its snapshot, rn keeps the two its condition reads
+    "ur_dep"       => (indep = [:x, :y, :z],   expect = Dict(),                       same = Symbol[], dep = [:y]),     # z is not a dependent: x is not read for it
+    "ur_chain"     => (indep = [:x],           expect = Dict(),                       same = Symbol[]),                 # q reaches y only through p: both stay active
+    "ur_cond"      => (indep = [:x],           expect = Dict(),                       same = Symbol[]),                 # s only selects the branch
+    "ur_via"       => (indep = [:x],           expect = Dict(:x => 1),                same = [:x], dep = [:y]),         # control: w is not a dependent but reaches y
+    "ur_arm"       => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                     # control: q is assigned in both arms and reaches y
+    "ur_live"      => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                     # control: the accumulation reaches y[1]
     "ir_mg2d_cycle_3" => (indep = [:u1, :f1],  expect = Dict(),                       same = Symbol[]),
-    "ir_mg2d_solve_3" => (indep = [:u1, :f1],  expect = Dict(:r1 => 4, :rn => 2),     same = Symbol[]),            # the residual norm only steers the guard, yet its partials keep r1 and rn: the activity analysis has no "useful" pass
+    "ir_mg2d_solve_3" => (indep = [:u1, :f1],  expect = Dict(:rn => 2),               same = Symbol[]),            # r1 lost its four snapshots with the useful analysis; rn keeps the two its guard condition reads
 )
 const IR_PIN = Dict(
     "ir_mg2d_cycle_3" => (pin = Dict(:n1 => 7, :nu1 => 2, :nu2 => 1), fr = Dict(:h1 => (0.05, 0.2), :w => (0.5, 1.0)), grow = 81 + 8),
     "ir_mg2d_solve_3" => (pin = Dict(:n1 => 7, :nu1 => 2, :nu2 => 1, :maxit => 3), fr = Dict(:h1 => (0.05, 0.2), :w => (0.5, 1.0), :tol => (1e-30, 1e-29)), grow = 81 + 8),
 )
 
-function ir_counts(primal, indep)
-    k = STADE.parse_override_indep_dep(STADE.parse_kernel(primal), indep, nothing)
+function ir_counts(primal, indep, dep = nothing)
+    k = STADE.parse_override_indep_dep(STADE.parse_kernel(primal), indep, dep)
     d = STADE.snap_value_needed_sites(k); v = STADE.snap_site_vars(k)
     cnt = Dict{Symbol,Int}()
     for (key, need) in d
@@ -60,19 +71,22 @@ ir_mask(kernel, base, names) = begin
     m
 end
 
-function ir_check(nm, path, ind, lo, yp, say)
+function ir_check(nm, path, ind, dep, lo, yp, say)
     primal = STADE.io_read_corpus_entry(path); kernel = STADE.parse_kernel(primal)
     base = STADE.io_read_baseline_yaml(yp); STADE.val_coerce_int_arrays!(kernel, base.values)
     mask = ir_mask(kernel, base, ind)
     x0 = STADE.val_flatten(kernel, base.values); n = length(x0); ia = base.int_args
     Random.seed!(sum(Int.(codeunits(nm))))
     seed = STADE.val_random_values_like(kernel, base.values); seedf = STADE.val_flatten(kernel, seed)
+    # with restricted dependents only their components carry a seed
+    dmask = dep === nothing ? trues(n) : ir_mask(kernel, base, dep)
+    seedf = seedf .* dmask; seed = STADE.val_unflatten(kernel, ia, base.values, seedf)
     obs = STADE.val_compile(STADE.val_primal_observing_expr(kernel, primal))
     fev(x) = (y = STADE.val_call_primal_observed(obs, kernel, ia, STADE.val_unflatten(kernel, ia, base.values, x)); sum(y .* seedf))
     relerr(a, b) = sqrt(sum(abs2, a .- b)) / max(sqrt(sum(abs2, b)), 1e-12)
     for (kp, fz) in ((true, false), (false, false), (false, true))
         tag = "$nm keep_push_pop=$kp fuse=$fz int_lo=$lo"
-        g = STADE.stade_adjoint(primal; independents = ind, keep_push_pop = kp, fuse_ii_loops = fz)
+        g = STADE.stade_adjoint(primal; independents = ind, dependents = dep, keep_push_pop = kp, fuse_ii_loops = fz)
         gd = STADE.stade_adjoint(primal; keep_push_pop = kp, fuse_ii_loops = fz)
         sn(o) = kp ? Symbol[] : Symbol[a for a in o.initstacks.args[1].args[2:end]]
         # both codes carry the same function names, so the default one is compiled and run first and the restricted one defined afterwards
@@ -92,13 +106,14 @@ function ir_check(nm, path, ind, lo, yp, say)
         end
         say(worst <= 1e-4, "$tag: finite difference vs restricted adjoint, rel $worst")
         # (c) exact dot-product identity, tangent and adjoint both restricted
-        tg = STADE.stade_tangent(primal; independents = ind, keep_push_pop = kp, fuse_ii_loops = fz)
+        tg = STADE.stade_tangent(primal; independents = ind, dependents = dep, keep_push_pop = kp, fuse_ii_loops = fz)
         tf = STADE.val_compile(tg)
         worst = 0.0
         for _ in 1:4
             xd = STADE.val_random_values_like(kernel, base.values); xdf = STADE.val_flatten(kernel, xd) .* mask
             xdv = STADE.val_unflatten(kernel, ia, base.values, xdf)
             yb = STADE.val_random_values_like(kernel, base.values)
+            yb = STADE.val_unflatten(kernel, ia, base.values, STADE.val_flatten(kernel, yb) .* dmask)
             yd = STADE.val_call_tangent(tf, kernel, ia, deepcopy(base.values), xdv)
             xbb = adj(deepcopy(base.values), yb)
             lhs = sum(STADE.val_flatten(kernel, yb) .* yd); rhs = sum(xbb .* xdf)
@@ -106,7 +121,7 @@ function ir_check(nm, path, ind, lo, yp, say)
         end
         say(worst <= 1e-11, "$tag: dot-product identity, rel $worst")
         # (d) HVP against a central difference of the restricted adjoint, on the independent components
-        hv = STADE.stade_hvp(primal; independents = ind, keep_push_pop = kp, fuse_ii_loops = fz)
+        hv = STADE.stade_hvp(primal; independents = ind, dependents = dep, keep_push_pop = kp, fuse_ii_loops = fz)
         hf = STADE.val_compile(hv.hvp)
         d = STADE.val_randn(n) .* mask; d ./= max(sqrt(sum(abs2, d)), 1e-300)
         dv = STADE.val_unflatten(kernel, ia, STADE.val_zeros_like(kernel, base.values), d)
@@ -125,6 +140,7 @@ function ir_sabotage(; verbose = true)
     text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
     sn = "ni = parts === nothing || any(j -> actv[j] && snap_expr_holds(parts[j], a), eachindex(args))"
     ag = "ni = parts === nothing || any(j -> actv[j] && agen_expr_holds(parts[j], a), eachindex(args))"
+    v33 = ["ur_norm", "ur_dep", "ur_chain", "ur_cond", "ur_via", "ur_live", "ur_arm"]
     v32 = ["ir_local", "ir_overwrite", "ir_time", "ir_array", "ir_firstwrite"]
     cases = [
         ("every operand counts as read", [(sn, "ni = true"), (ag, "ni = true")]),
@@ -142,23 +158,31 @@ function ir_sabotage(; verbose = true)
         ("only the snap_ twin is edited", [(sn, "ni = false")]),
         ("only the agen_ twin is edited", [(ag, "ni = false")]),
         # v0.5.32: a write to an inactive float is decided by the read set alone, and the emitters see it as taped
-        ("the written variable must be active again", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
-                                                       "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&"),
-                                                      ("agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
-                                                       "agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
-        ("only the snap_ twin keeps the activity gate", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
-                                                          "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
+        ("the written variable must be active again", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                       "snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&"),
+                                                      ("agen_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                       "agen_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
+        ("only the snap_ twin keeps the activity gate", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                          "snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
         ("the emitters never see the taped inactive variable", [("push_pop isa AbstractDict || return active_map", "return active_map")], v32),
         ("the forward sweep of the adjoint ignores the tape map", [("fwd = agen_forward_body(kernel.body, kernel.sig.kinds, tape_map, value_needed", "fwd = agen_forward_body(kernel.body, kernel.sig.kinds, active_map, value_needed")], v32),
         ("the backward sweep of the adjoint ignores the tape map", [("bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, tape_map, unsafe", "bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, active_map, unsafe")], v32),
         ("the forward sweep of the HVP ignores the tape map", [("fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, tape_map, value_needed,", "fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, active_map, value_needed,")], v32),
         ("an inactive local is not initialised before its first push", [("append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(",
                                                                           "append!(body, agen_local_primal_inits(kernel, active_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(")], v32),
+        ("usefulness is ignored: activity is varied only", [("(varied[v] && get(useful, v, false))", "varied[v]")], v33),
+        ("the useful scan makes one pass", [("    bound = length(useful) + 1\n", "    bound = 1\n")], v33),
+        ("a dependent does not seed usefulness", [("    for v in kernel.sig.dependents\n        useful[v] = true\n    end\n", "")], v33),
+        ("a read through an array is not followed", [("changed = act_useful_mark!(expr.args[1], useful, kinds)   # indices", "changed = false   # indices")], v33),
+        ("a condition makes its variables useful", [("            changed = act_useful_pass!(stmt.then, useful, kinds) || changed\n", "            changed = act_useful_mark!(stmt.cond, useful, kinds) || changed\n            changed = act_useful_pass!(stmt.then, useful, kinds) || changed\n")], v33),
+        ("an assignment to an inactive float still builds partials", [("dead ? Dict{Symbol,Bool}() : active_map)", "active_map)")], v33),
+        ("only the snap_ twin reads the rhs of an inactive float", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)", "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)")], v33),
+        ("only the agen_ twin reads the rhs of an inactive float", [("agen_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)", "agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)")], v33),
     ]
     mktempdir() do tmp
         for case in cases
             label, edits = case[1], case[2]
-            isempty(get(ENV, "IR_SAB_ONLY", "")) || occursin(ENV["IR_SAB_ONLY"], label) || continue   # run one case while developing
+            isempty(get(ENV, "IR_SAB_ONLY", "")) || any(t -> occursin(t, label), split(ENV["IR_SAB_ONLY"], "|")) || continue   # run one case while developing
             kset = length(case) > 2 ? case[3] : ["ir_prod", "ir_nested", "ir_mixed", "ir_sin"]
             t = text; okanchor = true
             for (old, new) in edits
@@ -195,8 +219,8 @@ function validate_inactive_read(; verbose = true, only = String[], report = fals
     for nm in (:units in phases ? names : String[])
         path = joinpath(dir, nm * ".jl"); c = IR_CASES[nm]
         primal = STADE.io_read_corpus_entry(path)
-        cr, same_r = ir_counts(primal, c.indep)
-        cd, same_d = ir_counts(primal, nothing)
+        cr, same_r = ir_counts(primal, c.indep, get(c, :dep, nothing))
+        cd, same_d = ir_counts(primal, nothing, nothing)
         report && println(rpad(nm, 18), " restricted: ", sort(collect(cr)), "  default: ", sort(collect(cd)))
         say(same_r && same_d, "$nm: snap_ and agen_ site decisions differ")
         if c.expect !== nothing
@@ -220,7 +244,7 @@ function validate_inactive_read(; verbose = true, only = String[], report = fals
             else
                 STADE.stade_generate_baseline_file(path; yaml_path = yp, int_pin = pin.pin, float_range = pin.fr, grow_max = pin.grow)
             end
-            ir_check(nm, path, c.indep, lo, yp, say)
+            ir_check(nm, path, c.indep, get(c, :dep, nothing), lo, yp, say)
         end
     end
     verbose && println("validate_inactive_read: $(checks - bad)/$checks ok")

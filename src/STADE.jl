@@ -2095,12 +2095,74 @@ end
 
 
 # ==================== act_* ====================================
-# Forward taint analysis from independents through assignments, swept to a fixed
+# act_varied: forward taint analysis from independents through assignments, swept to a fixed
 # point. Whole-variable, monotonic: once reachable, a variable stays active past
 # a later overwrite. A single pass misses taint a loop carries into its own
 # earlier statements, so it reruns until stable (at most #variables+1 passes).
+# act_useful: the backward dual, from the dependents. A float variable is useful when its value feeds,
+# through assignments, a useful variable; a branch condition carries no derivative, so a variable that only
+# steers a condition or a loop is not useful. act_analyze, the map of the adjoint and HVP stages, is active =
+# varied AND useful: the adjoint of a variable that reaches no dependent is zero, so it needs no partial
+# and no snapshot. The tangent stages keep act_varied.
 
 function act_analyze(kernel)
+    varied = act_varied(kernel)
+    useful = act_useful(kernel)
+    return Dict{Symbol,Bool}(v => (varied[v] && get(useful, v, false)) for v in keys(varied))
+end
+
+function act_useful(kernel)
+    kinds = kernel.sig.kinds
+    useful = Dict{Symbol,Bool}(v => false for v in keys(kinds))
+    for v in kernel.sig.dependents
+        useful[v] = true
+    end
+    bound = length(useful) + 1
+    for _ in 1:bound
+        act_useful_pass!(kernel.body, useful, kinds) || break
+    end
+    return useful
+end
+
+# one pass over a statement list: the right-hand side of an assignment to a useful float variable makes every float variable it
+# reads useful. Conditions and loop bounds are never read here.
+function act_useful_pass!(body::Vector{NamedTuple}, useful::Dict{Symbol,Bool}, kinds::Dict{Symbol,Symbol})
+    changed = false
+    for stmt in body
+        if stmt.kind == :assign
+            var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
+            kinds[var] in (:scalar_float, :array_float) || continue
+            get(useful, var, false) || continue
+            changed = act_useful_mark!(stmt.rhs, useful, kinds) || changed
+        elseif stmt.kind == :for || stmt.kind == :while
+            changed = act_useful_pass!(stmt.body, useful, kinds) || changed
+        elseif stmt.kind == :if
+            changed = act_useful_pass!(stmt.then, useful, kinds) || changed
+            changed = act_useful_pass!(stmt.els, useful, kinds) || changed
+        end
+    end
+    return changed
+end
+
+function act_useful_mark!(expr, useful::Dict{Symbol,Bool}, kinds::Dict{Symbol,Symbol})
+    changed = false
+    if expr isa Symbol
+        if get(kinds, expr, :none) in (:scalar_float, :array_float) && !useful[expr]
+            useful[expr] = true
+            changed = true
+        end
+    elseif expr isa Expr && expr.head == :ref
+        changed = act_useful_mark!(expr.args[1], useful, kinds)   # indices are Int64: never read
+    elseif expr isa Expr
+        start = expr.head == :call ? 2 : 1
+        for a in expr.args[start:end]
+            changed = act_useful_mark!(a, useful, kinds) || changed
+        end
+    end
+    return changed
+end
+
+function act_varied(kernel)
     active_map = Dict{Symbol,Bool}(v => false for v in keys(kernel.sig.kinds))
     for v in kernel.sig.independents
         active_map[v] = true
@@ -3075,7 +3137,8 @@ function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
             # present under a linear +/- (pure accumulation needs no old
             # value: d(new)/d(old)=1).
             local_reads = Set{Symbol}()
-            snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
+            # an assignment to an inactive float builds no partial (lin_build_stmt), so its rhs reads nothing
+            snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)
             decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             # a reset of a boxed element: see snap_boxed_reset
@@ -3240,34 +3303,37 @@ end
 # parallels the frozen `statement` shape; only `:assign` gains a built `tree`.
 
 function lin_build(kernel, active_map)
-    return lin_build_body(kernel.body, active_map)
+    return lin_build_body(kernel.body, active_map, kernel.sig.kinds)
 end
 
-function lin_build_body(body, active_map)
+function lin_build_body(body, active_map, kinds = nothing)
     plan = NamedTuple[]
     for stmt in body
-        push!(plan, lin_build_stmt(stmt, active_map))
+        push!(plan, lin_build_stmt(stmt, active_map, kinds))
     end
     return plan
 end
 
-function lin_build_stmt(stmt, active_map)
+function lin_build_stmt(stmt, active_map, kinds = nothing)
     if stmt.kind == :assign
-        tree = lin_build_expr(stmt.rhs, active_map)
+        # A float variable that is not active (it reaches no dependent) gets no partial from any rhs: every leaf is built inactive.
+        var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
+        dead = kinds !== nothing && get(kinds, var, :none) in (:scalar_float, :array_float) && !get(active_map, var, false)
+        tree = lin_build_expr(stmt.rhs, dead ? Dict{Symbol,Bool}() : active_map)
         return (kind = :assign, lhs = stmt.lhs, active = tree.active, tree = tree)
     elseif stmt.kind == :for
         return (kind = :for, var = stmt.var, lo = stmt.lo, hi = stmt.hi, step = stmt.step,
-                body = lin_build_body(stmt.body, active_map))
+                body = lin_build_body(stmt.body, active_map, kinds))
     elseif stmt.kind == :while
         # The condition is not linearized. It selects how many times the
         # body runs, and the trip count is replayed from a recorded value
         # rather than differentiated.
         return (kind = :while, cond = stmt.cond,
-                body = lin_build_body(stmt.body, active_map))
+                body = lin_build_body(stmt.body, active_map, kinds))
     elseif stmt.kind == :if
         return (kind = :if, cond = stmt.cond,
-                then = lin_build_body(stmt.then, active_map),
-                els = lin_build_body(stmt.els, active_map))
+                then = lin_build_body(stmt.then, active_map, kinds),
+                els = lin_build_body(stmt.els, active_map, kinds))
     end
     error("lin_build_stmt: unrecognized statement kind :$(stmt.kind)")
 end
@@ -4609,7 +4675,8 @@ function agen_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
         if stmt.kind == :assign
             var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
             local_reads = Set{Symbol}()
-            agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
+            # an assignment to an inactive float builds no partial (lin_build_stmt), so its rhs reads nothing
+            agen_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)
             decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             agen_boxed_reset(stmt, boxed) && (seen = setdiff(seen, (var,)))
@@ -17158,7 +17225,7 @@ end
 # val_'s machinery) would make the two layers mutually dependent. Calling the same pipeline
 # stages keeps val_ resting only on the codegen pipeline.
 function val_build_tangent(kernel)
-    active_map = act_analyze(kernel)
+    active_map = act_varied(kernel)
     lin_plan = lin_build(kernel, active_map)
     return tgen_emit(kernel, lin_plan)
 end
@@ -18666,7 +18733,7 @@ function stade_tangent(expr::Expr; independents::Union{Vector{Symbol},Nothing}=n
     # interface-consistency no-ops, letting a caller iterate uniformly over
     # stade_tangent/stade_adjoint/stade_hvp without special-casing tangent mode.
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
-    active_map = act_analyze(kernel)
+    active_map = act_varied(kernel)
     lin_plan = lin_build(kernel, active_map)
     return tgen_emit(kernel, lin_plan)
 end
