@@ -1,4 +1,4 @@
-# Regression for v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
+# Regression for v0.5.31 and v0.5.32. v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
 # belongs to an ACTIVE operand.
 #   Defect: snap_fwd_walk! / agen_fwd_walk! gated the written variable on activity, but built the set of values read nonlinearly with no regard for
 #   activity. In `u = u + w * r` and `y = x / d` the call is nonlinear, so r and x counted as read although w and d were inactive (`independents`
@@ -23,6 +23,14 @@ const IR_CASES = Dict(
     "ir_mixed"     => (indep = [:x, :z],       expect = Dict(:x => 1),                same = [:x]),                # second product needs x: kept
     "ir_maxmin"    => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                # the selection compares x: kept
     "ir_cond"      => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                # a condition always counts: kept
+    "ir_overwrite" => (indep = [:x],           expect = Dict(:w => 1),                same = [:w]),                # the inactive scalar w is overwritten and read next to the active x: w keeps a snapshot, x none
+    "ir_local"     => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),
+    "ir_array"     => (indep = [:x],           expect = Dict(:m => 1),                same = [:m]),                # an inactive coefficient array: same
+    "ir_carried"   => (indep = [:x],           expect = Dict(:c => 1),                same = [:c]),                # carried inside one loop
+    "ir_ifbr"      => (indep = [:x],           expect = Dict(:w => 1, :x => 1),       same = [:w, :x]),            # read in one arm of a branch
+    "ir_inert"     => (indep = [:x],           expect = Dict(),                       same = Symbol[]),            # feeds an inactive array only: no snapshot
+    "ir_time"      => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),                # time advanced in the loop, read in a forcing                # an inactive local built from constants, overwritten every sweep: same
+    "ir_firstwrite" => (indep = [:x],          expect = Dict(:t => 1),                same = [:t]),                # an inactive local first assigned inside the loop: its first push precedes any assignment
     "ir_mg2d_cycle_3" => (indep = [:u1, :f1],  expect = Dict(),                       same = Symbol[]),
     "ir_mg2d_solve_3" => (indep = [:u1, :f1],  expect = Dict(:r1 => 4, :rn => 2),     same = Symbol[]),            # the residual norm only steers the guard, yet its partials keep r1 and rn: the activity analysis has no "useful" pass
 )
@@ -117,6 +125,7 @@ function ir_sabotage(; verbose = true)
     text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
     sn = "ni = parts === nothing || any(j -> actv[j] && snap_expr_holds(parts[j], a), eachindex(args))"
     ag = "ni = parts === nothing || any(j -> actv[j] && agen_expr_holds(parts[j], a), eachindex(args))"
+    v32 = ["ir_local", "ir_overwrite", "ir_time", "ir_array", "ir_firstwrite"]
     cases = [
         ("every operand counts as read", [(sn, "ni = true"), (ag, "ni = true")]),
         ("no operand counts as read", [(sn, "ni = false"), (ag, "ni = false")]),
@@ -132,9 +141,25 @@ function ir_sabotage(; verbose = true)
                                                 ("if needed || agen_linear_call(op, args)", "if agen_linear_call(op, args)")]),
         ("only the snap_ twin is edited", [(sn, "ni = false")]),
         ("only the agen_ twin is edited", [(ag, "ni = false")]),
+        # v0.5.32: a write to an inactive float is decided by the read set alone, and the emitters see it as taped
+        ("the written variable must be active again", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                       "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&"),
+                                                      ("agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                       "agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
+        ("only the snap_ twin keeps the activity gate", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) &&",
+                                                          "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)\n            decisions[agen_site_key(body, idx)] = active_map[var] &&")], v32),
+        ("the emitters never see the taped inactive variable", [("push_pop isa AbstractDict || return active_map", "return active_map")], v32),
+        ("the forward sweep of the adjoint ignores the tape map", [("fwd = agen_forward_body(kernel.body, kernel.sig.kinds, tape_map, value_needed", "fwd = agen_forward_body(kernel.body, kernel.sig.kinds, active_map, value_needed")], v32),
+        ("the backward sweep of the adjoint ignores the tape map", [("bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, tape_map, unsafe", "bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, active_map, unsafe")], v32),
+        ("the forward sweep of the HVP ignores the tape map", [("fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, tape_map, value_needed,", "fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, active_map, value_needed,")], v32),
+        ("an inactive local is not initialised before its first push", [("append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(",
+                                                                          "append!(body, agen_local_primal_inits(kernel, active_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(")], v32),
     ]
     mktempdir() do tmp
-        for (label, edits) in cases
+        for case in cases
+            label, edits = case[1], case[2]
+            isempty(get(ENV, "IR_SAB_ONLY", "")) || occursin(ENV["IR_SAB_ONLY"], label) || continue   # run one case while developing
+            kset = length(case) > 2 ? case[3] : ["ir_prod", "ir_nested", "ir_mixed", "ir_sin"]
             t = text; okanchor = true
             for (old, new) in edits
                 n = length(findall(old, t))
@@ -148,7 +173,7 @@ function ir_sabotage(; verbose = true)
                 include($(repr(path)))
                 cd($(repr(@__DIR__)))
                 include($(repr(joinpath(@__DIR__, "validate_inactive_read.jl"))))
-                println("RESULT ", validate_inactive_read(; verbose = false, phases = (:units,), only = ["ir_prod", "ir_nested", "ir_mixed", "ir_sin"]) ? 0 : 1)
+                println("RESULT ", validate_inactive_read(; verbose = false, phases = (:units,), only = $(repr(kset))) ? 0 : 1)
             """
             out = sab_read(script)
             m = match(r"RESULT (\d)", out)

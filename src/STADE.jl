@@ -3064,7 +3064,7 @@ end
 # occurred strictly before w in forward order; a read counts only through the partial of an active operand
 # (snap_var_value_needed_act!). This is the production path, reached via snap_plan's
 # site_needed kwarg; stade_site_level_tbr_check asserts it stays a subset of the whole-variable set.
-function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}())
+function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}(), floats = nothing)
     for idx in eachindex(body)
         stmt = body[idx]
         if stmt.kind == :assign
@@ -3076,19 +3076,19 @@ function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
             # value: d(new)/d(old)=1).
             local_reads = Set{Symbol}()
             snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
-            decisions[agen_site_key(body, idx)] = active_map[var] && (var in local_reads || var in seen)
+            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             # a reset of a boxed element: see snap_boxed_reset
             snap_boxed_reset(stmt, boxed) && (seen = setdiff(seen, (var,)))
         elseif stmt.kind == :if
             snap_var_value_needed!(stmt.cond, seen, true)   # cond always conservative
-            seen_then = snap_fwd_walk!(stmt.then, copy(seen), active_map, decisions, bvars, boxed)
-            seen_els  = snap_fwd_walk!(stmt.els,  copy(seen), active_map, decisions, bvars, boxed)
+            seen_then = snap_fwd_walk!(stmt.then, copy(seen), active_map, decisions, bvars, boxed, floats)
+            seen_els  = snap_fwd_walk!(stmt.els,  copy(seen), active_map, decisions, bvars, boxed, floats)
             seen = union(seen_then, seen_els)
         elseif stmt.kind == :for
-            seen = snap_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed)
+            seen = snap_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed, floats)
         elseif stmt.kind == :while
-            seen = snap_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed)
+            seen = snap_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed, floats)
         end
     end
     # This body's block-boundary push re-establishes each of these vars at the head of its own reverse body, so every
@@ -3106,16 +3106,16 @@ end
 # need a snapshot due to a read near the bottom, one iteration back. `seen` only grows
 # across passes, so this terminates; a final pass re-walks with the converged set so
 # `decisions` reflects the fixed point.
-function snap_fwd_walk_loop!(body, in_seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}())
+function snap_fwd_walk_loop!(body, in_seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}(), floats = nothing)
     seen = copy(in_seen)
     while true
         scratch = Dict{Any,Bool}()
-        out_seen = snap_fwd_walk!(body, union(seen, in_seen), active_map, scratch, bvars, boxed)
+        out_seen = snap_fwd_walk!(body, union(seen, in_seen), active_map, scratch, bvars, boxed, floats)
         out_seen == seen && break
         seen = out_seen
     end
     final_in = union(seen, in_seen)
-    out = snap_fwd_walk!(body, final_in, active_map, decisions, bvars, boxed)
+    out = snap_fwd_walk!(body, final_in, active_map, decisions, bvars, boxed, floats)
     # a loop that may not run has not run: what a reset inside it removed from `seen` is still seen if the body never executes
     isempty(boxed) && return out
     return union(out, intersect(in_seen, keys(boxed)))
@@ -3194,12 +3194,15 @@ function snap_boxed_reset(stmt, boxed)
     return snap_count_var_refs(stmt.rhs, l.args[1]) == 0
 end
 
+# Float variables, active or not: a write to one needs its old value saved whenever an emitted partial reads it.
+snap_float_vars(kernel) = Set{Symbol}(v for (v, k) in kernel.sig.kinds if k == :scalar_float || k == :array_float)
+
 # public entry point: per-site (not per-variable) TBR decisions for every :assign in
 # `kernel`, keyed by agen_site_key(body, idx). Consumed by snap_plan's site_needed and,
 # via stade_site_level_tbr_check, by agen_needs_snapshot.
 function snap_value_needed_sites(kernel)
     decisions = Dict{Any,Bool}()
-    snap_fwd_walk!(kernel.body, Set{Symbol}(), act_analyze(kernel), decisions, snap_boundary_stack_vars(kernel), snap_boxed_arrays(kernel))
+    snap_fwd_walk!(kernel.body, Set{Symbol}(), act_analyze(kernel), decisions, snap_boundary_stack_vars(kernel), snap_boxed_arrays(kernel), snap_float_vars(kernel))
     return decisions
 end
 
@@ -3423,8 +3426,34 @@ end
 # sequential loop's direction), distributing each seed via der_rule(op).adjoint; pure accumulation skips resetting
 # the shadow, else it resets to 0.0. A snapshotted write pops its old value first.
 
+# Activity as the snapshot machinery sees it: a float whose old value is saved before a write counts as active even when it carries no
+# derivative (an inactive scalar a product reads together with an active array). The derivative plan keeps the true activity.
+function agen_tape_map(kernel, active_map, push_pop)
+    push_pop isa AbstractDict || return active_map
+    out = copy(active_map)
+    agen_tape_map_walk!(kernel.body, push_pop, out)
+    return out
+end
+
+function agen_tape_map_walk!(body, push_pop, out)
+    for idx in eachindex(body)
+        stmt = body[idx]
+        if stmt.kind == :assign
+            var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
+            get(push_pop, agen_site_key(body, idx), false) && (out[var] = true)
+        elseif stmt.kind == :for || stmt.kind == :while
+            agen_tape_map_walk!(stmt.body, push_pop, out)
+        elseif stmt.kind == :if
+            agen_tape_map_walk!(stmt.then, push_pop, out)
+            agen_tape_map_walk!(stmt.els, push_pop, out)
+        end
+    end
+    return nothing
+end
+
 function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, push_pop = nothing, ii_plan = nothing, remat = nothing, primal_outputs::Bool = true)
     active_map = act_analyze(kernel)
+    tape_map = agen_tape_map(kernel, active_map, push_pop)
     layout = nothing
     value_needed = exempt = stacks = nothing
     if !keep_push_pop
@@ -3438,10 +3467,10 @@ function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, 
         reassigned = agen_collect_reassigned_all(kernel.body)
         exempt = agen_exempt_vars(kernel, value_needed)
         stacks = agen_stack_map(snapshot_plan)
-        layout = agen_layout(kernel, kernel.sig.kinds, active_map, value_needed, reassigned, exempt, stacks; push_pop = push_pop)
+        layout = agen_layout(kernel, kernel.sig.kinds, tape_map, value_needed, reassigned, exempt, stacks; push_pop = push_pop)
     end
     (initstacks_expr, table_names, tot_names, val_names) = agen_init_emit(kernel, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout,
-                                      active_map = active_map, value_needed = value_needed, exempt = exempt, stacks = stacks, push_pop = push_pop)
+                                      active_map = tape_map, value_needed = value_needed, exempt = exempt, stacks = stacks, push_pop = push_pop)
     tier_b_extra_args = vcat(table_names, tot_names, val_names)
     (adjoint_expr, primal_pruned) = agen_adjoint_emit_(kernel, active_map, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout, push_pop = push_pop,
                                       tier_b_extra_args = tier_b_extra_args, ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs)
@@ -3691,11 +3720,12 @@ function agen_adjoint_emit_(kernel, active_map, lin_plan, sites; keep_push_pop::
 
     ectx = (keep_push_pop = keep_push_pop, loop_ctx = Any[], layout = layout, push_pop = push_pop, ii_plan = ii_plan, remat = remat)
 
+    tape_map = agen_tape_map(kernel, active_map, push_pop)
     body = Any[]
-    append!(body, agen_local_primal_inits(kernel, active_map, agen_itbr_vars(stacks)))
+    append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks)))
     append!(body, agen_local_shadow_inits(kernel, active_map))
-    fwd = agen_forward_body(kernel.body, kernel.sig.kinds, active_map, value_needed, reassigned, stacks, exempt; ectx = ectx, lin_body = lin_plan, unsafe = unsafe)
-    bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, active_map, unsafe, value_needed, reassigned, stacks, exempt; ectx = ectx)
+    fwd = agen_forward_body(kernel.body, kernel.sig.kinds, tape_map, value_needed, reassigned, stacks, exempt; ectx = ectx, lin_body = lin_plan, unsafe = unsafe)
+    bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, tape_map, unsafe, value_needed, reassigned, stacks, exempt; ectx = ectx)
     skipped = !primal_outputs && agen_forward_skippable(kernel, fwd, bwd, agen_stack_names(sites), tier_b_extra_args)
     skipped || append!(body, fwd)
     append!(body, bwd)
@@ -4573,25 +4603,25 @@ end
 # every agen_/snap_ pair in this file. stade_site_level_tbr_check asserts exact Dict
 # equality against snap_value_needed_sites on every call -- forward push and backward pop
 # must decide identically at every site or push/pop counts desync.
-function agen_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}())
+function agen_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}(), floats = nothing)
     for idx in eachindex(body)
         stmt = body[idx]
         if stmt.kind == :assign
             var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
             local_reads = Set{Symbol}()
             agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
-            decisions[agen_site_key(body, idx)] = active_map[var] && (var in local_reads || var in seen)
+            decisions[agen_site_key(body, idx)] = (floats === nothing ? active_map[var] : var in floats) && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             agen_boxed_reset(stmt, boxed) && (seen = setdiff(seen, (var,)))
         elseif stmt.kind == :if
             agen_var_value_needed!(stmt.cond, seen, true)
-            seen_then = agen_fwd_walk!(stmt.then, copy(seen), active_map, decisions, bvars, boxed)
-            seen_els  = agen_fwd_walk!(stmt.els,  copy(seen), active_map, decisions, bvars, boxed)
+            seen_then = agen_fwd_walk!(stmt.then, copy(seen), active_map, decisions, bvars, boxed, floats)
+            seen_els  = agen_fwd_walk!(stmt.els,  copy(seen), active_map, decisions, bvars, boxed, floats)
             seen = union(seen_then, seen_els)
         elseif stmt.kind == :for
-            seen = agen_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed)
+            seen = agen_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed, floats)
         elseif stmt.kind == :while
-            seen = agen_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed)
+            seen = agen_fwd_walk_loop!(stmt.body, seen, active_map, decisions, bvars, boxed, floats)
         end
     end
     # end-of-body block-boundary kill -- see snap_fwd_walk!'s comment for the full argument
@@ -4600,16 +4630,16 @@ function agen_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
     return setdiff(seen, kill)
 end
 
-function agen_fwd_walk_loop!(body, in_seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}())
+function agen_fwd_walk_loop!(body, in_seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}(), floats = nothing)
     seen = copy(in_seen)
     while true
         scratch = Dict{Any,Bool}()
-        out_seen = agen_fwd_walk!(body, union(seen, in_seen), active_map, scratch, bvars, boxed)
+        out_seen = agen_fwd_walk!(body, union(seen, in_seen), active_map, scratch, bvars, boxed, floats)
         out_seen == seen && break
         seen = out_seen
     end
     final_in = union(seen, in_seen)
-    out = agen_fwd_walk!(body, final_in, active_map, decisions, bvars, boxed)
+    out = agen_fwd_walk!(body, final_in, active_map, decisions, bvars, boxed, floats)
     # see snap_fwd_walk_loop!
     isempty(boxed) && return out
     return union(out, intersect(in_seen, keys(boxed)))
@@ -4680,9 +4710,12 @@ function agen_boxed_reset(stmt, boxed)
     return agen_count_var_refs(stmt.rhs, l.args[1]) == 0
 end
 
+# see snap_float_vars -- duplicated for the same purity-rule reason as every other agen_-prefixed pair
+agen_float_vars(kernel) = Set{Symbol}(v for (v, k) in kernel.sig.kinds if k == :scalar_float || k == :array_float)
+
 function agen_value_needed_sites(kernel)
     decisions = Dict{Any,Bool}()
-    agen_fwd_walk!(kernel.body, Set{Symbol}(), act_analyze(kernel), decisions, agen_boundary_stack_vars(kernel), agen_boxed_arrays(kernel))
+    agen_fwd_walk!(kernel.body, Set{Symbol}(), act_analyze(kernel), decisions, agen_boundary_stack_vars(kernel), agen_boxed_arrays(kernel), agen_float_vars(kernel))
     return decisions
 end
 
@@ -6802,13 +6835,14 @@ function hvp_emit(kernel, active_map, lin_plan, sites; keep_push_pop::Bool = tru
     reassigned = agen_collect_reassigned_all(kernel.body)
     unsafe = agen_unsafe_int_vars(kernel, agen_itbr_vars(stacks))
     exempt = agen_exempt_vars(kernel, value_needed)
+    tape_map = agen_tape_map(kernel, active_map, push_pop)
 
     ectx = (keep_push_pop = keep_push_pop, loop_ctx = Any[], layout = layout, push_pop = push_pop, ii_plan = ii_plan, remat = remat)
 
     cse_counter = Ref(0)
     cse_floats = agen_cse_float_names(sig, sites)
-    fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, active_map, value_needed, reassigned, stacks, exempt; ectx = ectx, lin_body = lin_plan, unsafe = unsafe), cse_counter, cse_floats)
-    bwd = emit_cse_stmts(agen_backward_body(lin_plan, kernel.body, sig.kinds, active_map, unsafe, value_needed, reassigned, stacks, exempt; ectx = ectx), cse_counter, cse_floats)
+    fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, tape_map, value_needed, reassigned, stacks, exempt; ectx = ectx, lin_body = lin_plan, unsafe = unsafe), cse_counter, cse_floats)
+    bwd = emit_cse_stmts(agen_backward_body(lin_plan, kernel.body, sig.kinds, tape_map, unsafe, value_needed, reassigned, stacks, exempt; ectx = ectx), cse_counter, cse_floats)
 
     shadow_of = hvp_shadow_map(kernel, sites)
     hvp_register_temp_shadows!(shadow_of, fwd)
@@ -6827,11 +6861,11 @@ function hvp_emit(kernel, active_map, lin_plan, sites; keep_push_pop::Bool = tru
     sizing_stmts = Any[]
     total_of = Dict{Symbol,Symbol}()
     if !keep_push_pop && layout !== nothing && !isempty(layout.tainted_stacks)
-        (sizing_stmts, total_of) = agen_tier_b_sizing_stmts(kernel, active_map, value_needed, exempt, stacks, layout.tainted_stacks; push_pop = push_pop)
+        (sizing_stmts, total_of) = agen_tier_b_sizing_stmts(kernel, tape_map, value_needed, exempt, stacks, layout.tainted_stacks; push_pop = push_pop)
     end
     append!(body, sizing_stmts)
     append!(body, hvp_shadow_stack_inits(sites, shadow_of, keep_push_pop, layout, total_of))
-    append!(body, agen_local_primal_inits(kernel, active_map, agen_itbr_vars(stacks)))
+    append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks)))
     append!(body, agen_local_shadow_inits(kernel, active_map))
     append!(body, hvp_local_second_inits(kernel, shadow_of))
     append!(body, hvp_double_body(fwd, shadow_of))
@@ -18677,8 +18711,8 @@ function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=n
     keep_push_pop || agen_refuse_itbr_sized(snapshot_plan)
     lin_plan = lin_build(kernel, active_map)
     ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing
-    (agen_sites, remat) = keep_push_pop ? (agen_sites, nothing) : agen_remat_apply(kernel, active_map, agen_sites)
-    (agen_sites, asnap) = keep_push_pop ? (agen_sites, nothing) : agen_asnap_apply(kernel, active_map, agen_sites; ii_plan = ii_plan)
+    (agen_sites, remat) = keep_push_pop ? (agen_sites, nothing) : agen_remat_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites)
+    (agen_sites, asnap) = keep_push_pop ? (agen_sites, nothing) : agen_asnap_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites; ii_plan = ii_plan)
     asnap === nothing || (snapshot_plan = vcat(snapshot_plan, agen_asnap_sites(asnap)))
     return agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, push_pop = agen_sites, ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs)
 end
@@ -18698,8 +18732,8 @@ function stade_hvp(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothi
     end
     lin_plan = lin_build(kernel, active_map)
     ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing
-    (agen_sites, remat) = keep_push_pop ? (agen_sites, nothing) : agen_remat_apply(kernel, active_map, agen_sites)
-    (agen_sites, asnap) = keep_push_pop ? (agen_sites, nothing) : agen_asnap_apply(kernel, active_map, agen_sites; ii_plan = ii_plan)
+    (agen_sites, remat) = keep_push_pop ? (agen_sites, nothing) : agen_remat_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites)
+    (agen_sites, asnap) = keep_push_pop ? (agen_sites, nothing) : agen_asnap_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites; ii_plan = ii_plan)
     asnap === nothing || (snapshot_plan = vcat(snapshot_plan, agen_asnap_sites(asnap)))
     layout = nothing
     value_needed = exempt = stacks = nothing
@@ -18709,10 +18743,10 @@ function stade_hvp(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothi
         reassigned = agen_collect_reassigned_all(kernel.body)
         exempt = agen_exempt_vars(kernel, value_needed)
         stacks = agen_stack_map(snapshot_plan)
-        layout = agen_layout(kernel, kernel.sig.kinds, active_map, value_needed, reassigned, exempt, stacks; push_pop = agen_sites)
+        layout = agen_layout(kernel, kernel.sig.kinds, agen_tape_map(kernel, active_map, agen_sites), value_needed, reassigned, exempt, stacks; push_pop = agen_sites)
     end
     (initstacks_expr, table_names, tot_names, val_names) = agen_init_emit(kernel, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout,
-                                      active_map = active_map, value_needed = value_needed, exempt = exempt, stacks = stacks, push_pop = agen_sites)
+                                      active_map = agen_tape_map(kernel, active_map, agen_sites), value_needed = value_needed, exempt = exempt, stacks = stacks, push_pop = agen_sites)
     tier_b_extra_args = vcat(table_names, tot_names, val_names)
     hvp_expr = hvp_emit(kernel, active_map, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout, push_pop = agen_sites,
                          tier_b_extra_args = tier_b_extra_args, ii_plan = ii_plan, remat = remat)
