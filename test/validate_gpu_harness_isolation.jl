@@ -1,6 +1,6 @@
 # ===================== validate_gpu_harness_isolation.jl =====================
 # Structural gate for validate_corpus_gpu.jl (no device needed; the script runs on include, so its text is read).
-# One kernel whose baseline cannot be generated (rank-2 arrays, which io_write_baseline_yaml refuses; a draw that never avoids a domain error, as in
+# One kernel whose baseline cannot be generated (arrays of rank 3 or more, which io_write_baseline_yaml refused before it learned them; a draw that never avoids a domain error, as in
 # phc_colebrook) used to raise out of the whole run and drop every kernel after it: a group of 25 battle kernels came back with no row at all.
 #   1. ISOLATION: the baseline call sits inside a `try`; its `catch` prints the kernel and the message, records a `:no_baseline` row and goes on to the next kernel.
 #   2. USAGE ERRORS STAY LOUD: the check of a stored baseline against a pinned integer (`delete it`) is outside that `try`, so a wrong pin still stops the run.
