@@ -72,7 +72,9 @@ function validate_host_stack_note()
         end
     end
     # 2. NESTED
-    check(hsn_note(joinpath(dir, "nest_in_lv.jl"), :adjoint).note !== nothing, "assignment in the level loop: a note")
+    nlv = hsn_note(joinpath(dir, "nest_in_lv.jl"), :adjoint).note
+    check(nlv !== nothing, "assignment in the level loop: a note")
+    check(nlv !== nothing && occursin("assigning it once before the loops", nlv) && occursin("`if X <= bound` mask", nlv), "the note names both remedies: assign the bound once before the loops, or the constant bound with a mask")
     check(hsn_note(pkk, :adjoint).note === nothing, "same assignment in the outer loop: no note")
     check(hsn_note(pvc, :adjoint).note === nothing, "mg_vcycle (resolved ragged nest): no note")
     # 3. FLAG

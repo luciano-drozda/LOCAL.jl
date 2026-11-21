@@ -18689,7 +18689,7 @@ function agen_host_stack_note(kernel, generated_fn)
     off = agen_tier_b_offender(kernel)
     why = off === nothing ? "a loop bound that changes inside a loop" : "the loop bound `$(off)`, assigned inside a loop that is nested in another loop with changing bounds"
     return "keep_push_pop = false: `$(kernel.sig.name)` still has $(npush[]) push! and $(npop[]) pop! calls on the host ($(why)). On a GPU each stored value then goes through the host. " *
-           "Writing those loops with a constant bound and an `if X <= bound` mask removes them (README)."
+           "If the bound keeps its value from one pass to the next, assigning it once before the loops removes them; otherwise writing those loops with a constant bound and an `if X <= bound` mask does (README)."
 end
 
 function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
