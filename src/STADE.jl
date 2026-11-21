@@ -2584,6 +2584,41 @@ function snap_var_value_needed!(expr, acc, needed)
     return nothing
 end
 
+# Activity-aware twin of snap_var_value_needed!, used by the site-level walk only. In a nonlinear call an operand's VALUE is read only
+# by a partial that is built, and a partial is built only for an active operand: `w * r` with w inactive builds the partial of r (w), never
+# the partial of w (r), so r is not read. An operand counts iff some active operand's partial (der_partials) holds it. Under an
+# already-needed context the rule is the conservative one. An op with no partials counts every operand, as before.
+snap_expr_active(e, am) = e isa Symbol ? get(am, e, false) :
+    (e isa Expr && e.head == :ref) ? get(am, e.args[1], false) :
+    (e isa Expr && e.head == :call) ? any(a -> snap_expr_active(a, am), e.args[2:end]) : false
+snap_expr_holds(e, t) = e == t || (e isa Expr && any(a -> snap_expr_holds(a, t), e.args))
+function snap_var_value_needed_act!(expr, acc, needed, am)
+    if expr isa Expr && expr.head == :call
+        op = expr.args[1]
+        args = expr.args[2:end]
+        if needed || snap_linear_call(op, args)
+            for a in args
+                snap_var_value_needed_act!(a, acc, needed, am)
+            end
+        else
+            parts = try der_partials(op, args) catch; nothing end
+            actv = [snap_expr_active(a, am) for a in args]
+            for (i, a) in enumerate(args)
+                ni = parts === nothing || any(j -> actv[j] && snap_expr_holds(parts[j], a), eachindex(args))
+                snap_var_value_needed_act!(a, acc, ni, am)
+            end
+        end
+    elseif expr isa Expr && expr.head == :ref
+        needed && push!(acc, expr.args[1])
+        for a in expr.args[2:end]
+            snap_var_value_needed_act!(a, acc, needed, am)
+        end
+    elseif expr isa Symbol
+        needed && push!(acc, expr)
+    end
+    return nothing
+end
+
 # Every variable whose value is needed somewhere in the kernel: the union, over
 # every :assign rhs (from `needed=false`) and every :if condition (from
 # `needed=true`, deliberately not refined -- the reverse sweep never re-
@@ -3026,7 +3061,8 @@ end
 # ---- site-level (forward-seen) TBR ----
 # `snap_value_needed_vars` decides whole-variable necessity; `snap_fwd_walk!` refines to a per-write
 # decision: w needs its pre-write value iff (a) w self-references, or (b) a nonlinear read of var
-# occurred strictly before w in forward order. This is the production path, reached via snap_plan's
+# occurred strictly before w in forward order; a read counts only through the partial of an active operand
+# (snap_var_value_needed_act!). This is the production path, reached via snap_plan's
 # site_needed kwarg; stade_site_level_tbr_check asserts it stays a subset of the whole-variable set.
 function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}(), boxed = Dict{Symbol,Any}())
     for idx in eachindex(body)
@@ -3039,7 +3075,7 @@ function snap_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
             # present under a linear +/- (pure accumulation needs no old
             # value: d(new)/d(old)=1).
             local_reads = Set{Symbol}()
-            snap_var_value_needed!(stmt.rhs, local_reads, false)
+            snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
             decisions[agen_site_key(body, idx)] = active_map[var] && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             # a reset of a boxed element: see snap_boxed_reset
@@ -4441,6 +4477,38 @@ function agen_var_value_needed!(expr, acc, needed)
     return nothing
 end
 
+# see snap_var_value_needed_act!'s comment -- identical logic, duplicated for the same purity-rule reason as every other agen_-prefixed pair.
+agen_expr_active(e, am) = e isa Symbol ? get(am, e, false) :
+    (e isa Expr && e.head == :ref) ? get(am, e.args[1], false) :
+    (e isa Expr && e.head == :call) ? any(a -> agen_expr_active(a, am), e.args[2:end]) : false
+agen_expr_holds(e, t) = e == t || (e isa Expr && any(a -> agen_expr_holds(a, t), e.args))
+function agen_var_value_needed_act!(expr, acc, needed, am)
+    if expr isa Expr && expr.head == :call
+        op = expr.args[1]
+        args = expr.args[2:end]
+        if needed || agen_linear_call(op, args)
+            for a in args
+                agen_var_value_needed_act!(a, acc, needed, am)
+            end
+        else
+            parts = try der_partials(op, args) catch; nothing end
+            actv = [agen_expr_active(a, am) for a in args]
+            for (i, a) in enumerate(args)
+                ni = parts === nothing || any(j -> actv[j] && agen_expr_holds(parts[j], a), eachindex(args))
+                agen_var_value_needed_act!(a, acc, ni, am)
+            end
+        end
+    elseif expr isa Expr && expr.head == :ref
+        needed && push!(acc, expr.args[1])
+        for a in expr.args[2:end]
+            agen_var_value_needed_act!(a, acc, needed, am)
+        end
+    elseif expr isa Symbol
+        needed && push!(acc, expr)
+    end
+    return nothing
+end
+
 function agen_value_needed_vars(kernel)
     acc = Set{Symbol}()
     agen_collect_value_needed!(kernel.body, acc)
@@ -4511,7 +4579,7 @@ function agen_fwd_walk!(body, seen, active_map, decisions, bvars = Set{Symbol}()
         if stmt.kind == :assign
             var = stmt.lhs isa Symbol ? stmt.lhs : stmt.lhs.args[1]
             local_reads = Set{Symbol}()
-            agen_var_value_needed!(stmt.rhs, local_reads, false)
+            agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)
             decisions[agen_site_key(body, idx)] = active_map[var] && (var in local_reads || var in seen)
             seen = union(seen, local_reads)
             agen_boxed_reset(stmt, boxed) && (seen = setdiff(seen, (var,)))
