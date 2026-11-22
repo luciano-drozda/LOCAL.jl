@@ -36,9 +36,10 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
     verbose && println("validate_fixedpoint_gpu_cpu: $(checks - bad)/$checks ok")
     if sabotage
         text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
+        # No case for the CUDA dead-stack pass on a fixed-point adjoint: it deletes only the `*_stack` arrays an initstacks host allocates, fp_info is not one,
+        # and the adjoint is one function holding both the record and the replay, so running the pass there changes nothing (an equivalent mutant, four kernels checked).
         cases = [
             ("the stage drops the fp_info stores (CUDA)", "dead_scalars && !(split_half in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))", ["fp_scalar_cos"]),
-            ("the CUDA dead stack pass runs on a fixed-point adjoint", "dead_stack >= 1 && split_half === nothing && ((host, kernels, dead_stacks", "dead_stack >= 1 && split_half !== :fwd && ((host, kernels, dead_stacks", ["fp_scalar_cos", "phc_jacobi2d", "ir_mg2d_solve_3", "fp_gauss_seidel"]),
             ("the fixed-point adjoint is not recognised", ":fp_info in expr.args[1].args[2:end] && return :fixedpoint", ":fp_infox in expr.args[1].args[2:end] && return :fixedpoint", ["fp_scalar_cos"]),
         ]
         mktempdir() do tmp
