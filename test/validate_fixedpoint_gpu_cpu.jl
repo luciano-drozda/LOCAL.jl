@@ -1,0 +1,72 @@
+# Regression for v0.5.37: the device code (CUDA and JACC) of stade_adjoint_fixedpoint, run on the CPU with the serial stand-ins of
+# validate_adjoint_split_cuda_cpu.jl and validate_adjoint_split_jacc_cpu.jl. For each kernel of validate_fixedpoint.jl and each regime, the device
+# adjoint equals the CPU fixed-point adjoint (every shadow, every returned scalar) and reports the same fp_info.
+#   The defect this guards: the GPU stage drops stores nothing in the function reads, and a fixed-point adjoint's `fp_info` is only written.
+#   julia validate_fixedpoint_gpu_cpu.jl [kernel names] [--sabotage]
+isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
+isdefined(@__MODULE__, :sab_read) || include(joinpath(@__DIR__, "sabotage_run.jl"))
+isdefined(@__MODULE__, :fpv_cases) || include(joinpath(@__DIR__, "validate_fixedpoint.jl"))
+isdefined(@__MODULE__, :scc_env) || include(joinpath(@__DIR__, "validate_adjoint_split_cuda_cpu.jl"))
+isdefined(@__MODULE__, :spj_env) || include(joinpath(@__DIR__, "validate_adjoint_split_jacc_cpu.jl"))
+
+function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage = false)
+    checks = 0; bad = 0
+    say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
+    for (ename, mk) in (("cuda", scc_env), ("jacc", spj_env))
+        env = mk()
+        for (dir, name, pins, floats, gs, prep) in fpv_cases()
+            isempty(only) || name in only || continue
+            for regime in (:converged, :zero, :cap)
+                r = try fpv_device(dir, name, pins, floats, gs, prep, env, regime)
+                    catch e
+                        # the stand-in JACC has no block reduction: a loop long enough to launch one cannot run here (the V100 job covers it)
+                        msg = first(split(sprint(showerror, e), "\n"))
+                        if ename == "jacc" && occursin("parallel_reduce was reached", msg)
+                            verbose && println(rpad(name, 22), " ", ename, " ", regime, ": needs parallel_reduce (skipped)")
+                            continue
+                        end
+                        say(false, "$ename $name $regime: $msg"); continue
+                    end
+                verbose && println(rpad(name, 22), " ", ename, " ", regime, ": err=", round(r.err, sigdigits = 3), " info=", r.dev_info)
+                say(r.err <= 1e-12, "$ename $name $regime: device vs CPU fixed-point adjoint err=$(r.err)")
+                say(r.dev_info == r.cpu_info || (r.dev_info[1:2] == r.cpu_info[1:2] && r.dev_info[4:5] == r.cpu_info[4:5] && isapprox(r.dev_info[3], r.cpu_info[3]; rtol = 1e-6)), "$ename $name $regime: fp_info device $(r.dev_info) vs CPU $(r.cpu_info)")
+            end
+        end
+    end
+    verbose && println("validate_fixedpoint_gpu_cpu: $(checks - bad)/$checks ok")
+    if sabotage
+        text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
+        cases = [
+            ("the stage drops the fp_info stores (CUDA)", "dead_scalars && !(split_half in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))", ["fp_scalar_cos"]),
+            ("the CUDA dead stack pass runs on a fixed-point adjoint", "dead_stack >= 1 && split_half === nothing && ((host, kernels, dead_stacks", "dead_stack >= 1 && split_half !== :fwd && ((host, kernels, dead_stacks", ["fp_scalar_cos", "phc_jacobi2d", "ir_mg2d_solve_3", "fp_gauss_seidel"]),
+            ("the fixed-point adjoint is not recognised", ":fp_info in expr.args[1].args[2:end] && return :fixedpoint", ":fp_infox in expr.args[1].args[2:end] && return :fixedpoint", ["fp_scalar_cos"]),
+        ]
+        mktempdir() do tmp
+            for (label, old, new, kset) in cases
+                isempty(get(ENV, "FPG_SAB_ONLY", "")) || any(t -> occursin(t, label), split(ENV["FPG_SAB_ONLY"], "|")) || continue
+                n = length(findall(old, text))
+                if n != 1
+                    bad += 1; verbose && println("NOT OK sabotage \"$label\": anchor found $n times"); continue
+                end
+                get(ENV, "SAB_ANCHORS_ONLY", "") == "1" && continue
+                path = joinpath(tmp, "STADE_sab.jl"); write(path, replace(text, old => new; count = 1))
+                script = """
+                    include($(repr(path)))
+                    cd($(repr(@__DIR__)))
+                    include($(repr(joinpath(@__DIR__, "validate_fixedpoint_gpu_cpu.jl"))))
+                    println("RESULT ", validate_fixedpoint_gpu_cpu(; verbose = false, only = $(repr(kset))) ? 0 : 1)
+                """
+                out = sab_read(script)
+                m = match(r"RESULT (\d)", out)
+                caught = out == "ERR" || m === nothing || m.captures[1] == "1"
+                caught || (bad += 1)
+                verbose && println(caught ? "ok     " : "NOT OK ", "sabotage \"$label\": ", caught ? "a check fails" : "NOT CAUGHT")
+            end
+        end
+    end
+    return bad == 0
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    exit(validate_fixedpoint_gpu_cpu(; only = String[a for a in ARGS if !startswith(a, "--")], sabotage = "--sabotage" in ARGS) ? 0 : 1)
+end

@@ -34,9 +34,8 @@ module SJStub
     end
 end
 
-spj_env() = (mod = SJStub, wrap = x -> copy(x), tohost = x -> copy(x),
-             flags = (warp_atomics = false, split_reduce = 0, jacc_contraction = 0, reduction_threshold = typemax(Int) ÷ 2, glue_kernels = true),
-             atomic_macro = Expr(:., :Atomix, QuoteNode(Symbol("@atomic"))))
+spj_env() = sg_jacc_env(; mod = SJStub, wrap = x -> copy(x), tohost = x -> copy(x),
+                        flags = (warp_atomics = false, split_reduce = 0, jacc_contraction = 0, reduction_threshold = typemax(Int) ÷ 2, glue_kernels = true))
 
 # plan-level unit: the forward half keeps its tape stores in both stages, and a half keeps the stack of the other (no shrink) in the CUDA stage
 function spj_unit_checks(say)
@@ -84,8 +83,8 @@ function validate_adjoint_split_jacc_cpu(; verbose = true, only = String[], sabo
     if sabotage
         text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
         cases = [
-            ("dead pops runs on the forward half (JACC)", "dead_scalars && jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", ["sp_restore", "sp_carry"]),
-            ("dead pops runs on the forward half (CUDA)", "dead_scalars && split_half !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))", ["sp_restore"]),
+            ("dead pops runs on the forward half (JACC)", "dead_scalars && jacc_dead_pops && !(cgen_split_half(expr) in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", ["sp_restore", "sp_carry"]),
+            ("dead pops runs on the forward half (CUDA)", "dead_scalars && !(split_half in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))", ["sp_restore"]),
             ("the CUDA stage shrinks the stacks of a half", "dead_stack >= 1 && split_half === nothing && ((host, kernels, dead_stacks", "dead_stack >= 1 && ((host, kernels, dead_stacks", ["sp_restore"]),
             ("a half is not recognised", "endswith(name, \"_b_fwd\") && return :fwd", "endswith(name, \"_b_fwdx\") && return :fwd", ["sp_restore", "sp_carry"]),
         ]

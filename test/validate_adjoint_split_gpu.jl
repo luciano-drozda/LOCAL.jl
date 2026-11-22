@@ -6,12 +6,27 @@
 #      them, equals the CPU full adjoint with that seed. This is the replay: the forward half runs once.
 #   A pass needs elements changed (the CPU reference wrote something) and two seeds that give different adjoints. A kernel with a host stack in
 #   `consume` has no device form and is reported as :host_stacks.
-# The device is an `env`: (mod, wrap, tohost, flags, atomic_macro). `mod` is where the generated plans are evaluated and run (Main on a device job, a module
-# with the stand-in JACC on the CPU), `wrap` moves a host array to the device, `tohost` brings it back, `flags` go to every stade_jacc call.
+# The device is an `env` (sg_jacc_env, sg_cuda_env): `mod` is where the generated plans are evaluated and run (Main on a device job, a module with a stand-in on
+# the CPU), `wrap` moves a host array to the device, `tohost` brings it back, `plan` makes the plan of a function (JACC or CUDA), `shrink` the stack shrink.
 # Needs only STADE (included by the caller); no GPU package is loaded here.
 
-sg_device_env() = (mod = Main, wrap = x -> Main.JACC.array(x), tohost = x -> Main.JACC.to_host(x), flags = NamedTuple(),
-                   atomic_macro = Expr(:., :Atomix, QuoteNode(Symbol("@atomic"))))
+# JACC: flags go to every stade_jacc call; the tape allocator is never shrunk (JACC has no stack shrink)
+function sg_jacc_env(; mod = Main, wrap = x -> Main.JACC.array(x), tohost = x -> Main.JACC.to_host(x), flags = NamedTuple())
+    return (kind = :jacc, mod = mod, wrap = wrap, tohost = tohost,
+            plan = (e, ih) -> ih === nothing ? STADE.stade_jacc(e; flags...) : STADE.stade_jacc(e; flags..., init_hosts = ih),
+            shrink = (pinit, pgen) -> pinit, initmap = (pinit, raw) -> Dict{Symbol,Expr}(raw.args[1].args[1] => raw),
+            atomic_macro = Expr(:., :Atomix, QuoteNode(Symbol("@atomic"))))
+end
+# CUDA: the stack shrink of the CUDA stage applies to the tape allocator of a whole adjoint (a half has none, see cgen_split_half)
+function sg_cuda_env(; mod = Main, wrap = x -> Main.CuArray(x), tohost = x -> Array(x), flags = NamedTuple())
+    be = STADE.cgen_backend_cuda()
+    return (kind = :cuda, mod = mod, wrap = wrap, tohost = tohost,
+            plan = (e, ih) -> ih === nothing ? STADE.stade_gpu(e, be; flags...) : STADE.stade_gpu(e, be; flags..., init_hosts = ih),
+            shrink = (pinit, pgen) -> merge(pinit, (host = STADE.cgen_shrink_stacks(pinit.host, pgen.dead_stacks, pgen.compact_stacks),)),
+            initmap = (pinit, raw) -> Dict{Symbol,Expr}(pinit.host.args[1].args[1] => pinit.host),
+            atomic_macro = be.atomic_macro)
+end
+sg_device_env(kind::Symbol = :jacc) = kind === :cuda ? sg_cuda_env() : sg_jacc_env()
 
 function sg_eval_plan!(evmod, plan)
     for h in get(plan, :helpers, Expr[]); Core.eval(evmod, h); end
@@ -160,19 +175,19 @@ function sg_setup(primal, kernel, env)
     # CPU reference: the full adjoint, evaluated in Main (an anonymous Module() in a function crashes the Julia 1.10 compiler here); the stand-in lives in its own module
     cpu_init = STADE.val_compile(full.initstacks); cpu_gen = STADE.val_compile(full.adjoint)
     names_full = Symbol[a for a in full.initstacks.args[1].args[2:end]]
-    fl = env.flags
-    plan_init = STADE.stade_jacc(sp.initstacks; fl...)
-    initmap = Dict{Symbol,Expr}(sp.initstacks.args[1].args[1] => sp.initstacks)
-    plan_f = try STADE.stade_jacc(sp.forward; fl..., init_hosts = initmap) catch e; return (:gen_error, "forward: " * first(split(sprint(showerror, e), "\n")), NaN, 0) end
-    plan_b = try STADE.stade_jacc(sp.backward; fl..., init_hosts = initmap) catch e; return (:gen_error, "backward: " * first(split(sprint(showerror, e), "\n")), NaN, 0) end
+    plan_init = env.plan(sp.initstacks, nothing)
+    initmap = env.initmap(plan_init, sp.initstacks)
+    plan_f = try env.plan(sp.forward, initmap) catch e; return (:gen_error, "forward: " * first(split(sprint(showerror, e), "\n")), NaN, 0) end
+    plan_b = try env.plan(sp.backward, initmap) catch e; return (:gen_error, "backward: " * first(split(sprint(showerror, e), "\n")), NaN, 0) end
     dev_init = sg_eval_plan!(env.mod, plan_init); dev_fwd = sg_eval_plan!(env.mod, plan_f); dev_bwd = sg_eval_plan!(env.mod, plan_b)
     # the full adjoint on the device, the same draw, to tell a defect of the split from one of the JACC path itself
     fi_name = Symbol(string(full.initstacks.args[1].args[1]) * "full"); fg_name = Symbol(string(full.adjoint.args[1].args[1]) * "full")
     full_init_ex = sg_rename(full.initstacks, fi_name); full_gen_ex = sg_rename(full.adjoint, fg_name)
     dev_full_init = nothing; dev_full_gen = nothing
     try
-        pfi = STADE.stade_jacc(full_init_ex; fl...)
-        pfg = STADE.stade_jacc(full_gen_ex; fl..., init_hosts = Dict{Symbol,Expr}(fi_name => full_init_ex))
+        pfi = env.plan(full_init_ex, nothing)
+        pfg = env.plan(full_gen_ex, env.initmap(pfi, full_init_ex))
+        pfi = env.shrink(pfi, pfg)
         dev_full_init = sg_eval_plan!(env.mod, pfi); dev_full_gen = sg_eval_plan!(env.mod, pfg)
     catch
         dev_full_init = nothing; dev_full_gen = nothing
@@ -232,7 +247,7 @@ function validate_adjoint_split_gpu(dir::String; only = String[], env = sg_devic
             (:error, first(split(sprint(showerror, e), "\n")), NaN, 0)
         end
         push!(rows, (nm, r...))
-        verbose && println(rpad("$nm [split/jacc]", 40), " ", r[1], isnan(r[3]) ? "" : "  max_rel_err=$(round(r[3], sigdigits = 4))", "  changed=$(r[4])", isempty(r[2]) ? "" : "  " * r[2])
+        verbose && println(rpad("$nm [split/$(env.kind)]", 40), " ", r[1], isnan(r[3]) ? "" : "  max_rel_err=$(round(r[3], sigdigits = 4))", "  changed=$(r[4])", isempty(r[2]) ? "" : "  " * r[2])
     end
     bad = count(r -> !(r[2] in (:ok, :refused, :host_stacks, :nodraw)), rows)
     verbose && println("\n", length(rows) - bad, "/", length(rows), " checks passed", bad == 0 ? "" : "   *** $bad NOT OK ***")
