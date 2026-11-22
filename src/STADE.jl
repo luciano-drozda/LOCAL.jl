@@ -3524,7 +3524,7 @@ function agen_tape_map_walk!(body, push_pop, out)
     return nothing
 end
 
-function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, push_pop = nothing, ii_plan = nothing, remat = nothing, primal_outputs::Bool = true)
+function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, push_pop = nothing, ii_plan = nothing, remat = nothing, primal_outputs::Bool = true, split::Bool = false)
     active_map = act_analyze(kernel)
     tape_map = agen_tape_map(kernel, active_map, push_pop)
     layout = nothing
@@ -3545,6 +3545,17 @@ function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, 
     (initstacks_expr, table_names, tot_names, val_names) = agen_init_emit(kernel, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout,
                                       active_map = tape_map, value_needed = value_needed, exempt = exempt, stacks = stacks, push_pop = push_pop)
     tier_b_extra_args = vcat(table_names, tot_names, val_names)
+    if split
+        parts = agen_adjoint_emit_(kernel, active_map, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout, push_pop = push_pop,
+                                   tier_b_extra_args = tier_b_extra_args, ii_plan = ii_plan, remat = remat, primal_outputs = true, split = true)
+        # the unused-stack cleanup judges the two halves together: a stack the forward half records and the backward half reads is in use
+        whole = Expr(:function, Expr(:call, agen_fname(kernel.sig.name), parts.fwd.args[1].args[2:end]...), Expr(:block, parts.fwd.args[2].args..., parts.bwd.args[2].args...))
+        (whole, initstacks_expr) = agen_finalize_stacks(whole, initstacks_expr, snapshot_plan, ii_plan; force = !keep_push_pop && (any(s -> agen_asnap_site_array(s, kernel.sig.kinds) !== nothing, snapshot_plan) || !isempty(agen_remat_cross_vars(remat))))
+        kept = Set{Symbol}(a for a in whole.args[1].args[2:end] if a isa Symbol)
+        unused = Set{Symbol}(nm for nm in agen_stack_names(snapshot_plan) if !(nm in kept))
+        return (initstacks = initstacks_expr, forward = agen_drop_unused_stack_args(parts.fwd, unused), backward = agen_drop_unused_stack_args(parts.bwd, unused),
+                carry_init = parts.carry_init, carry_f = parts.carry_f, carry_i = parts.carry_i, restore = parts.restore, consume = parts.consume)
+    end
     (adjoint_expr, primal_pruned) = agen_adjoint_emit_(kernel, active_map, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, layout = layout, push_pop = push_pop,
                                       tier_b_extra_args = tier_b_extra_args, ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs)
     # fuse_ii_loops can leave a stack with zero remaining push!/pop!/indexed-ref references
@@ -3605,6 +3616,185 @@ end
 # outputs of the kernel are then left at their input values. Returns (function expression, whether the forward sweep was dropped).
 function agen_adjoint_emit(kernel, active_map, lin_plan, sites; kw...)
     return agen_adjoint_emit_(kernel, active_map, lin_plan, sites; kw...)[1]
+end
+
+# ==== agen_split_*: the adjoint as two functions, so one recording serves many backward sweeps ====
+# `NAME_b_fwd` runs the primal and records the tape; `NAME_b_bwd` only reads the tape and accumulates the adjoints. This is the repeated-sweep
+# primitive of a fixed-point adjoint: the forward sweep does not depend on the seeds, so it runs once while the backward sweep runs once per seed.
+# What a split must settle, each with a guard:
+#   - the forward half names no adjoint (agen_split_syms! against the shadow names), else it would depend on the seed;
+#   - a scalar the backward half reads before it assigns it and the forward half leaves at function scope crosses in `__carry_f`/`__carry_i`;
+#   - the backward half rewrites some primal arrays (restores), so a repeated backward sweep needs fresh copies of those: they are listed, not copied here;
+#   - a host stack (a Vector with push!/pop!, kept for a ragged loop nest) is consumed by the backward half, so it is listed in `consume` and the caller copies it
+#     before each backward sweep that will be repeated; every indexed tape array is only read.
+function agen_split_syms!(x, acc)
+    if x isa Symbol
+        push!(acc, x)
+    elseif x isa Expr
+        x.head === :call ? foreach(a -> agen_split_syms!(a, acc), x.args[2:end]) : foreach(a -> agen_split_syms!(a, acc), x.args)
+    end
+    return nothing
+end
+
+# names assigned at function scope: at the top level or inside an `if`, never inside a loop (a loop body is its own scope)
+function agen_split_top_assigned!(stmts, acc)
+    for st in stmts
+        st isa Expr || continue
+        if st.head === :(=)
+            lhs = st.args[1]
+            lhs isa Symbol && push!(acc, lhs)
+            lhs isa Expr && lhs.head === :tuple && foreach(v -> v isa Symbol && push!(acc, v), lhs.args)
+        elseif st.head in (:+=, :-=, :*=, :/=) && st.args[1] isa Symbol
+            push!(acc, st.args[1])
+        elseif st.head === :if || st.head === :elseif
+            for b in st.args[2:end]
+                agen_split_top_assigned!(b isa Expr && b.head === :block ? b.args : Any[b], acc)
+            end
+        elseif st.head === :block
+            agen_split_top_assigned!(st.args, acc)
+        end
+    end
+    return nothing
+end
+
+# names read before every path assigns them (upward-exposed uses). A loop body may run zero times, so what it assigns does not count afterwards;
+# an `if` counts only what both of its arms assign.
+function agen_split_uev!(x, defd::Set{Symbol}, out::Set{Symbol})
+    if x isa Symbol
+        x in defd || push!(out, x)
+    elseif x isa Expr
+        h = x.head
+        if h === :(=)
+            agen_split_uev!(x.args[2], defd, out)
+            lhs = x.args[1]
+            if lhs isa Symbol
+                push!(defd, lhs)
+            elseif lhs isa Expr && lhs.head === :tuple
+                foreach(v -> v isa Symbol && push!(defd, v), lhs.args)
+            else
+                agen_split_uev!(lhs, defd, out)   # an element write reads the array name and its indices
+            end
+        elseif h in (:+=, :-=, :*=, :/=)
+            agen_split_uev!(x.args[1], defd, out)
+            agen_split_uev!(x.args[2], defd, out)
+        elseif h === :for
+            spec = x.args[1]
+            agen_split_uev!(spec.args[2], defd, out)
+            inner = copy(defd)
+            push!(inner, spec.args[1])
+            agen_split_uev!(x.args[2], inner, out)
+        elseif h === :if || h === :elseif
+            agen_split_uev!(x.args[1], defd, out)
+            d1 = copy(defd)
+            agen_split_uev!(x.args[2], d1, out)
+            if length(x.args) >= 3
+                d2 = copy(defd)
+                agen_split_uev!(x.args[3], d2, out)
+                union!(defd, intersect(d1, d2))
+            end
+        elseif h === :call
+            foreach(a -> agen_split_uev!(a, defd, out), x.args[2:end])
+        elseif h === :macrocall || h === :while
+            error("agen_split_uev!: a `$h` in a generated sweep; the split does not know how to read it")
+        else
+            foreach(a -> agen_split_uev!(a, defd, out), x.args)
+        end
+    end
+    return nothing
+end
+
+# base names of every array element written
+function agen_split_written_arrays!(x, acc)
+    x isa Expr || return nothing
+    if x.head in (:(=), :+=, :-=, :*=, :/=) && x.args[1] isa Expr && x.args[1].head === :ref && x.args[1].args[1] isa Symbol
+        push!(acc, x.args[1].args[1])
+    end
+    foreach(a -> agen_split_written_arrays!(a, acc), x.args)
+    return nothing
+end
+
+# the host stacks a sweep pops
+function agen_split_popped!(x, acc)
+    x isa Expr || return nothing
+    x.head === :call && length(x.args) >= 2 && x.args[1] === :pop! && x.args[2] isa Symbol && push!(acc, x.args[2])
+    foreach(a -> agen_split_popped!(a, acc), x.args)
+    return nothing
+end
+
+agen_split_fwd_name(name::Symbol) = Symbol(string(name) * "_b_fwd")
+agen_split_bwd_name(name::Symbol) = Symbol(string(name) * "_b_bwd")
+agen_split_carry_init_name(name::Symbol) = Symbol("initcarry_" * string(name) * "_b")
+
+function agen_split_emit(kernel, fargs, pinit, sinit, fwd, bwd, sites, stack_names, tier_b_extra_args)
+    sig = kernel.sig
+    name = sig.name
+    popped = Set{Symbol}()
+    foreach(st -> agen_split_popped!(st, popped), bwd)
+    consume = Symbol[nm for nm in vcat(stack_names, tier_b_extra_args) if nm in popped]
+    # 1. the forward half must not depend on an adjoint
+    shadow_names = Set{Symbol}(agen_shadow(a) for a in sig.args if sig.kinds[a] in (:scalar_float, :array_float))
+    for st in sinit
+        push!(shadow_names, st.args[1])
+    end
+    fwd_syms = Set{Symbol}()
+    foreach(st -> agen_split_syms!(st, fwd_syms), vcat(pinit, fwd))
+    leaked = sort(collect(intersect(fwd_syms, shadow_names)))
+    isempty(leaked) || error("stade_adjoint_split: the forward sweep of `$(name)` reads the adjoint $(join(leaked, ", ")), so one recording could not serve a second seed (fuse_ii_loops moves adjoint work into the forward sweep; the split does not use it)")
+    # 2. what the backward half reads that the forward half leaves behind
+    fwd_scope = Set{Symbol}()
+    agen_split_top_assigned!(vcat(pinit, fwd), fwd_scope)
+    exposed = Set{Symbol}()
+    let defd = Set{Symbol}()
+        for st in vcat(sinit, bwd)
+            agen_split_uev!(st, defd, exposed)
+        end
+    end
+    skip = Set{Symbol}(vcat(fargs, stack_names, tier_b_extra_args))
+    carry = sort(collect(setdiff(intersect(exposed, fwd_scope), skip)))
+    carry_f = Symbol[v for v in carry if get(sig.kinds, v, :none) == :scalar_float]
+    carry_i = Symbol[v for v in carry if get(sig.kinds, v, :none) == :scalar_int]
+    odd = [v for v in carry if !(v in carry_f) && !(v in carry_i)]
+    isempty(odd) || error("stade_adjoint_split: the backward sweep of `$(name)` reads $(join(odd, ", ")) from the forward sweep, and the split carries only Float64 and Int64 scalars")
+    # 3. primal arrays the backward half rewrites
+    written = Set{Symbol}()
+    foreach(st -> agen_split_written_arrays!(st, written), vcat(sinit, bwd))
+    restore = Symbol[a for a in sig.args if a in written && sig.kinds[a] in (:array_float, :array_int)]
+    # assemble
+    carry_args = isempty(carry) ? Symbol[] : Symbol[:__carry_f, :__carry_i]
+    fwd_body = Any[]
+    # a carried name not assigned at the top of the forward half starts defined, so the store at the end cannot meet an unassigned name
+    pinit_names = Set{Symbol}(st.args[1] for st in pinit if st isa Expr && st.head === :(=) && st.args[1] isa Symbol)
+    for v in carry
+        v in pinit_names || push!(fwd_body, Expr(:(=), v, v in carry_f ? 0.0 : 0))
+    end
+    append!(fwd_body, pinit)
+    append!(fwd_body, fwd)
+    for (k, v) in enumerate(carry_f)
+        push!(fwd_body, :(__carry_f[$k] = $v))
+    end
+    for (k, v) in enumerate(carry_i)
+        push!(fwd_body, :(__carry_i[$k] = $v))
+    end
+    push!(fwd_body, emit_return_nothing())
+    bwd_body = Any[]
+    for (k, v) in enumerate(carry_f)
+        push!(bwd_body, :($v = __carry_f[$k]))
+    end
+    for (k, v) in enumerate(carry_i)
+        push!(bwd_body, :($v = __carry_i[$k]))
+    end
+    append!(bwd_body, sinit)
+    append!(bwd_body, bwd)
+    scalar_args = [a for a in sig.args if sig.kinds[a] == :scalar_float]
+    push!(bwd_body, emit_return_scalars([agen_shadow(a) for a in scalar_args]))
+    cse_names = agen_cse_float_names(sig, sites)
+    mk(fn, body) = Expr(:function, Expr(:call, fn, fargs..., carry_args...), Expr(:block, emit_cse_stmts(body, Ref(0), cse_names)...))
+    carry_init = isempty(carry) ? nothing :
+        Expr(:function, Expr(:call, agen_split_carry_init_name(name)),
+             Expr(:block, :(__carry_f = zeros(Float64, $(length(carry_f)))), :(__carry_i = zeros(Int64, $(length(carry_i)))),
+                  Expr(:return, Expr(:tuple, :__carry_f, :__carry_i))))
+    return (fwd = mk(agen_split_fwd_name(name), fwd_body), bwd = mk(agen_split_bwd_name(name), bwd_body), carry_f = carry_f, carry_i = carry_i,
+            restore = restore, consume = consume, carry_init = carry_init)
 end
 
 # The forward sweep can be dropped when the backward body (the generated statements, not the kernel) never reads a name that the primal writes, and never touches a
@@ -3777,7 +3967,7 @@ function agen_prune_dead_primal(kernel, body, stack_names)
 end
 
 function agen_adjoint_emit_(kernel, active_map, lin_plan, sites; keep_push_pop::Bool = true, layout = nothing, push_pop = nothing,
-                            tier_b_extra_args::Vector{Symbol} = Symbol[], ii_plan = nothing, remat = nothing, primal_outputs::Bool = true)
+                            tier_b_extra_args::Vector{Symbol} = Symbol[], ii_plan = nothing, remat = nothing, primal_outputs::Bool = true, split::Bool = false)
     fname = agen_fname(kernel.sig.name)
     stacks = agen_stack_map(sites)
     # `tier_b_extra_args` (Phase D) is the same table/total/value-table name list agen_init_emit
@@ -3795,10 +3985,13 @@ function agen_adjoint_emit_(kernel, active_map, lin_plan, sites; keep_push_pop::
 
     tape_map = agen_tape_map(kernel, active_map, push_pop)
     body = Any[]
-    append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks), agen_value_stack_vars(stacks)))
-    append!(body, agen_local_shadow_inits(kernel, active_map))
+    pinit = agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks), agen_value_stack_vars(stacks))
+    sinit = agen_local_shadow_inits(kernel, active_map)
+    append!(body, pinit)
+    append!(body, sinit)
     fwd = agen_forward_body(kernel.body, kernel.sig.kinds, tape_map, value_needed, reassigned, stacks, exempt; ectx = ectx, lin_body = lin_plan, unsafe = unsafe)
     bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, tape_map, unsafe, value_needed, reassigned, stacks, exempt; ectx = ectx)
+    split && return agen_split_emit(kernel, fargs, pinit, sinit, fwd, bwd, sites, agen_stack_names(sites), tier_b_extra_args)
     skipped = !primal_outputs && agen_forward_skippable(kernel, fwd, bwd, agen_stack_names(sites), tier_b_extra_args)
     skipped || append!(body, fwd)
     append!(body, bwd)
@@ -18782,6 +18975,19 @@ end
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
                         keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
+    return stade_adjoint_(expr, independents, dependents, keep_push_pop, fuse_ii_loops, primal_outputs, false)
+end
+
+# The adjoint as a forward function that records the tape and a backward function that only reads it (agen_split_emit has the contract). Always
+# keep_push_pop = false (the tape is read, never consumed) and never fused (fusion moves adjoint work into the forward sweep). Returns
+# (initstacks, forward, backward, carry_init, carry_f, carry_i, restore, consume); carry_init is `nothing` when no scalar crosses from one half to the other.
+# `restore` lists the primal arrays the backward half rewrites and `consume` the host stacks it pops: a backward sweep that will be repeated needs a fresh copy of each.
+function stade_adjoint_split(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
+                              dependents::Union{Vector{Symbol},Nothing}=nothing)
+    return stade_adjoint_(expr, independents, dependents, false, false, true, true)
+end
+
+function stade_adjoint_(expr::Expr, independents, dependents, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool, split::Bool)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     kernel = norm_insert_dead_entry_resets(kernel)   # see norm_dead_entry_vars
     active_map = act_analyze(kernel)
@@ -18794,7 +19000,7 @@ function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=n
     (agen_sites, remat) = keep_push_pop ? (agen_sites, nothing) : agen_remat_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites)
     (agen_sites, asnap) = keep_push_pop ? (agen_sites, nothing) : agen_asnap_apply(kernel, agen_tape_map(kernel, active_map, agen_sites), agen_sites; ii_plan = ii_plan)
     asnap === nothing || (snapshot_plan = vcat(snapshot_plan, agen_asnap_sites(asnap)))
-    return agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, push_pop = agen_sites, ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs)
+    return agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop = keep_push_pop, push_pop = agen_sites, ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs, split = split)
 end
 
 function stade_hvp(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,

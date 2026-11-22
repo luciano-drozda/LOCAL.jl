@@ -294,7 +294,7 @@ function validate_primal_outputs(; phases = (:units, :sabotage), slice = 1:typem
             ("a store into an array that is read is dropped", "dead_a = Set{Symbol}(a for a in warrays if !(a in reads))", "dead_a = Set{Symbol}(a for a in warrays)"),
             ("an assignment to a scalar that is read is dropped", "dead_s = Set{Symbol}(a for a in wscalars if !(a in reads))", "dead_s = Set{Symbol}(a for a in wscalars)"),
             ("a stack operation is dropped with its scalar", "(:push! in rs || :pop! in rs) || return nothing", "return nothing"),
-            ("the keyword is ignored by stade_adjoint", "ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs)\nend\n\nfunction stade_hvp", "ii_plan = ii_plan, remat = remat)\nend\n\nfunction stade_hvp"),
+            ("the keyword is ignored by stade_adjoint", "ii_plan = ii_plan, remat = remat, primal_outputs = primal_outputs, split = split)\nend\n\nfunction stade_hvp", "ii_plan = ii_plan, remat = remat, split = split)\nend\n\nfunction stade_hvp"),
             ("the forward sweep is never dropped", "skipped = !primal_outputs && agen_forward_skippable(kernel, fwd, bwd, agen_stack_names(sites), tier_b_extra_args)", "skipped = false"),
             ("dead stores are never pruned", "    if !primal_outputs\n        (body, dropped) = agen_prune_dead_primal(kernel, body, agen_stack_names(sites))", "    if false\n        (body, dropped) = agen_prune_dead_primal(kernel, body, agen_stack_names(sites))"),
             ("the forward sweep is dropped with the default setting", "skipped = !primal_outputs && agen_forward_skippable", "skipped = agen_forward_skippable"),

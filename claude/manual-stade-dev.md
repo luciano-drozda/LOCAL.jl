@@ -1242,6 +1242,19 @@ values swapped. The gradient was wrong without any error. `agen_tripcount_bound_
 now returns the bounds sorted by name, and the pop side walks them in reverse.
 Seeds 3001 to 3030 give 30 failures on v0.4.21 and none on v0.4.22.
 
+### The record/replay split of the adjoint (v0.5.35)
+
+`stade_adjoint_split(expr; independents, dependents)` returns the adjoint as two functions, `NAME_b_fwd` and `NAME_b_bwd`. The forward half re-runs the primal and records the tape. The backward half only reads the tape and runs the reverse sweep. A caller that needs many reverse sweeps at one fixed primal state (the Christianson two-step adjoint of a fixed-point loop) calls the forward half once and the backward half many times. The split is always generated with `keep_push_pop = false`, `fuse_ii_loops = false` and `primal_outputs = true`. Fusion moves adjoint work into the forward sweep, which would give the forward half a reason to read an adjoint. The public flag surface is unchanged. There is no HVP split: the forward sweep of an HVP depends on the direction, so there is nothing to record once.
+
+The result is `(initstacks, forward, backward, carry_init, carry_f, carry_i, restore, consume)`.
+
+- **carry.** A scalar that the forward half assigns and the backward half reads before it assigns it (`agen_split_uev!`, a flow-sensitive upward-exposed-use walk). `initcarry_NAME_b()` makes the two carry vectors `__carry_f` (Float64) and `__carry_i` (Int64). Both halves take them as last arguments. Only Float64 and Int64 scalars are carried; anything else raises an error. The corpus survey gave 350 of 359 kernels with no carry.
+- **restore.** The primal arrays that the backward half writes (the reverse sweep rewrites them). A caller that repeats the backward sweep gives each sweep a fresh copy of these arrays.
+- **consume.** The host stacks (`Vector` with `push!`/`pop!`) that the backward half pops. A caller copies them before each repeated sweep. Indexed tape arrays are only read, so they need no copy. The multigrid cycle has five of these, and the copies are why its replay gain is 1.6x, not the 2.4x that a hand split gives.
+- **guards.** A forward half that mentions an adjoint name raises an error ("reads the adjoint"). A carry that is not a Float64 or Int64 scalar raises an error. A carried name that the primal initialisations do not set gets a zero initialisation at the top of the forward half, so the carry vector never holds an undefined value. The shadow-local initialisations (`agen_local_shadow_inits`) move to the start of the backward half. Common-subexpression elimination runs per half.
+
+Tests: `test/validate_adjoint_split.jl` (`--sabotage` runs the 11 sabotage cases) and the corpus `test/split-corpus/` (`sp_carry`, `sp_restore`, `sp_branch_off`, `sp_branch_on`). For each kernel the suite checks that the forward and backward halves together equal the full adjoint bit for bit in every argument, stack and returned scalar; that only `consume` stacks change; that every array the backward half changes is in `restore`; and that a second backward sweep with a second seed equals a full adjoint with that seed. Two seeds must give different adjoints, so a vacuous pass is refused. A GPU build of the split is not done.
+
 ## IV.12 `keep_push_pop = false` in detail
 
 This flag replaces every `push!` and `pop!` with an indexed write and read
