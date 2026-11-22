@@ -1801,7 +1801,7 @@ unmodified 0.4.4.
   from two threads. `cgen_offset_difference` decides this exactly; an index it
   cannot analyse stays trusted, so mpnn's three slices of one buffer still
   offload. Two additive writes are exempt, since they become atomic adds.
-  `idm_refuse_cond_read` is the witness.
+  `idm_overlap_plain` is the witness. Since 0.5.34 a condition alone no longer snapshots an array, so `idm_refuse_cond_read` keeps only its host forward loop; `idm_refuse_cond_read_nl` keeps the restores.
 - `cgen_rmw_hazard_arrays` (`:rmw`). Reached through an index that is itself
   read from an array (a gather), a read-modify-write that no atomic add repairs
   (`m[n] = m[n] * 0.5 + x`), an undo from a stack, and an array that is both

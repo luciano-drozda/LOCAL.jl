@@ -143,7 +143,7 @@ function validate_offload(dir::String = joinpath(@__DIR__, "val-corpus"))
         # loop-invariant atomic hoisting: ragged per-row loops that accumulate into a shared bin; the one host loop of hoist_sentinel is the prefix table of its Tier B trip counts in initstacks_*
         "hoist_bins" => 0, "hoist_nested" => 0, "hoist_sentinel" => 1,
         "idm_cse_acc" => 2, "ii_multiversion" => 0, "idm_src_consume" => 2, "idm_gather_rmw" => 6, "idm_overlap_plain" => 3,
-        "idm_refuse_cond_read" => 3, "idm_refuse_scalar_read" => 3, "idm_refuse_consume_gap" => 3,
+        "idm_refuse_cond_read" => 3, "idm_refuse_cond_read_nl" => 3, "idm_refuse_scalar_read" => 3, "idm_refuse_consume_gap" => 3,
         # idm_refuse_scalar_read_nl: the nonlinear twin of idm_refuse_scalar_read, kept so the scalar gate still has a witness once linear uses stopped saving the scalar
         "idm_refuse_scalar_read_nl" => 3,
         # lin_*: in-place linear loops (v0.4.27 value-needed rule); the carried and ping-pong loops are order-dependent and must stay on the host
@@ -162,7 +162,9 @@ function validate_offload(dir::String = joinpath(@__DIR__, "val-corpus"))
     # kernel => decisions that MUST appear in the offload report of its adjoint: (verdict, reason, array).
     # A listed loop that reaches a kernel instead is a failure, not an improvement.
     REFUSALS = Dict{String,Vector{Tuple{Symbol,Symbol,Any}}}(
-        "idm_refuse_cond_read" => [(:host, :array, :v), (:host, :overlap, :v)],
+        # a condition alone no longer snapshots v (v0.5.34): the forward loop stays on the host, and the reverse loop, which now writes no v, offloads. The _nl twin keeps the restores.
+        "idm_refuse_cond_read" => [(:host, :array, :v)],
+        "idm_refuse_cond_read_nl" => [(:host, :array, :v)],
         "idm_gather_rmw" => [(:host, :rmw, :m)],
         "idm_cse_acc" => [(:host, :rmw, :mb)],
         "idm_overlap_plain" => [(:host, :overlap, :a)],

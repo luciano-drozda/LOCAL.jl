@@ -1,4 +1,4 @@
-# Regression for v0.5.31, v0.5.32 and v0.5.33. v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
+# Regression for v0.5.31 to v0.5.34. v0.5.31: the value-read set of site-level TBR counts an operand of a nonlinear call only when a partial that holds it
 # belongs to an ACTIVE operand.
 #   Defect: snap_fwd_walk! / agen_fwd_walk! gated the written variable on activity, but built the set of values read nonlinearly with no regard for
 #   activity. In `u = u + w * r` and `y = x / d` the call is nonlinear, so r and x counted as read although w and d were inactive (`independents`
@@ -9,6 +9,11 @@
 #   not a requested dependent, still got partials, so its operands kept snapshots nothing needed (the squared residual norm of a guarded solve kept the
 #   residual's tape). Fix: act_analyze = act_varied AND act_useful for the adjoint and HVP stages, lin_build_stmt builds no partial for an assignment
 #   to an inactive float, and the two forward walks read nothing from such a right-hand side. The tangent stages keep act_varied.
+# v0.5.34: a condition is not a read. The reverse sweep replays an `if` from its recorded flag, so the walks count a condition only inside a loop the fusing
+#   pass recomputes (agen_ii_recompute_stmts re-emits the condition there). The classifier never covers a loop that holds an `if`, so that branch is dead today
+#   and a hand-built plan drives it (ir_plan_unit). Fix: replay/ii_plan arguments of the four walk functions, and the plan reaches the site decisions through
+#   stade_site_level_tbr_check. The boundary snapshots still come from the whole-variable set, which counts conditions, so a float local with a value stack but
+#   no site (uc_zinit) needs its own initial value: agen_local_primal_inits takes the value-stack variables (zero-trip loops, GPU glue code).
 # Part 1 counts the per-site decisions per variable, with the independents restricted and with the defaults (shapes that must keep their snapshots keep them).
 # Part 2 checks the restricted-independents adjoint on the independent components against (a) a central finite difference along a random direction,
 #   (b) the default-independents adjoint, (c) the exact tangent-adjoint dot-product identity, (d) the HVP against a finite difference of the adjoint,
@@ -26,38 +31,61 @@ const IR_CASES = Dict(
     "ir_sin"       => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                # partial of sin needs x: kept
     "ir_mixed"     => (indep = [:x, :z],       expect = Dict(:x => 1),                same = [:x]),                # second product needs x: kept
     "ir_maxmin"    => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                # the selection compares x: kept
-    "ir_cond"      => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                # a condition always counts: kept
+    "ir_cond"      => (indep = [:x],           expect = Dict(),                       same = Symbol[]),            # a condition reads nothing (replayed from its flag): x is read by it and by w's partial of y only, w inactive
     "ir_overwrite" => (indep = [:x],           expect = Dict(:w => 1),                same = [:w]),                # the inactive scalar w is overwritten and read next to the active x: w keeps a snapshot, x none
     "ir_local"     => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),
     "ir_array"     => (indep = [:x],           expect = Dict(:m => 1),                same = [:m]),                # an inactive coefficient array: same
     "ir_carried"   => (indep = [:x],           expect = Dict(:c => 1),                same = [:c]),                # carried inside one loop
-    "ir_ifbr"      => (indep = [:x],           expect = Dict(:w => 1, :x => 1),       same = [:w, :x]),            # read in one arm of a branch
+    "ir_ifbr"      => (indep = [:x],           expect = Dict(:w => 1),                same = [:w]),                # read in one arm of a branch: w kept; x only steers the condition
     "ir_inert"     => (indep = [:x],           expect = Dict(),                       same = Symbol[]),            # feeds an inactive array only: no snapshot
     "ir_time"      => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),                # time advanced in the loop, read in a forcing                # an inactive local built from constants, overwritten every sweep: same
     "ir_firstwrite" => (indep = [:x],          expect = Dict(:t => 1),                same = [:t]),                # an inactive local first assigned inside the loop: its first push precedes any assignment
-    "ur_norm"      => (indep = [:x, :r],       expect = Dict(:rn => 2),               same = Symbol[]),   # the norm only steers the guard: r loses its snapshot, rn keeps the two its condition reads
+    "ur_norm"      => (indep = [:x, :r],       expect = Dict(),                       same = Symbol[]),   # the norm only steers the guard: r loses its snapshot, and rn none (a condition is replayed from its recorded flag)
     "ur_dep"       => (indep = [:x, :y, :z],   expect = Dict(),                       same = Symbol[], dep = [:y]),     # z is not a dependent: x is not read for it
     "ur_chain"     => (indep = [:x],           expect = Dict(),                       same = Symbol[]),                 # q reaches y only through p: both stay active
     "ur_cond"      => (indep = [:x],           expect = Dict(),                       same = Symbol[]),                 # s only selects the branch
     "ur_via"       => (indep = [:x],           expect = Dict(:x => 1),                same = [:x], dep = [:y]),         # control: w is not a dependent but reaches y
     "ur_arm"       => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                     # control: q is assigned in both arms and reaches y
     "ur_live"      => (indep = [:x],           expect = Dict(:x => 1),                same = [:x]),                     # control: the accumulation reaches y[1]
+    "uc_recompute" => (indep = [:x],           expect = Dict(:t => 1),                same = [:t]),                     # an if in a loop: no covered kind can hold it, so c (read only by the condition) has no snapshot
+    "uc_zinit"     => (indep = [:s, :w],       expect = nothing,                      same = Symbol[]),                 # g is read only by a condition but saved at a block boundary: it needs an initial value (zero-trip loop)
     "ir_mg2d_cycle_3" => (indep = [:u1, :f1],  expect = Dict(),                       same = Symbol[]),
-    "ir_mg2d_solve_3" => (indep = [:u1, :f1],  expect = Dict(:rn => 2),               same = Symbol[]),            # r1 lost its four snapshots with the useful analysis; rn keeps the two its guard condition reads
+    "ir_mg2d_solve_3" => (indep = [:u1, :f1],  expect = Dict(),                       same = Symbol[]),            # r1 lost its four snapshots with the useful analysis, rn the two its guard condition read
 )
 const IR_PIN = Dict(
     "ir_mg2d_cycle_3" => (pin = Dict(:n1 => 7, :nu1 => 2, :nu2 => 1), fr = Dict(:h1 => (0.05, 0.2), :w => (0.5, 1.0)), grow = 81 + 8),
     "ir_mg2d_solve_3" => (pin = Dict(:n1 => 7, :nu1 => 2, :nu2 => 1, :maxit => 3), fr = Dict(:h1 => (0.05, 0.2), :w => (0.5, 1.0), :tol => (1e-30, 1e-29)), grow = 81 + 8),
 )
 
-function ir_counts(primal, indep, dep = nothing)
-    k = STADE.parse_override_indep_dep(STADE.parse_kernel(primal), indep, dep)
-    d = STADE.snap_value_needed_sites(k); v = STADE.snap_site_vars(k)
+# plan = nothing: fusing off, a condition reads nothing; :all: every condition read kept (what the fusing pass is classified from); a Dict: that ii plan.
+# A plan is keyed by objectid of the statement vectors, so build it from the same parsed kernel that is counted: use ir_counts_kernel.
+function ir_counts_kernel(k; plan = nothing)
+    d = STADE.snap_value_needed_sites(k; ii_plan = plan); v = STADE.snap_site_vars(k)
     cnt = Dict{Symbol,Int}()
     for (key, need) in d
         need && (cnt[v[key]] = get(cnt, v[key], 0) + 1)
     end
-    return cnt, STADE.agen_value_needed_sites(k) == d
+    return cnt, STADE.agen_value_needed_sites(k; ii_plan = plan) == d
+end
+ir_counts(primal, indep, dep = nothing; plan = nothing) =
+    ir_counts_kernel(STADE.parse_override_indep_dep(STADE.parse_kernel(primal), indep, dep); plan = plan)
+
+# The replay branch cannot be reached through the classifier (it never covers a loop holding an `if`), so a hand-built plan drives it.
+function ir_plan_unit(say)
+    path = joinpath(@__DIR__, "inactive-read-corpus", "uc_recompute.jl")
+    k = STADE.parse_override_indep_dep(STADE.parse_kernel(STADE.io_read_corpus_entry(path)), [:x], nothing)
+    fors = [i for (i, s) in enumerate(k.body) if s.kind == :for]
+    say(length(fors) == 2, "uc_recompute: expected two top-level loops, found $(length(fors))")
+    length(fors) == 2 || return
+    plan(i, kind) = Dict(STADE.agen_site_key(k.body, fors[i]) => kind)
+    c(p) = begin cnt, same = ir_counts_kernel(k; plan = p); say(same, "uc_recompute: snap_ and agen_ site decisions differ under $(p isa Dict ? collect(values(p)) : p)"); get(cnt, :c, 0) end
+    say(c(nothing) == 0, "uc_recompute: with fusing off a condition read must not snapshot c, got $(c(nothing))")
+    say(c(:all) == 1, "uc_recompute: the conservative walk must keep the condition read of c, got $(c(:all))")
+    for kind in (:reduction, :mixed, :recompute)
+        say(c(plan(1, kind)) == 1, "uc_recompute: a loop covered as $kind re-emits its if, so c must snapshot, got $(c(plan(1, kind)))")
+        say(c(plan(2, kind)) == 0, "uc_recompute: covering the loop WITHOUT the if must not keep c, got $(c(plan(2, kind)))")
+    end
+    say(c(plan(1, :independent)) == 0, "uc_recompute: an :independent loop replays from its flag, so c must not snapshot, got $(c(plan(1, :independent)))")
 end
 
 # unit vector over the flattened float arguments named in `names`
@@ -141,6 +169,7 @@ function ir_sabotage(; verbose = true)
     sn = "ni = parts === nothing || any(j -> actv[j] && snap_expr_holds(parts[j], a), eachindex(args))"
     ag = "ni = parts === nothing || any(j -> actv[j] && agen_expr_holds(parts[j], a), eachindex(args))"
     v33 = ["ur_norm", "ur_dep", "ur_chain", "ur_cond", "ur_via", "ur_live", "ur_arm"]
+    v34 = ["ur_norm", "uc_recompute"]
     v32 = ["ir_local", "ir_overwrite", "ir_time", "ir_array", "ir_firstwrite"]
     cases = [
         ("every operand counts as read", [(sn, "ni = true"), (ag, "ni = true")]),
@@ -168,7 +197,7 @@ function ir_sabotage(; verbose = true)
         ("the forward sweep of the adjoint ignores the tape map", [("fwd = agen_forward_body(kernel.body, kernel.sig.kinds, tape_map, value_needed", "fwd = agen_forward_body(kernel.body, kernel.sig.kinds, active_map, value_needed")], v32),
         ("the backward sweep of the adjoint ignores the tape map", [("bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, tape_map, unsafe", "bwd = agen_backward_body(lin_plan, kernel.body, kernel.sig.kinds, active_map, unsafe")], v32),
         ("the forward sweep of the HVP ignores the tape map", [("fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, tape_map, value_needed,", "fwd = emit_cse_stmts(agen_forward_body(kernel.body, sig.kinds, active_map, value_needed,")], v32),
-        ("an inactive local is not initialised before its first push", [("append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(",
+        ("an inactive local is not initialised before its first push", [("append!(body, agen_local_primal_inits(kernel, tape_map, agen_itbr_vars(stacks), agen_value_stack_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(",
                                                                           "append!(body, agen_local_primal_inits(kernel, active_map, agen_itbr_vars(stacks)))\n    append!(body, agen_local_shadow_inits(kernel, active_map))\n    fwd = agen_forward_body(")], v32),
         ("usefulness is ignored: activity is varied only", [("(varied[v] && get(useful, v, false))", "varied[v]")], v33),
         ("the useful scan makes one pass", [("    bound = length(useful) + 1\n", "    bound = 1\n")], v33),
@@ -178,6 +207,23 @@ function ir_sabotage(; verbose = true)
         ("an assignment to an inactive float still builds partials", [("dead ? Dict{Symbol,Bool}() : active_map)", "active_map)")], v33),
         ("only the snap_ twin reads the rhs of an inactive float", [("snap_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)", "snap_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)")], v33),
         ("only the agen_ twin reads the rhs of an inactive float", [("agen_var_value_needed_act!(stmt.rhs, local_reads, false, (floats !== nothing && var in floats && !active_map[var]) ? Dict{Symbol,Bool}() : active_map)", "agen_var_value_needed_act!(stmt.rhs, local_reads, false, active_map)")], v33),
+
+        # v0.5.34: a condition reads a value only inside a loop the fusing pass recomputes
+        ("every condition counts again (no replay)", [("snap_float_vars(kernel),\n                   ii_plan === :all, ii_plan === :all ? nothing : ii_plan)", "snap_float_vars(kernel),\n                   true, ii_plan === :all ? nothing : ii_plan)"),
+                                                      ("agen_float_vars(kernel),\n                   ii_plan === :all, ii_plan === :all ? nothing : ii_plan)", "agen_float_vars(kernel),\n                   true, ii_plan === :all ? nothing : ii_plan)")], v34),
+        ("a condition never counts", [("replay && snap_var_value_needed!(stmt.cond, seen, true)", "false && snap_var_value_needed!(stmt.cond, seen, true)"),
+                                      ("replay && agen_var_value_needed!(stmt.cond, seen, true)", "false && agen_var_value_needed!(stmt.cond, seen, true)")], v34),
+        ("a recomputed loop does not replay its conditions", [("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = snap_fwd_walk_loop!(", "replay_in = replay\n            seen = snap_fwd_walk_loop!("),
+                                                              ("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = agen_fwd_walk_loop!(", "replay_in = replay\n            seen = agen_fwd_walk_loop!(")], v34),
+        ("an :independent loop replays its conditions", [("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = snap_fwd_walk_loop!(", "replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute, :independent))\n            seen = snap_fwd_walk_loop!("),
+                                                         ("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = agen_fwd_walk_loop!(", "replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute, :independent))\n            seen = agen_fwd_walk_loop!(")], v34),
+        ("only the snap_ twin replays a recomputed loop", [("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = snap_fwd_walk_loop!(", "replay_in = replay\n            seen = snap_fwd_walk_loop!(")], v34),
+        ("only the agen_ twin replays a recomputed loop", [("replay_in = replay || (ii_plan !== nothing && get(ii_plan, agen_site_key(body, idx), :none) in (:reduction, :mixed, :recompute))\n            seen = agen_fwd_walk_loop!(", "replay_in = replay\n            seen = agen_fwd_walk_loop!(")], v34),
+        ("the adjoint ignores the plan for its sites", [("    # the plan is classified from the conservative sites; the emitted sites then keep a condition read only inside a loop the plan recomputes\n    snap_sites, agen_sites = stade_site_level_tbr_check(kernel; ii_plan = ii_plan)",
+                                                          "    snap_sites, agen_sites = stade_site_level_tbr_check(kernel)")], v34),
+        ("a float with a value stack is not initialised", [("(active_map[v] || v in stacked)", "active_map[v]")], ["uc_zinit"]),
+        ("the HVP ignores the plan for its sites", [("    ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing\n    snap_sites, agen_sites = stade_site_level_tbr_check(kernel; ii_plan = ii_plan)",
+                                                      "    ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing\n    snap_sites, agen_sites = stade_site_level_tbr_check(kernel)")], v34),
     ]
     mktempdir() do tmp
         for case in cases
@@ -209,6 +255,19 @@ function ir_sabotage(; verbose = true)
     return bad == 0
 end
 
+# The condition of the guard reads rn; with it no longer a read, only the two block-boundary snapshots of rn remain (four before v0.5.34, eight in the HVP).
+function ir_nopush(say)
+    primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, "inactive-read-corpus", "ur_norm.jl"))
+    for kp in (true, false), fz in (false, true), mode in (:adjoint, :hvp)
+        g = mode == :adjoint ? STADE.stade_adjoint(primal; independents = [:x, :r], keep_push_pop = kp, fuse_ii_loops = fz).adjoint :
+                               STADE.stade_hvp(primal; independents = [:x, :r], keep_push_pop = kp, fuse_ii_loops = fz).hvp
+        src = string(g)
+        n = kp ? count("push!(rn_stack", src) : count(r"rn_stack\[[^\]]*\]\s*=[^=]", src)
+        want = (kp && mode == :hvp) ? 4 : 2
+        say(n == want, "ur_norm $mode keep_push_pop=$kp fuse_ii_loops=$fz: $n writes to rn_stack, expected $want")
+    end
+end
+
 function validate_inactive_read(; verbose = true, only = String[], report = false, phases = (:units, :sabotage))
     bad = 0; checks = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
@@ -216,6 +275,8 @@ function validate_inactive_read(; verbose = true, only = String[], report = fals
     tmp = mktempdir()
     names = sort(String[f[1:end-3] for f in readdir(dir) if endswith(f, ".jl")])
     isempty(only) || (names = filter(n -> n in only, names))
+    :units in phases && "uc_recompute" in names && ir_plan_unit(say)
+    :units in phases && "ur_norm" in names && ir_nopush(say)
     for nm in (:units in phases ? names : String[])
         path = joinpath(dir, nm * ".jl"); c = IR_CASES[nm]
         primal = STADE.io_read_corpus_entry(path)

@@ -42,7 +42,8 @@ function validate_plain_write_gate(dir::String = joinpath(@__DIR__, "val-corpus"
 
     # 1. verdicts
     r = report("idm_overlap_plain");  check(has(r, :host, :overlap, :a), "idm_overlap_plain: plain writes a[i], a[i+1] -> host (overlap, a)")
-    r = report("idm_refuse_cond_read"); check(has(r, :host, :overlap, :v), "idm_refuse_cond_read: restores v[i], v[i+1] -> host (overlap, v)")
+    r = report("idm_refuse_cond_read"); check(has(r, :host, :array, :v) && !any(x -> x.verdict == :host && x.reason == :overlap, r) && any(x -> x.verdict == :kernel && x.owner == :idm_refuse_cond_read_b && x.step == -1, r), "idm_refuse_cond_read: forward loop -> host (array, v); the reverse loop writes no v and offloads (the condition is replayed from its flag)")
+    r = report("idm_refuse_cond_read_nl"); check(count(x -> x.verdict == :host && x.reason == :array && x.array == :v, r) >= 2, "idm_refuse_cond_read_nl: forward loop and its restoring reverse loop -> host (array, v)")
     r = report("idm_gather_rmw");     check(has(r, :host, :rmw, :m), "idm_gather_rmw: m[n] = m[n]*0.5 + x through a gather -> host (rmw, m)")
     # the array snapshot takes the saved old values off ttgc's scatters; asnap_readbefore reads the array before its writes, keeps them, and stays on the host
     r = report("asnap_readbefore");   check(any(x -> x.verdict == :host && x.reason == :rmw, r), "asnap_readbefore: scatter with saved old value, and its undo -> host (rmw)")
@@ -71,7 +72,7 @@ function validate_plain_write_gate(dir::String = joinpath(@__DIR__, "val-corpus"
     # 3. sabotage, one fresh process per guard
     src = joinpath(@__DIR__, "validate_ownership.jl")
     guards = (
-        ("overlap", "cgen_overlap_proven_arrays(body::Vector{NamedTuple}, thread_var::Symbol) = Set{Symbol}()", ["idm_overlap_plain", "idm_refuse_cond_read"]),
+        ("overlap", "cgen_overlap_proven_arrays(body::Vector{NamedTuple}, thread_var::Symbol) = Set{Symbol}()", ["idm_overlap_plain", "idm_refuse_cond_read_nl"]),
         ("rmw", "cgen_rmw_hazard_arrays(body::Vector{NamedTuple}) = Set{Symbol}()", ["idm_gather_rmw", "asnap_readbefore"]),
         # the three guards of the save-only scalar relaxation; each control breaks exactly one of its conditions
         ("saveonly push", "cgen_ends_with_push(body::Vector{NamedTuple}, v::Symbol) = true", ["so_inner"]),
