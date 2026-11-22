@@ -150,9 +150,9 @@ function validate_jacc_dead_pops(; phases = (:units, :file, :fill, :sabotage), s
         check(ok, msg) = (println(rpad(ok ? "ok" : "FAIL", 6), msg); ok || (bad += 1))
         text = read(joinpath(abspath(joinpath(@__DIR__, "..")), "src", "STADE.jl"), String)
         cases = [
-            ("the pass is not applied in stade_jacc", "    dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))\n", ""),
-            ("the switch is ignored", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))"),
-            ("dead_scalars = false does not stop it", "dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))", "jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))"),
+            ("the pass is not applied in stade_jacc", "    dead_scalars && jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))\n", ""),
+            ("the switch is ignored", "dead_scalars && jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))"),
+            ("dead_scalars = false does not stop it", "dead_scalars && jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))", "jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))"),
             ("the file driver passes no initstacks", "jacc_dead_pops, jacc_tile_fill, init_hosts = (nclaim > 1 ? nothing : inits), glue_kernels)", "jacc_dead_pops, jacc_tile_fill, glue_kernels)"),
             ("the fill gate is dropped", "    fill > 16 && (cond = Expr(:&&, cond, call(:>=, call(:min, d.Mh, d.Nh), min(cmin, fill))))\n", ""),
             ("the fill gate looks at one side only", "call(:>=, call(:min, d.Mh, d.Nh), min(cmin, fill))", "call(:>=, d.Nh, min(cmin, fill))"),

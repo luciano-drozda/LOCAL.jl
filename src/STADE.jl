@@ -13108,6 +13108,17 @@ end
 # loses its stores. STADE_DEAD_POPS=0 switches it off.
 cgen_dead_pops_enabled() = get(ENV, "STADE_DEAD_POPS", "1") != "0"
 
+# The two halves of stade_adjoint_split share one tape: the stores of the forward half are read by the backward half, which is another function.
+# The passes that see one function only (cgen_dead_pops drops the stores that nothing in the function reads, and the stack shrink of the CUDA stage drops
+# and compacts a stack) must leave a half alone. A half is recognised by the name that agen_split_fwd_name and agen_split_bwd_name give it.
+function cgen_split_half(expr::Expr)
+    (expr.head === :function && expr.args[1] isa Expr && expr.args[1].head === :call && expr.args[1].args[1] isa Symbol) || return nothing
+    name = string(expr.args[1].args[1])
+    endswith(name, "_b_fwd") && return :fwd
+    endswith(name, "_b_bwd") && return :bwd
+    return nothing
+end
+
 function cgen_dead_pops_stacks(expr::Expr, init_hosts)
     init_hosts === nothing && return Set{Symbol}()
     (expr.head === :function && expr.args[1] isa Expr && expr.args[1].head === :call) || return Set{Symbol}()
@@ -19554,14 +19565,15 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
     if backend.precision_locked && p !== backend.default_precision
         error("stade_gpu: backend `$(backend.kernel_tag)` only supports precision=$(backend.default_precision) (got $(p)) -- $(backend.precision_lock_reason)")
     end
-    dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))
+    split_half = cgen_split_half(expr)
+    dead_scalars && split_half !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))
     merge_accum && (expr = cgen_merge_accum(expr))
     plan = cgen_emit(cgen_gather_stencil(cgen_ingest(expr), gather_stencil), backend; reduction_threshold)
     host, kernels = plan.host, plan.kernels
     dead_scalars && (kernels = Expr[cgen_dead_scalars(k, inbounds) for k in kernels])
     backend.kernel_tag == "cuda" && dead_scalars && reuse_stored >= 1 && ((host, kernels) = cgen_reuse_stored(host, kernels, backend; inbounds))
     dead_stacks = Symbol[]; compact_stacks = Dict{Symbol,Any}(); stack_init = nothing
-    backend.kernel_tag == "cuda" && dead_scalars && dead_stack >= 1 && ((host, kernels, dead_stacks, compact_stacks, stack_init) = cgen_dead_stack_apply(host, kernels, backend; inbounds, init_hosts, compact_ok = dead_stack >= 2))
+    backend.kernel_tag == "cuda" && dead_scalars && dead_stack >= 1 && split_half === nothing && ((host, kernels, dead_stacks, compact_stacks, stack_init) = cgen_dead_stack_apply(host, kernels, backend; inbounds, init_hosts, compact_ok = dead_stack >= 2))
     empty_launches = Symbol[]
     backend.kernel_tag == "cuda" && skip_empty && ((host, kernels, empty_launches) = cgen_skip_empty(host, kernels, backend))
     fresh = Symbol[]
@@ -19647,7 +19659,7 @@ stade_metal_file(in_path::String, out_path::String; precision::Union{Nothing, Ty
 # On JACC a matched reduction becomes one
 # JACC.@parallel_reduce call instead of @parallel_for + Atomix.@atomic.
 function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), hoist_atomics::Bool = true, gather_stencil::Union{Bool,Integer} = true, inbounds::Bool = true, dead_scalars::Bool = true, merge_accum::Bool = true, split_reduce::Integer = 16, split_fallback::Integer = 8, split_min_inner::Integer = 256, split_max_out::Integer = 32768, split_coalesce::Bool = true, warp_atomics::Bool = true, jacc_async::Bool = true, jacc_async_wait::Bool = true, jacc_contraction::Integer = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Integer = 64, glue_kernels::Bool = true, init_hosts = nothing)
-    dead_scalars && jacc_dead_pops && (expr = cgen_dead_pops(expr, init_hosts))
+    dead_scalars && jacc_dead_pops && cgen_split_half(expr) !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))
     merge_accum && (expr = cgen_merge_accum(expr))
     plan = jgen_emit(cgen_gather_stencil(cgen_ingest(expr), gather_stencil); reduction_threshold, hoist_atomics)
     host = plan.host
