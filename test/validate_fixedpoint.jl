@@ -1,12 +1,15 @@
-# Regression for v0.5.37: agen_adjoint_fixedpoint, the fixed-point reverse of a counted loop with a guard (`for kk = 1:maxit`, one `if rn > tol`).
-# For each kernel and three regimes:
+# Regression for agen_adjoint_fixedpoint, the fixed-point reverse of a counted loop with a guard (`for kk = 1:maxit`, one `if rn > tol`), with the one-slot tape.
+# For each kernel and four regimes:
 #   converged  the loop stops on its tolerance: the fixed-point adjoint (every shadow and returned scalar) equals the full adjoint of the unrolled loop to
-#              1e-9, a central difference of the primal (the tolerance held fixed) to 1e-5, the sweeps ran (at least one), neither flag is set, and the state
-#              arrays it leaves hold the primal result (the unrolled reverse rolls them back to their entry values)
+#              1e-9, a central difference of the primal (the tolerance held fixed) to 1e-5, the sweeps ran (at least one), no flag is set, the state arrays it
+#              leaves hold the primal result (the unrolled reverse rolls them back to their entry values), the result equals bit for bit that of the same adjoint
+#              with the cap-sized tape (`tape = :full`), and the tape holds the same number of elements for twice the cap
 #   zero       the guard is closed before the first iteration: no sweep, the two adjoints equal
-#   cap        maxit = 3: the forward flag is set, no sweep runs and the adjoint is the unrolled one (equal to stade_adjoint with keep_push_pop = false)
-# and the unsettled case (fp_slow_linear: the loop converges, the reverse sweeps cannot settle: the adjoint raises and fp_info[5] is set), the refusal rule
-# (a whitelist of the features the validated kernels show) and the refusals: two loops, a counter read in the body, an accumulation (no state adjoint consumed).
+#   cap        maxit = 3: the loop stops on its cap, no sweep runs, fp_info[5] = 2 and the adjoint raises (there is no fixed point)
+#   nocap      maxit = 0: the loop does not run, nothing is cut off, nothing raises
+# and the unsettled case (fp_slow_linear: the loop converges, the reverse sweeps cannot settle: the adjoint raises and fp_info[5] = 1), the refusal rule
+# (a whitelist of the features the validated kernels show) and the refusals: two loops, a counter read in the body, an accumulation (no state adjoint consumed),
+# the cap read in the body.
 #   julia validate_fixedpoint.jl [kernel names] [--sabotage]
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :sab_read) || include(joinpath(@__DIR__, "sabotage_run.jl"))
@@ -56,7 +59,11 @@ function fpv_fd(kernel, primal, adj_out, int_args, vals, stack_names, tol_sym; t
     return worst
 end
 
-# one kernel in one regime: (err against the unrolled adjoint, fp_info, elements changed, FD error or NaN, the check's verdict string or "")
+# the tape of a fixed-point adjoint, in elements (every stack but the last, `fp_info`)
+fpv_tape_elems(init_fn, names, int_args, vals) = sum(length, sg_init_stacks(init_fn, sg_stack_extra(names, int_args, vals, identity))[1:end-1])
+
+# one kernel in one regime: (err against the unrolled adjoint, fp_info, elements changed, FD error or NaN, the check's verdict string or "", the state left against the
+# primal, what the adjoint raised or "", the error against the cap-sized tape, the tape elements for the cap and for twice the cap)
 function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = false)
     primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")); kernel = STADE.parse_kernel(primal)
     pins2 = copy(pins); floats2 = copy(floats)
@@ -65,20 +72,29 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
+    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0)))
     for (k, v) in floats2; vals[k] = v; end
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
     full = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)   # the unrolled reference: stade_adjoint itself takes the fixed-point path
     fp = STADE.agen_adjoint_fixedpoint(primal)
+    fl = STADE.agen_adjoint_fixedpoint(primal; tape = :full)
     fi = STADE.val_compile(full.initstacks); fg = STADE.val_compile(full.adjoint)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
+    li = STADE.val_compile(sg_rename(fl.initstacks, :fpv_init_full)); lg = STADE.val_compile(sg_rename(fl.adjoint, :fpv_adj_full))
     names_full = Symbol[a for a in full.initstacks.args[1].args[2:end]]
     n_ret = count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args)
     c1 = sg_cpu_run(kernel.sig, int_args, vals, seed, fi, fg, names_full)
     a2, t2 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
     s2 = sg_init_stacks(pi_, sg_stack_extra(names_full, int_args, vals, identity))
-    r2 = Base.invokelatest(pg, a2..., s2...)
+    raised = ""; r2 = nothing
+    try r2 = Base.invokelatest(pg, a2..., s2...) catch e; raised = first(split(sprint(showerror, e), "\n")) end
+    info = Float64.(s2[end])
+    verdict = try STADE.agen_adjoint_fixedpoint_check(info); "" catch e; first(split(sprint(showerror, e), "\n")) end
+    tape1 = fpv_tape_elems(pi_, names_full, int_args, vals)
+    tape2 = haskey(int_args, :maxit) && regime === :converged ? fpv_tape_elems(pi_, names_full, merge(int_args, Dict(:maxit => 2 * int_args[:maxit])), vals) : -1
+    isempty(raised) || return (err = NaN, info = info, changed = 0, fderr = NaN, verdict = verdict, vleft = NaN, raised = raised, errfull = NaN, tape = tape1, tape2 = tape2)
     # the adjoints (every shadow, every returned scalar); the primal arrays are not compared: the unrolled reverse rolls them back to the entry values, the
     # fixed-point reverse leaves the state at the fixed point (checked against the primal below)
     m = 0.0; changed = 0
@@ -87,6 +103,17 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
         m = max(m, sg_relerr(ct.sh, t2[a].sh)); changed += count(!=(0.0), ct.sh .- c1.pre[a].sh)
     end
     m = max(m, sg_scalar_err(n_ret, c1.ret, r2))
+    # the same adjoint with the cap-sized tape: every shadow, every value and every returned scalar equal bit for bit
+    a3, t3 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
+    s3 = sg_init_stacks(li, sg_stack_extra(names_full, int_args, vals, identity))
+    r3 = Base.invokelatest(lg, a3..., s3...)
+    errfull = 0.0
+    for (a, ct) in t3
+        ct.kind == :array_float || continue
+        errfull = max(errfull, maximum(abs, ct.sh .- t2[a].sh; init = 0.0), maximum(abs, ct.val .- t2[a].val; init = 0.0))
+    end
+    errfull = max(errfull, maximum(abs(x - y) for (x, y) in zip(sg_rets(n_ret, r3), sg_rets(n_ret, r2)); init = 0.0))
+    errfull = max(errfull, Float64(abs(s3[end][1] - s2[end][1]) + abs(s3[end][2] - s2[end][2])))
     # the state arrays the adjoint leaves are the primal result of the same loop
     pf = STADE.val_compile(primal)
     pargs = STADE.val_primal_call_args(kernel.sig, int_args, Dict{Symbol,Any}(k => deepcopy(v) for (k, v) in vals))
@@ -95,10 +122,8 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     for (i, a) in enumerate(kernel.sig.args)
         kernel.sig.kinds[a] == :array_float && a in fp.loop.arrays && (vleft = max(vleft, sg_relerr(pargs[i], t2[a].val)))
     end
-    info = Float64.(s2[end])
-    verdict = try STADE.agen_adjoint_fixedpoint_check(info); "" catch e; first(split(sprint(showerror, e), "\n")) end
     fderr = fd ? fpv_fd(kernel, primal, fp, int_args, vals, names_full, :tol) : NaN
-    return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft)
+    return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft, raised = "", errfull = errfull, tape = tape1, tape2 = tape2)
 end
 
 # the same draw run by the device code of the fixed-point adjoint (`env` of validate_adjoint_split_gpu.jl): the worst relative error of every shadow and
@@ -112,6 +137,7 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
+    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0)))
     for (k, v) in floats; vals[k] = v; end
     regime === :unsettled && for (k, v) in Dict(:a => 1.0, :x0 => 0.0, :omega => 0.1, :tol => 1e-3); vals[k] = v; end
     prep === nothing || prep(vals)
@@ -246,9 +272,31 @@ function fpv_unit_checks(say)
         why = length(f) == 1 ? STADE.agen_fp_refusal(f[1], STADE.agen_fp_stmts(sq.args[2])) : String["not detected"]
         say(isempty(why) == ok, "a loop that calls $fn: the rule " * (ok ? "accepts" : "refuses") * " (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
+    # the one-slot transformer refuses what it cannot prove: a statement after the guard that is no tape write, a read of the branch stack in the guard, the
+    # counter used outside the loops. Each is built from the real adjoint of fp_scalar_cos with one statement added.
+    cos_ = STADE.io_read_corpus_entry(joinpath(root, "fp-corpus", "fp_scalar_cos.jl")); kc = STADE.parse_kernel(cos_)
+    det = STADE.agen_fp_detect(cos_, kc.sig.kinds)[1]
+    rr = STADE.stade_adjoint_(cos_, nothing, nothing, false, false, true, false)
+    sts = Any[x for x in rr.adjoint.args[2].args if !(x isa LineNumberNode)]
+    fi_ = findfirst(x -> (h = STADE.agen_fp_header(x); h !== nothing && h.step === 1 && h.var === det.var), sts)
+    trip = :(max(0, div($(det.hi) - 1, 1) + 1))
+    fl = sts[fi_]; fb = STADE.agen_fp_stmts(fl.args[2]); bst = first(x.args[1].args[1] for x in STADE.agen_fp_stmts(fb[1].args[3]) if x isa Expr && x.head === :(=) && x.args[1] isa Expr && x.args[1].head === :ref)
+    with_post(x) = Expr(:for, fl.args[1], Expr(:block, fb..., x))
+    say(try STADE.agen_fp_one_slot_forward(fl, det, trip); true catch; false end, "the transformer accepts the forward loop as generated")
+    say(try STADE.agen_fp_one_slot_forward(with_post(:(zz = 1.0)), det, trip); false catch e; occursin("not a tape write", sprint(showerror, e)) end, "the transformer refuses a statement after the guard that is no tape write")
+    say(try STADE.agen_fp_one_slot_forward(with_post(:(__idx_zz = $bst[1])), det, trip); false catch e; occursin("used in the guard besides its flag", sprint(showerror, e)) end, "the transformer refuses a read of the branch stack in the guard")
+    sts2 = Any[sts[1:end-1]..., :(zz = $(det.var)), sts[end]]
+    say(try STADE.agen_fp_rewrite_one_slot(Expr(:function, rr.adjoint.args[1], Expr(:block, sts2...)), rr.initstacks, det); false catch e; occursin("used outside the loop", sprint(showerror, e)) end, "the transformer refuses the counter used outside the loops")
+    # the cap read in the body is a reason: an inner bound that uses it would be sized wrongly by the one-slot tape
+    for (cap_in_body, ok) in (("1:maxit", false), ("1:3", true))
+        sq = Meta.parse("function fpc(a, x0, tol, maxit, v, y)\n x = x0\n rn = 1.0\n for kk = 1:maxit\n if rn > tol\n s = 0.0\n for j = $cap_in_body\n s = s + v[j]\n end\n xn = a + 0.5 * x + 0.0 * s\n rn = (xn - x) * (xn - x)\n x = xn\n end\n end\n y[1] = x\n return nothing\nend")
+        k = STADE.parse_kernel(sq); f = STADE.agen_fp_detect(sq, k.sig.kinds)
+        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1], STADE.agen_fp_stmts(sq.args[2])) : String["not detected"]
+        say(ok ? !any(w -> occursin("loop's cap", w), why) : any(w -> occursin("loop's cap", w), why), "an inner loop over $cap_in_body: the rule " * (ok ? "does not refuse" : "refuses") * " for the cap (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
+    end
     # the verdict raises on each flag
-    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 1.0, 0.0]); false catch; true end, "check raises when the forward loop hit its cap")
-    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 0.0, 1.0]); false catch; true end, "check raises when the sweeps did not settle")
+    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 0.0, 0.0, 1.0, 2.0]); false catch e; occursin("stopped on its cap", sprint(showerror, e)) end, "check raises when the forward loop hit its cap")
+    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 0.0, 1.0]); false catch e; occursin("did not settle", sprint(showerror, e)) end, "check raises when the sweeps did not settle")
     say(STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.0, 0.0, 0.0]) == 2, "check returns the sweeps when nothing is flagged")
 end
 
@@ -257,24 +305,27 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
     fpv_unit_checks(say)
     fpv_dispatch_checks(say)
-    cap_diff = 0.0
     for (dir, name, pins, floats, gs, prep) in fpv_cases()
         isempty(only) || name in only || continue
         r = fpv_run(dir, name, pins, floats, gs, prep, :converged; fd = true)
-        verbose && println(rpad(name, 22), " converged: err=", round(r.err, sigdigits = 3), " fd=", round(r.fderr, sigdigits = 3), " sweeps=", Int(r.info[2]), " last_iter=", Int(r.info[1]), " ratio=", round(r.info[3], sigdigits = 3), " changed=", r.changed)
+        verbose && println(rpad(name, 22), " converged: err=", round(r.err, sigdigits = 3), " fd=", round(r.fderr, sigdigits = 3), " sweeps=", Int(r.info[2]), " iterations=", Int(r.info[1]), " ratio=", round(r.info[3], sigdigits = 3), " changed=", r.changed, " tape=", r.tape)
+        say(isempty(r.raised), "$name converged: the adjoint raised ($(r.raised))")
         say(r.err <= 1e-9, "$name converged: fixed-point vs unrolled adjoint err=$(r.err)")
         say(r.fderr <= 1e-5, "$name converged: fixed-point adjoint vs central difference err=$(r.fderr)")
         say(r.info[2] >= 1 && r.info[1] >= 1 && r.info[4] == 0 && r.info[5] == 0 && r.verdict == "", "$name converged: sweeps ran, no flag ($(r.info)) $(r.verdict)")
         say(r.changed > 0, "$name converged: nothing changed (vacuous)")
         say(r.vleft <= 1e-6, "$name converged: the state the adjoint leaves is not the primal result ($(r.vleft))")
+        say(r.errfull == 0.0, "$name converged: the one-slot tape and the cap-sized tape differ by $(r.errfull)")
+        say(r.tape > 0 && r.tape == r.tape2, "$name converged: the tape has $(r.tape) elements for the cap and $(r.tape2) for twice the cap")
         z = fpv_run(dir, name, pins, floats, gs, prep, :zero)
-        say(z.err <= 1e-12 && z.info[1] == 0 && z.info[2] == 0 && z.info[4] == 0 && z.info[5] == 0, "$name zero: err=$(z.err) info=$(z.info)")
+        say(isempty(z.raised) && z.err <= 1e-12 && z.info[1] == 0 && z.info[2] == 0 && z.info[4] == 0 && z.info[5] == 0, "$name zero: err=$(z.err) info=$(z.info) raised=$(z.raised)")
         c = fpv_run(dir, name, pins, floats, gs, prep, :cap)
-        # a loop that ran to its cap is not at a fixed point: the adjoint takes the unrolled reverse, every iteration, and raises nothing
-        say(c.info[4] == 1 && c.info[2] == 0 && c.info[5] == 0, "$name cap: the forward flag is set and no sweep ran ($(c.info))")
-        say(c.err <= 1e-12, "$name cap: the adjoint differs from the unrolled adjoint ($(c.err))")
+        # a loop that ran to its cap is not at a fixed point: no sweep runs and the adjoint raises
+        say(occursin("stopped on its cap", c.raised), "$name cap: the adjoint raises the cut-off message (got: $(first(c.raised, 100)))")
+        say(c.info[4] == 1 && c.info[2] == 0 && c.info[5] == 2, "$name cap: the forward flag is set, no sweep ran, the status is 2 ($(c.info))")
         say(occursin("cap", c.verdict), "$name cap: the host verdict names the cap ($(c.verdict))")
-        cap_diff = max(cap_diff, c.err)
+        n0 = fpv_run(dir, name, pins, floats, gs, prep, :nocap)
+        say(isempty(n0.raised) && all(==(0.0), n0.info) && n0.err <= 1e-12, "$name nocap: a loop with maxit = 0 does not raise and runs no sweep (err=$(n0.err) info=$(n0.info) raised=$(n0.raised))")
     end
     u = fpv_unsettled()
     say(occursin("did not settle", u.msg), "fp_slow_linear: a converged loop whose reverse cannot settle raises (got: $(first(u.msg, 100)))")
@@ -283,17 +334,27 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     if sabotage
         text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
         cases = [
-            ("the sweeps replay iteration 1", "                    \$kk = __fp_last\n", "                    \$kk = 1\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the last active iteration is the first", "                    __fp_last = __fp_k\n", "                    __fp_last = 1\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("one sweep only", "                    if __fp_cn <= \$tolx * __fp_c0\n                        __fp_go = 0\n                    end\n", "                    __fp_go = 0\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the forward flag is never set", "        if \$fwd_flag\n            __fp_cut = 1\n            fp_info[4] = 1.0\n        end\n", "", ["fp_scalar_cos"]),
-            ("the adjoint flag is never set", "            fp_info[5] = __fp_go\n", "            fp_info[5] = 0.0\n", ["fp_scalar_cos"]),
             ("the counter may be read in the body", "        h.var in syms && continue\n", "", ["fp_scalar_cos"]),
+            ("the counter stays in the tape positions", "    body = Any[agen_fp_slot(s, trip, kk, true) for s in Any[keep; post]]\n", "    body = Any[agen_fp_slot(s, trip, kk, false) for s in Any[keep; post]]\n", ["fp_scalar_cos", "fp_array_tanh"]),
+            ("the trip count stays in the sizes", "            push!(out, agen_fp_slot(st, trip, kk, false))\n        end\n    end\n    args2", "            push!(out, st)\n        end\n    end\n    args2", ["fp_scalar_cos", "fp_array_tanh"]),
+            ("the iterations that ran are not counted", "    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = \$kk)))\n", "    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = 1)))\n", ["fp_scalar_cos", "fp_array_tanh"]),
+            ("the sweeps run when no iteration ran", "            if __fp_last > 0\n                __fp_go = 1\n            end\n", "            __fp_go = 1\n", ["fp_scalar_cos"]),
+            ("one sweep only", "                    if __fp_cn <= \$tolx * __fp_c0\n                        __fp_go = 0\n                    end\n                end\n            end\n            fp_info[2] = __fp_sw\n", "                    __fp_go = 0\n                end\n            end\n            fp_info[2] = __fp_sw\n", ["fp_scalar_cos", "fp_array_tanh"]),
+            ("the first sweep's norm is not kept", "            \$(sweep...)\n                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "            \$(sweep...)\n                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos", "fp_array_tanh"]),
+            ("the forward flag is never set", "            if \$fwd_flag\n                __fp_cut = 1\n                fp_info[4] = 1.0\n                fp_info[5] = 2.0\n            end\n", "", ["fp_scalar_cos"]),
+            ("the cut-off test runs for maxit = 0", "        if \$hi >= 1\n            if \$fwd_flag\n", "        if \$hi >= 0\n            if \$fwd_flag\n", ["fp_scalar_cos"]),
+            ("the cut-off status is the sweeps' status", "                fp_info[5] = 2.0\n", "                fp_info[5] = 1.0\n", ["fp_scalar_cos"]),
+            ("the adjoint flag is never set", "            fp_info[5] = __fp_go\n        end\n        fp_info[1] = __fp_last\n", "            fp_info[5] = 0.0\n        end\n        fp_info[1] = __fp_last\n", ["fp_scalar_cos"]),
+            ("a cut-off loop does not raise", "        if __fp_cut == 1\n            error(\$msgcut)\n        end\n", "", ["fp_scalar_cos"]),
+            ("the sweep error is not raised", "            error(\$msgcut)\n        end\n        if __fp_go == 1\n            error(\$msg)\n        end\n", "            error(\$msgcut)\n        end\n", ["fp_scalar_cos"]),
+            ("the branch stack stays in the arguments", "    args2 = Any[a for a in call.args if a !== bstack]\n", "    args2 = Any[a for a in call.args]\n", ["fp_scalar_cos"]),
+            ("a statement after the guard is accepted", "    all(agen_fp_is_tape_stmt, post) || error(", "    true || error(", ["fp_scalar_cos"]),
+            ("the branch stack may be read in the guard", "    any(s -> agen_fp_uses(s, bstack), body) && error(", "    false && error(", ["fp_scalar_cos"]),
+            ("the counter may be used outside the loops", "        agen_fp_uses(st, kk) && !(st isa Expr", "        false && !(st isa Expr", ["fp_scalar_cos"]),
+            ("the cap may be read in the body", "    f.cap_in_body && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
+            ("the host check ignores a cut-off", "    (info[4] == 0 && info[5] != 2) || error(", "    true || error(", ["fp_scalar_cos"]),
             ("a second loop is accepted", "    length(found) == 1 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", "    length(found) >= 0 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", ["fp_scalar_cos"]),
-            ("accumulation loops are accepted", "    count > 0 || error(\"agen_adjoint_fixedpoint: the reverse", "    count >= 0 || error(\"agen_adjoint_fixedpoint: the reverse", ["fp_scalar_cos"]),
-            ("the branch is inverted", "        if __fp_cut == 0\n            __fp_last = 0\n", "        if __fp_cut == 1\n            __fp_last = 0\n", ["fp_scalar_cos"]),
-            ("a cut-off loop has no unrolled reverse", "        else\n            \$rev\n        end\n", "        else\n        end\n", ["fp_scalar_cos"]),
-            ("the sweep error is not raised", "        if __fp_go == 1\n            error(\$msg)\n        end\n", "", ["fp_scalar_cos"]),
+            ("accumulation loops are accepted", "    count > 0 || error(\"agen_adjoint_fixedpoint: the reverse of the loop over `\$kk`", "    count >= 0 || error(\"agen_adjoint_fixedpoint: the reverse of the loop over `\$kk`", ["fp_scalar_cos"]),
             ("a division by a reduction is not a reason", "    f.div_by_reduction && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
             ("an if in the body is not a reason", "    f.inner_if && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
             ("a literal tolerance is not a reason", "    f.literal_tol && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
@@ -306,7 +367,6 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("the independents are dropped", "agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)", "agen_adjoint_fixedpoint(expr)", ["fp_scalar_cos"]),
             ("the HVP validator takes the fixed-point adjoint", "        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", "        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", ["fp_scalar_cos"]),
             ("a validator says nothing about the adjoint it checks", "    @info \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", "    nothing; \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", ["fp_scalar_cos"]),
-            ("the first sweep's norm is not kept", "                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos", "fp_array_tanh"]),
         ]
         mktempdir() do tmp
             for (label, old, new, kset) in cases

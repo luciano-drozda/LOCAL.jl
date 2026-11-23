@@ -1,6 +1,7 @@
-# Regression for v0.5.37: the device code (CUDA and JACC) of agen_adjoint_fixedpoint, run on the CPU with the serial stand-ins of
+# Regression for the fixed-point adjoint with the one-slot tape: the device code (CUDA and JACC) of agen_adjoint_fixedpoint, run on the CPU with the serial stand-ins of
 # validate_adjoint_split_cuda_cpu.jl and validate_adjoint_split_jacc_cpu.jl. For each kernel of validate_fixedpoint.jl and each regime, the device
-# adjoint equals the CPU fixed-point adjoint (every shadow, every returned scalar) and reports the same fp_info.
+# adjoint equals the CPU fixed-point adjoint (every shadow, every returned scalar) and reports the same fp_info. In the cap regime the CPU adjoint and the device
+# one both raise the cut-off message (the host read of fp_info[5] picks it), in the unsettled regime the other one.
 #   The defect this guards: the GPU stage drops stores nothing in the function reads, and a fixed-point adjoint's `fp_info` is only written.
 #   julia validate_fixedpoint_gpu_cpu.jl [kernel names] [--sabotage]
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
@@ -16,7 +17,7 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
         env = mk()
         for (dir, name, pins, floats, gs, prep) in fpv_cases()
             isempty(only) || name in only || continue
-            for regime in (:converged, :zero, :cap)
+            for regime in (:converged, :zero, :cap, :nocap)
                 r = try fpv_device(dir, name, pins, floats, gs, prep, env, regime)
                     catch e
                         # the stand-in JACC has no block reduction: a loop long enough to launch one cannot run here (the V100 job covers it)
@@ -28,7 +29,12 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
                         say(false, "$ename $name $regime: $msg"); continue
                     end
                 verbose && println(rpad(name, 22), " ", ename, " ", regime, ": err=", round(r.err, sigdigits = 3), " info=", r.dev_info)
-                say(r.err <= 1e-12 && !r.devraised && !r.raised, "$ename $name $regime: device vs CPU fixed-point adjoint err=$(r.err) (raised: $(r.raised)/$(r.devraised) $(r.devmsg))")
+                if regime === :cap
+                    say(r.raised && r.devraised && occursin("stopped on its cap", r.devmsg) && r.err <= 1e-12, "$ename $name cap: CPU raised ($(r.raised)), device raised ($(r.devraised): $(first(r.devmsg, 80))), err=$(r.err)")
+                    say(r.dev_info[4] == 1 && r.dev_info[5] == 2, "$ename $name cap: device fp_info $(r.dev_info)")
+                else
+                    say(r.err <= 1e-12 && !r.devraised && !r.raised, "$ename $name $regime: device vs CPU fixed-point adjoint err=$(r.err) (raised: $(r.raised)/$(r.devraised) $(r.devmsg))")
+                end
                 say(r.dev_info == r.cpu_info || (r.dev_info[1:2] == r.cpu_info[1:2] && r.dev_info[4:5] == r.cpu_info[4:5] && isapprox(r.dev_info[3], r.cpu_info[3]; rtol = 1e-6)), "$ename $name $regime: fp_info device $(r.dev_info) vs CPU $(r.cpu_info)")
             end
         end
