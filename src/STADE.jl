@@ -7399,8 +7399,13 @@ end
 # ingest drops it instead of refusing the whole initstacks.
 cgen_is_sizehint(s) = s isa Expr && s.head == :call && !isempty(s.args) && s.args[1] == :sizehint!
 
+# `if cond; error("...") end` is the raise of a fixed-point adjoint whose sweeps did not settle (agen_fp_rewrite). The host function of a device adjoint has no
+# such statement yet: the ingest drops it, and `fp_info[5]` is the only signal there.
+cgen_is_fp_raise(s) = s isa Expr && s.head === :if && length(s.args) == 2 && (b = agen_fp_stmts(s.args[2]); length(b) == 1 && b[1] isa Expr && b[1].head === :call &&
+                      b[1].args[1] === :error && length(b[1].args) == 2 && b[1].args[2] isa String)
+
 function cgen_parse_generated_statements(stmts::Vector)
-    return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s)]
+    return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s) && !cgen_is_fp_raise(s)]
 end
 
 function cgen_parse_generated_statement(stmt)
