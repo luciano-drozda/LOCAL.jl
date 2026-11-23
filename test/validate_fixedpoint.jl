@@ -14,6 +14,7 @@
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :sab_read) || include(joinpath(@__DIR__, "sabotage_run.jl"))
 using Random, LinearAlgebra, Logging
+isdefined(@__MODULE__, :fps_kernel) || include(joinpath(@__DIR__, "fp_shapes.jl"))
 isdefined(@__MODULE__, :sg_build_call) || include(joinpath(@__DIR__, "validate_adjoint_split_gpu.jl"))
 
 # the multigrid kernel keeps a zero ghost layer on every level; a random draw has none, and its residual then stagnates and never closes the guard
@@ -65,7 +66,15 @@ fpv_tape_elems(init_fn, names, int_args, vals) = sum(length, sg_init_stacks(init
 # one kernel in one regime: (err against the unrolled adjoint, fp_info, elements changed, FD error or NaN, the check's verdict string or "", the state left against the
 # primal, what the adjoint raised or "", the error against the cap-sized tape, the tape elements for the cap and for twice the cap)
 function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = false)
-    primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")); kernel = STADE.parse_kernel(primal)
+    return fpv_run_expr(STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")), pins, floats, gs, prep, regime; fd = fd)
+end
+
+# the same for a kernel given as an Expr (a generated shape of fp_shapes.jl): the comparison with the cap-sized tape and the state left by the adjoint apply to
+# a solve loop at the top level only
+function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool = false)
+    kernel = STADE.parse_kernel(primal)
+    dets = STADE.agen_fp_detect(primal, kernel.sig.kinds)
+    nested = length(dets) > 1 || any(d -> !isempty(d.enclosing), dets)
     pins2 = copy(pins); floats2 = copy(floats)
     regime === :cap && (pins2[:maxit] = 3)
     Random.seed!(20261122)
@@ -79,10 +88,10 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     seed = STADE.val_random_values_like(kernel, vals)
     full = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)   # the unrolled reference: stade_adjoint itself takes the fixed-point path
     fp = STADE.agen_adjoint_fixedpoint(primal)
-    fl = STADE.agen_adjoint_fixedpoint(primal; tape = :full)
+    fl = nested ? nothing : STADE.agen_adjoint_fixedpoint(primal; tape = :full)
     fi = STADE.val_compile(full.initstacks); fg = STADE.val_compile(full.adjoint)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
-    li = STADE.val_compile(sg_rename(fl.initstacks, :fpv_init_full)); lg = STADE.val_compile(sg_rename(fl.adjoint, :fpv_adj_full))
+    li = nested ? nothing : STADE.val_compile(sg_rename(fl.initstacks, :fpv_init_full)); lg = nested ? nothing : STADE.val_compile(sg_rename(fl.adjoint, :fpv_adj_full))
     names_full = Symbol[a for a in full.initstacks.args[1].args[2:end]]
     n_ret = count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args)
     c1 = sg_cpu_run(kernel.sig, int_args, vals, seed, fi, fg, names_full)
@@ -103,24 +112,25 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
         m = max(m, sg_relerr(ct.sh, t2[a].sh)); changed += count(!=(0.0), ct.sh .- c1.pre[a].sh)
     end
     m = max(m, sg_scalar_err(n_ret, c1.ret, r2))
-    # the same adjoint with the cap-sized tape: every shadow, every value and every returned scalar equal bit for bit
-    a3, t3 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
-    s3 = sg_init_stacks(li, sg_stack_extra(names_full, int_args, vals, identity))
-    r3 = Base.invokelatest(lg, a3..., s3...)
-    errfull = 0.0
-    for (a, ct) in t3
-        ct.kind == :array_float || continue
-        errfull = max(errfull, maximum(abs, ct.sh .- t2[a].sh; init = 0.0), maximum(abs, ct.val .- t2[a].val; init = 0.0))
-    end
-    errfull = max(errfull, maximum(abs(x - y) for (x, y) in zip(sg_rets(n_ret, r3), sg_rets(n_ret, r2)); init = 0.0))
-    errfull = max(errfull, Float64(abs(s3[end][1] - s2[end][1]) + abs(s3[end][2] - s2[end][2])))
-    # the state arrays the adjoint leaves are the primal result of the same loop
-    pf = STADE.val_compile(primal)
-    pargs = STADE.val_primal_call_args(kernel.sig, int_args, Dict{Symbol,Any}(k => deepcopy(v) for (k, v) in vals))
-    Base.invokelatest(pf, pargs...)
-    vleft = 0.0
-    for (i, a) in enumerate(kernel.sig.args)
-        kernel.sig.kinds[a] == :array_float && a in fp.loop.arrays && (vleft = max(vleft, sg_relerr(pargs[i], t2[a].val)))
+    errfull = 0.0; vleft = 0.0
+    if !nested
+        # the same adjoint with the cap-sized tape: every shadow, every value and every returned scalar equal bit for bit
+        a3, t3 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
+        s3 = sg_init_stacks(li, sg_stack_extra(names_full, int_args, vals, identity))
+        r3 = Base.invokelatest(lg, a3..., s3...)
+        for (a, ct) in t3
+            ct.kind == :array_float || continue
+            errfull = max(errfull, maximum(abs, ct.sh .- t2[a].sh; init = 0.0), maximum(abs, ct.val .- t2[a].val; init = 0.0))
+        end
+        errfull = max(errfull, maximum(abs(x - y) for (x, y) in zip(sg_rets(n_ret, r3), sg_rets(n_ret, r2)); init = 0.0))
+        errfull = max(errfull, Float64(abs(s3[end][1] - s2[end][1]) + abs(s3[end][2] - s2[end][2])))
+        # the state arrays the adjoint leaves are the primal result of the same loop
+        pf = STADE.val_compile(primal)
+        pargs = STADE.val_primal_call_args(kernel.sig, int_args, Dict{Symbol,Any}(k => deepcopy(v) for (k, v) in vals))
+        Base.invokelatest(pf, pargs...)
+        for (i, a) in enumerate(kernel.sig.args)
+            kernel.sig.kinds[a] == :array_float && a in fp.loop.arrays && (vleft = max(vleft, sg_relerr(pargs[i], t2[a].val)))
+        end
     end
     fderr = fd ? fpv_fd(kernel, primal, fp, int_args, vals, names_full, :tol) : NaN
     return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft, raised = "", errfull = errfull, tape = tape1, tape2 = tape2)
@@ -242,11 +252,14 @@ end
 
 function fpv_unit_checks(say)
     root = @__DIR__
-    for (nm, frag) in (("fp_two_loops", "has 2 counted-guard loops"), ("fp_counter_used", "has 0 counted-guard loops"), ("fp_accumulate", "never consumes a state adjoint"))
+    for (nm, frag) in (("fp_counter_used", "has 0 counted-guard loops"), ("fp_accumulate", "never consumes a state adjoint"))
         primal = STADE.io_read_corpus_entry(joinpath(root, "fp-corpus", nm * ".jl"))
         msg = try STADE.agen_adjoint_fixedpoint(primal); "" catch e; sprint(showerror, e) end
         say(occursin(frag, msg), "$nm is refused with `$frag` (got: $(first(msg, 120)))")
     end
+    # two solve loops at the top level are accepted: one forward and one reversed loop each
+    tl = STADE.agen_adjoint_fixedpoint(STADE.io_read_corpus_entry(joinpath(root, "fp-corpus", "fp_two_loops.jl")))
+    say(length(tl.loops) == 2, "fp_two_loops: both solve loops are rewritten (got $(length(tl.loops)))")
     # the state the detector reads
     want = Dict("fp_newton_sqrt" => (Symbol[], [:x]), "fp_scalar_cos" => (Symbol[], [:x]), "fp_array_tanh" => ([:u, :w], Symbol[]), "fp_gauss_seidel" => ([:u], Symbol[]), "fp_mixed_state" => ([:u], [:m]))
     for (nm, (ar, sc)) in want
@@ -262,14 +275,34 @@ function fpv_unit_checks(say)
     for (dir, nm, frag) in verdicts
         primal = STADE.io_read_corpus_entry(joinpath(root, dir, nm * ".jl")); k = STADE.parse_kernel(primal)
         f = STADE.agen_fp_detect(primal, k.sig.kinds)
-        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1], STADE.agen_fp_stmts(primal.args[2])) : String["not detected"]
+        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1]) : String["not detected"]
         say(isempty(frag) ? isempty(why) : any(w -> occursin(frag, w), why), "$nm: the rule " * (isempty(frag) ? "accepts" : "refuses with `$frag`") * " (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
+    # the nests of the generator: the accepted ones have no reason, each refused one has its own
+    for (body, nest) in fpv_shape_cases()
+        pr = fps_kernel(body, nest); k = STADE.parse_kernel(pr)
+        why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(pr, k.sig.kinds)]...)
+        say(isempty(why), "fps_$(body)_$(nest): the rule accepts (got: $(join(why, " | ")))")
+    end
+    for (nest, frag) in ((:cold, "independent iterations"), (:indep, "independent iterations"), (:solve_in_solve, "another solve loop"), (:hi_assigned, "assigned inside an enclosing loop"),
+                         (:tol_assigned, "assigned inside an enclosing loop"), (:hi_assigned, "used outside the headers of solve loops"))
+        pr = fps_kernel(:scalar, nest); k = STADE.parse_kernel(pr)
+        why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(pr, k.sig.kinds)]...)
+        say(any(w -> occursin(frag, w), why), "fps_scalar_$nest: the rule refuses with `$frag` (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
+    end
+    # a loop with independent iterations around the solve stays with the unrolled reverse, and says why
+    pr = fps_kernel(:scalar, :indep)
+    r = fpv_logged(() -> STADE.stade_adjoint(pr; keep_push_pop = false))
+    say(!occursin("fp_info", string(r.value.adjoint)) && occursin("independent iterations", r.log), "an enclosing loop with independent iterations keeps the unrolled reverse and the log says why")
+    # the cap of the solve loop as the bound of another loop at the top level: the one-slot tape would size that loop wrongly
+    sq = Meta.parse("function fpk(a, x0, tol, maxit, v, y)\n x = x0\n rn = 1.0\n for kk = 1:maxit\n if rn > tol\n xn = a * cos(x)\n rn = (xn - x) * (xn - x)\n x = xn\n end\n end\n for j = 1:maxit\n v[j] = x * j\n end\n y[1] = x\n return nothing\nend")
+    k = STADE.parse_kernel(sq); why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(sq, k.sig.kinds)]...)
+    say(any(w -> occursin("used outside the headers of solve loops", w), why), "a loop outside the solve that runs over the cap is a reason (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     # a function the validated cases never call is a reason
     for (fn, ok) in ((:sqrt, false), (:tanh, true))
         sq = Meta.parse("function fpw(a, x0, tol, maxit, y)\n x = x0\n rn = 1.0\n for kk = 1:maxit\n if rn > tol\n xn = $fn(x) + a\n rn = (xn - x) * (xn - x)\n x = xn\n end\n end\n y[1] = x\n return nothing\nend")
         k = STADE.parse_kernel(sq); f = STADE.agen_fp_detect(sq, k.sig.kinds)
-        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1], STADE.agen_fp_stmts(sq.args[2])) : String["not detected"]
+        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1]) : String["not detected"]
         say(isempty(why) == ok, "a loop that calls $fn: the rule " * (ok ? "accepts" : "refuses") * " (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
     # the one-slot transformer refuses what it cannot prove: a statement after the guard that is no tape write, a read of the branch stack in the guard, the
@@ -282,22 +315,51 @@ function fpv_unit_checks(say)
     trip = :(max(0, div($(det.hi) - 1, 1) + 1))
     fl = sts[fi_]; fb = STADE.agen_fp_stmts(fl.args[2]); bst = first(x.args[1].args[1] for x in STADE.agen_fp_stmts(fb[1].args[3]) if x isa Expr && x.head === :(=) && x.args[1] isa Expr && x.args[1].head === :ref)
     with_post(x) = Expr(:for, fl.args[1], Expr(:block, fb..., x))
-    say(try STADE.agen_fp_one_slot_forward(fl, det, trip); true catch; false end, "the transformer accepts the forward loop as generated")
-    say(try STADE.agen_fp_one_slot_forward(with_post(:(zz = 1.0)), det, trip); false catch e; occursin("not a tape write", sprint(showerror, e)) end, "the transformer refuses a statement after the guard that is no tape write")
-    say(try STADE.agen_fp_one_slot_forward(with_post(:(__idx_zz = $bst[1])), det, trip); false catch e; occursin("used in the guard besides its flag", sprint(showerror, e)) end, "the transformer refuses a read of the branch stack in the guard")
+    say(try STADE.agen_fp_one_slot_forward(fl, det, Any[trip], Dict{Symbol,Any}()); true catch; false end, "the transformer accepts the forward loop as generated")
+    say(try STADE.agen_fp_one_slot_forward(with_post(:(zz = 1.0)), det, Any[trip], Dict{Symbol,Any}()); false catch e; occursin("not a tape write", sprint(showerror, e)) end, "the transformer refuses a statement after the guard that is no tape write")
+    say(try STADE.agen_fp_one_slot_forward(with_post(:(__idx_zz = $bst[1])), det, Any[trip], Dict{Symbol,Any}()); false catch e; occursin("used in the guard besides its flag", sprint(showerror, e)) end, "the transformer refuses a read of the branch stack in the guard")
     sts2 = Any[sts[1:end-1]..., :(zz = $(det.var)), sts[end]]
-    say(try STADE.agen_fp_rewrite_one_slot(Expr(:function, rr.adjoint.args[1], Expr(:block, sts2...)), rr.initstacks, det); false catch e; occursin("used outside the loop", sprint(showerror, e)) end, "the transformer refuses the counter used outside the loops")
+    say(try STADE.agen_fp_rewrite_one_slot(Expr(:function, rr.adjoint.args[1], Expr(:block, sts2...)), rr.initstacks, [det]); false catch e; occursin("used outside the loop", sprint(showerror, e)) end, "the transformer refuses the counter used outside the loops")
     # the cap read in the body is a reason: an inner bound that uses it would be sized wrongly by the one-slot tape
     for (cap_in_body, ok) in (("1:maxit", false), ("1:3", true))
         sq = Meta.parse("function fpc(a, x0, tol, maxit, v, y)\n x = x0\n rn = 1.0\n for kk = 1:maxit\n if rn > tol\n s = 0.0\n for j = $cap_in_body\n s = s + v[j]\n end\n xn = a + 0.5 * x + 0.0 * s\n rn = (xn - x) * (xn - x)\n x = xn\n end\n end\n y[1] = x\n return nothing\nend")
         k = STADE.parse_kernel(sq); f = STADE.agen_fp_detect(sq, k.sig.kinds)
-        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1], STADE.agen_fp_stmts(sq.args[2])) : String["not detected"]
+        why = length(f) == 1 ? STADE.agen_fp_refusal(f[1]) : String["not detected"]
         say(ok ? !any(w -> occursin("loop's cap", w), why) : any(w -> occursin("loop's cap", w), why), "an inner loop over $cap_in_body: the rule " * (ok ? "does not refuse" : "refuses") * " for the cap (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
     # the verdict raises on each flag
     say(try STADE.agen_adjoint_fixedpoint_check([3.0, 0.0, 0.0, 1.0, 2.0]); false catch e; occursin("stopped on its cap", sprint(showerror, e)) end, "check raises when the forward loop hit its cap")
     say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 0.0, 1.0]); false catch e; occursin("did not settle", sprint(showerror, e)) end, "check raises when the sweeps did not settle")
     say(STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.0, 0.0, 0.0]) == 2, "check returns the sweeps when nothing is flagged")
+end
+
+# generated shapes of fp_shapes.jl that must take the fixed-point reverse
+fpv_shape_cases() = Any[(:scalar, :none), (:scalar, :loop1), (:scalar, :loop2), (:scalar, :ifbranch), (:scalar, :solve_first), (:scalar, :solve_last),
+                        (:scalar, :two_in_body), (:scalar, :two_loops), (:scalar, :literal),
+                        (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal)]
+
+# the four regimes of one case; `run(regime)` is fpv_run or fpv_run_expr bound to the case
+function fpv_case_checks(say, name, run, verbose)
+    r = run(:converged)
+    verbose && println(rpad(name, 22), " converged: err=", round(r.err, sigdigits = 3), " fd=", round(r.fderr, sigdigits = 3), " sweeps=", Int(r.info[2]), " iterations=", Int(r.info[1]), " ratio=", round(r.info[3], sigdigits = 3), " changed=", r.changed, " tape=", r.tape)
+    say(isempty(r.raised), "$name converged: the adjoint raised ($(r.raised))")
+    say(r.err <= 1e-9, "$name converged: fixed-point vs unrolled adjoint err=$(r.err)")
+    say(r.fderr <= 1e-5, "$name converged: fixed-point adjoint vs central difference err=$(r.fderr)")
+    say(r.info[2] >= 1 && r.info[1] >= 1 && r.info[4] == 0 && r.info[5] == 0 && r.verdict == "", "$name converged: sweeps ran, no flag ($(r.info)) $(r.verdict)")
+    say(r.changed > 0, "$name converged: nothing changed (vacuous)")
+    say(r.vleft <= 1e-6, "$name converged: the state the adjoint leaves is not the primal result ($(r.vleft))")
+    say(r.errfull == 0.0, "$name converged: the one-slot tape and the cap-sized tape differ by $(r.errfull)")
+    say(r.tape > 0 && r.tape == r.tape2, "$name converged: the tape has $(r.tape) elements for the cap and $(r.tape2) for twice the cap")
+    z = run(:zero)
+    say(isempty(z.raised) && z.err <= 1e-12 && z.info[1] == 0 && z.info[2] == 0 && z.info[4] == 0 && z.info[5] == 0, "$name zero: err=$(z.err) info=$(z.info) raised=$(z.raised)")
+    c = run(:cap)
+    # an instance that ran to its cap is not at a fixed point: no sweep runs and the adjoint raises
+    say(occursin("stopped on its cap", c.raised), "$name cap: the adjoint raises the cut-off message (got: $(first(c.raised, 100)))")
+    say(c.info[4] >= 1 && c.info[2] == 0 && c.info[5] == 2, "$name cap: the cut-off count is set, no sweep ran, the status is 2 ($(c.info))")
+    say(occursin("cap", c.verdict), "$name cap: the host verdict names the cap ($(c.verdict))")
+    n0 = run(:nocap)
+    say(isempty(n0.raised) && all(==(0.0), n0.info) && n0.err <= 1e-12, "$name nocap: a loop with maxit = 0 does not raise and runs no sweep (err=$(n0.err) info=$(n0.info) raised=$(n0.raised))")
+    return nothing
 end
 
 function validate_fixedpoint(; verbose = true, only = String[], sabotage = false)
@@ -307,25 +369,18 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     fpv_dispatch_checks(say)
     for (dir, name, pins, floats, gs, prep) in fpv_cases()
         isempty(only) || name in only || continue
-        r = fpv_run(dir, name, pins, floats, gs, prep, :converged; fd = true)
-        verbose && println(rpad(name, 22), " converged: err=", round(r.err, sigdigits = 3), " fd=", round(r.fderr, sigdigits = 3), " sweeps=", Int(r.info[2]), " iterations=", Int(r.info[1]), " ratio=", round(r.info[3], sigdigits = 3), " changed=", r.changed, " tape=", r.tape)
-        say(isempty(r.raised), "$name converged: the adjoint raised ($(r.raised))")
-        say(r.err <= 1e-9, "$name converged: fixed-point vs unrolled adjoint err=$(r.err)")
-        say(r.fderr <= 1e-5, "$name converged: fixed-point adjoint vs central difference err=$(r.fderr)")
-        say(r.info[2] >= 1 && r.info[1] >= 1 && r.info[4] == 0 && r.info[5] == 0 && r.verdict == "", "$name converged: sweeps ran, no flag ($(r.info)) $(r.verdict)")
-        say(r.changed > 0, "$name converged: nothing changed (vacuous)")
-        say(r.vleft <= 1e-6, "$name converged: the state the adjoint leaves is not the primal result ($(r.vleft))")
-        say(r.errfull == 0.0, "$name converged: the one-slot tape and the cap-sized tape differ by $(r.errfull)")
-        say(r.tape > 0 && r.tape == r.tape2, "$name converged: the tape has $(r.tape) elements for the cap and $(r.tape2) for twice the cap")
-        z = fpv_run(dir, name, pins, floats, gs, prep, :zero)
-        say(isempty(z.raised) && z.err <= 1e-12 && z.info[1] == 0 && z.info[2] == 0 && z.info[4] == 0 && z.info[5] == 0, "$name zero: err=$(z.err) info=$(z.info) raised=$(z.raised)")
-        c = fpv_run(dir, name, pins, floats, gs, prep, :cap)
-        # a loop that ran to its cap is not at a fixed point: no sweep runs and the adjoint raises
-        say(occursin("stopped on its cap", c.raised), "$name cap: the adjoint raises the cut-off message (got: $(first(c.raised, 100)))")
-        say(c.info[4] == 1 && c.info[2] == 0 && c.info[5] == 2, "$name cap: the forward flag is set, no sweep ran, the status is 2 ($(c.info))")
-        say(occursin("cap", c.verdict), "$name cap: the host verdict names the cap ($(c.verdict))")
-        n0 = fpv_run(dir, name, pins, floats, gs, prep, :nocap)
-        say(isempty(n0.raised) && all(==(0.0), n0.info) && n0.err <= 1e-12, "$name nocap: a loop with maxit = 0 does not raise and runs no sweep (err=$(n0.err) info=$(n0.info) raised=$(n0.raised))")
+        fpv_case_checks(say, name, reg -> fpv_run(dir, name, pins, floats, gs, prep, reg; fd = reg === :converged), verbose)
+    end
+    # generated shapes: one solve loop, or two, inside loops and branches at any depth (fp_shapes.jl)
+    for (body, nest) in fpv_shape_cases()
+        name = "fps_$(body)_$(nest)"
+        isempty(only) || name in only || continue
+        primal = fps_kernel(body, nest)
+        args = Set(STADE.parse_kernel(primal).sig.args)
+        pins = Dict(k => v for (k, v) in (body === :scalar ? Dict(:maxit => 500, :maxq => 500, :nt => 3, :ns => 2) : Dict(:n => 6, :maxit => 800, :maxq => 800, :nt => 3, :ns => 2)) if k in args)
+        floats = Dict(k => v for (k, v) in (body === :scalar ? Dict(:c => 0.6, :tol => 1e-30) : Dict(:c => 0.3, :tol => 1e-30)) if k in args)
+        prep = v -> (v[:pa] .= [iseven(i) ? 0.2 : 0.9 for i in eachindex(v[:pa])])
+        fpv_case_checks(say, name, reg -> fpv_run_expr(primal, pins, floats, body === :scalar ? 4 : 8, :pa in args ? prep : nothing, reg; fd = reg === :converged), verbose)
     end
     u = fpv_unsettled()
     say(occursin("did not settle", u.msg), "fp_slow_linear: a converged loop whose reverse cannot settle raises (got: $(first(u.msg, 100)))")
@@ -334,26 +389,41 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     if sabotage
         text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
         cases = [
-            ("the counter may be read in the body", "        h.var in syms && continue\n", "", ["fp_scalar_cos"]),
-            ("the counter stays in the tape positions", "    body = Any[agen_fp_slot(s, trip, kk, true) for s in Any[keep; post]]\n", "    body = Any[agen_fp_slot(s, trip, kk, false) for s in Any[keep; post]]\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the trip count stays in the sizes", "            push!(out, agen_fp_slot(st, trip, kk, false))\n        end\n    end\n    args2", "            push!(out, st)\n        end\n    end\n    args2", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the iterations that ran are not counted", "    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = \$kk)))\n", "    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = 1)))\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the sweeps run when no iteration ran", "            if __fp_last > 0\n                __fp_go = 1\n            end\n", "            __fp_go = 1\n", ["fp_scalar_cos"]),
-            ("one sweep only", "                    if __fp_cn <= \$tolx * __fp_c0\n                        __fp_go = 0\n                    end\n                end\n            end\n            fp_info[2] = __fp_sw\n", "                    __fp_go = 0\n                end\n            end\n            fp_info[2] = __fp_sw\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the first sweep's norm is not kept", "            \$(sweep...)\n                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "            \$(sweep...)\n                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos", "fp_array_tanh"]),
-            ("the forward flag is never set", "            if \$fwd_flag\n                __fp_cut = 1\n                fp_info[4] = 1.0\n                fp_info[5] = 2.0\n            end\n", "", ["fp_scalar_cos"]),
-            ("the cut-off test runs for maxit = 0", "        if \$hi >= 1\n            if \$fwd_flag\n", "        if \$hi >= 0\n            if \$fwd_flag\n", ["fp_scalar_cos"]),
-            ("the cut-off status is the sweeps' status", "                fp_info[5] = 2.0\n", "                fp_info[5] = 1.0\n", ["fp_scalar_cos"]),
-            ("the adjoint flag is never set", "            fp_info[5] = __fp_go\n        end\n        fp_info[1] = __fp_last\n", "            fp_info[5] = 0.0\n        end\n        fp_info[1] = __fp_last\n", ["fp_scalar_cos"]),
-            ("a cut-off loop does not raise", "        if __fp_cut == 1\n            error(\$msgcut)\n        end\n", "", ["fp_scalar_cos"]),
-            ("the sweep error is not raised", "            error(\$msgcut)\n        end\n        if __fp_go == 1\n            error(\$msg)\n        end\n", "            error(\$msgcut)\n        end\n", ["fp_scalar_cos"]),
-            ("the branch stack stays in the arguments", "    args2 = Any[a for a in call.args if a !== bstack]\n", "    args2 = Any[a for a in call.args]\n", ["fp_scalar_cos"]),
+            ("the counter may be read in the body", "    h.var in syms && return nothing\n", "", ["fp_scalar_cos"]),
+            ("the counter stays in the tape positions", "    body = Any[agen_fp_slot(s, trips, kk, true) for s in Any[then; post]]\n", "    body = Any[agen_fp_slot(s, trips, kk, false) for s in Any[then; post]]\n", ["fp_scalar_cos", "fps_scalar_loop1"]),
+            ("the trip count stays in the sizes", "    body_i = Any[agen_fp_slot(st, trips, :__fp_none, false) for st in ib[1:end-1]]\n", "    body_i = Any[st for st in ib[1:end-1]]\n", ["fp_scalar_cos", "fps_scalar_loop1"]),
+            ("the trip count stays in the positions outside the solve", "    out = Any[agen_fp_slot(st, trips, :__fp_none, false) for st in nst]\n", "    out = Any[st for st in nst]\n", ["fps_scalar_loop1"]),
+            ("only the first cap is substituted", "    trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets])]\n", "    trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets[1:1]])]\n", ["fps_scalar_two_caps"]),
+            ("the count stack is not reset before the loop", "    return (Any[:(\$bstack[\$E] = 0), Expr(:for, floop.args[1], Expr(:block, guard))], bstack, E)\n", "    return (Any[Expr(:for, floop.args[1], Expr(:block, guard))], bstack, E)\n", ["fps_scalar_ifbranch", "fps_scalar_loop1"]),
+            ("the count stack is read at the wrong instance", "        __fp_cnt = \$bstack[\$E]\n", "        __fp_cnt = \$bstack[1]\n", ["fps_scalar_loop1"]),
+            ("the sweep counter is not reset per instance", "            __fp_sw = 0\n            __fp_go = 0\n            if __fp_cnt > 0\n", "            __fp_go = 0\n            if __fp_cnt > 0\n", ["fps_scalar_loop1"]),
+            ("the sweeps run when no iteration ran", "            if __fp_cnt > 0\n                __fp_go = 1\n            end\n", "            __fp_go = 1\n", ["fp_scalar_cos", "fps_scalar_ifbranch"]),
+            ("the first sweep's norm is not kept", "\$(sweep...)\n                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "\$(sweep...)\n                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos"]),
+            ("one sweep only", "                    if __fp_cn <= \$tolx * __fp_c0\n                        __fp_go = 0\n                    end\n                end\n            end\n            __fp_iters", "                    __fp_go = 0\n                end\n            end\n            __fp_iters", ["fp_scalar_cos"]),
+            ("the cut-off count is never set", "                        __fp_ncut = __fp_ncut + 1\n", "                        __fp_ncut = __fp_ncut + 0\n", ["fp_scalar_cos", "fps_scalar_loop1"]),
+            ("the cut-off test runs for maxit = 0", "        cut = :(if \$(d.hi) >= 1\n", "        cut = :(if \$(d.hi) >= 0\n", ["fp_scalar_cos"]),
+            ("the cut-off status is the sweeps' status", "        if __fp_ncut > 0\n            fp_info[5] = 2.0\n", "        if __fp_ncut > 0\n            fp_info[5] = 1.0\n", ["fp_scalar_cos"]),
+            ("a cut-off instance does not raise", "        if __fp_ncut > 0\n            error(\$msgcut)\n        end\n", "", ["fp_scalar_cos", "fps_scalar_loop1"]),
+            ("the cut-off check runs before the forward nest", "    final = Any[start...; out[1:last_fwd]; raise_cut; out[last_fwd+1:end-1]; raise_end; out[end]]\n", "    final = Any[start...; raise_cut; out[1:end-1]; raise_end; out[end]]\n", ["fps_scalar_loop1"]),
+            ("the sweeps' status is never set", "        if __fp_unset > 0\n            fp_info[5] = 1.0\n        end\n", "", ["fp_scalar_cos"]),
+            ("the sweeps' error is not raised", "        if __fp_unset > 0\n            error(\$msg)\n        end\n", "", ["fp_scalar_cos"]),
+            ("the sweeps' unsettled count is never set", "                __fp_unset = __fp_unset + 1\n", "                __fp_unset = __fp_unset + 0\n", ["fp_scalar_cos"]),
+            ("the index chain of the sweeps loses a link", "        (agen_fp_uses(st, bstack) || !(lhs isa Symbol && any(t -> agen_fp_uses(t, lhs), later))) && (keep[j] = false)\n", "        (agen_fp_uses(st, bstack) || !(lhs isa Symbol && any(t -> !any(u -> u === t, sl) && agen_fp_uses(t, lhs), later))) && (keep[j] = false)\n", ["fps_scalar_two_loops"]),
+            ("the branch stack may be read in the guard", "    any(s -> agen_fp_uses(s, bstack) && !(s === body[flag[1]]), body) && error(", "    false && error(", ["fp_scalar_cos"]),
+            ("the counter may be used outside the loops", "        counter_outside(body, d.var) && error(", "        false && error(", ["fp_scalar_cos"]),
+            ("the cap may be used outside the solve loops", "    det.cap_elsewhere > 0 && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
+            ("the cap uses outside the solves are not counted", "cap_elsewhere = total[d.hi] - nhead[d.hi] - inbody", "cap_elsewhere = 0", ["fp_scalar_cos"]),
+            ("an enclosing loop with independent iterations is accepted", "        agen_fp_carries(L) || push!(why,", "        true || push!(why,", ["fp_scalar_cos"]),
+            ("a ragged bound read from an outer counter is accepted", "        isempty(intersect(bsyms, Set(counters))) || push!(why,", "        true || push!(why,", ["fp_scalar_cos"]),
+            ("a bound assigned inside an outer loop is accepted", "            isempty(intersect(bsyms, asg)) || (push!(why,", "            true || (push!(why,", ["fp_scalar_cos"]),
+            ("a bound assigned inside its own loop is accepted", "        isempty(intersect(bsyms, own)) || push!(why,", "        true || push!(why,", ["fp_scalar_cos"]),
+            ("a tolerance assigned in an enclosing loop is accepted", "        v in asg && push!(why,", "        false && push!(why,", ["fp_scalar_cos"]),
+            ("the detector does not look into the bodies of loops", "            agen_fp_walk_solves!(agen_fp_stmts(st.args[2]), Any[enclosing..., st], kinds, out)\n        elseif st.head === :if\n", "        elseif st.head === :if\n", ["fp_scalar_cos", "fps_scalar_loop1"]),
+            ("the detector does not look into the branches", "            agen_fp_walk_solves!(agen_fp_stmts(st.args[2]), Any[enclosing..., st], kinds, out)\n            length(st.args) == 3", "            length(st.args) == 3", ["fp_scalar_cos", "fps_scalar_ifbranch"]),
+            ("the carried-value test accepts a loop of independent iterations", "    return false\nend\n\n# why the nest around one solve loop", "    return true\nend\n\n# why the nest around one solve loop", ["fp_scalar_cos"]),
             ("a statement after the guard is accepted", "    all(agen_fp_is_tape_stmt, post) || error(", "    true || error(", ["fp_scalar_cos"]),
-            ("the branch stack may be read in the guard", "    any(s -> agen_fp_uses(s, bstack), body) && error(", "    false && error(", ["fp_scalar_cos"]),
-            ("the counter may be used outside the loops", "        agen_fp_uses(st, kk) && !(st isa Expr", "        false && !(st isa Expr", ["fp_scalar_cos"]),
             ("the cap may be read in the body", "    f.cap_in_body && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
             ("the host check ignores a cut-off", "    (info[4] == 0 && info[5] != 2) || error(", "    true || error(", ["fp_scalar_cos"]),
-            ("a second loop is accepted", "    length(found) == 1 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", "    length(found) >= 0 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", ["fp_scalar_cos"]),
             ("accumulation loops are accepted", "    count > 0 || error(\"agen_adjoint_fixedpoint: the reverse of the loop over `\$kk`", "    count >= 0 || error(\"agen_adjoint_fixedpoint: the reverse of the loop over `\$kk`", ["fp_scalar_cos"]),
             ("a division by a reduction is not a reason", "    f.div_by_reduction && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
             ("an if in the body is not a reason", "    f.inner_if && push!(why,", "    false && push!(why,", ["fp_scalar_cos"]),
