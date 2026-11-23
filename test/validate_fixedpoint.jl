@@ -285,11 +285,16 @@ function fpv_unit_checks(say)
         say(isempty(why), "fps_$(body)_$(nest): the rule accepts (got: $(join(why, " | ")))")
     end
     for (nest, frag) in ((:cold, "independent iterations"), (:indep, "independent iterations"), (:solve_in_solve, "another solve loop"), (:hi_assigned, "assigned inside an enclosing loop"),
-                         (:tol_assigned, "assigned inside an enclosing loop"), (:hi_assigned, "used outside the headers of solve loops"))
+                         (:tol_assigned, "assigned inside an enclosing loop"), (:hi_assigned, "used outside the headers of solve loops"),
+                         (:ragged, "ragged nest"), (:triangle, "depends on an outer counter"), (:read_top, "before a solve loop overwrites it"), (:read_before, "before a solve loop overwrites it"),
+                         (:read_between, "before a solve loop overwrites it"), (:read_nl, "before a solve loop overwrites it"))
         pr = fps_kernel(:scalar, nest); k = STADE.parse_kernel(pr)
         why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(pr, k.sig.kinds)]...)
         say(any(w -> occursin(frag, w), why), "fps_scalar_$nest: the rule refuses with `$frag` (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
+    pr = fps_kernel(:array, :tdep_nl); k = STADE.parse_kernel(pr)
+    why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(pr, k.sig.kinds)]...)
+    say(any(w -> occursin("before a solve loop overwrites it", w), why), "fps_array_tdep_nl: an array read after the solve and before the next one overwrites it is a reason")
     # a loop with independent iterations around the solve stays with the unrolled reverse, and says why
     pr = fps_kernel(:scalar, :indep)
     r = fpv_logged(() -> STADE.stade_adjoint(pr; keep_push_pop = false))
@@ -335,8 +340,8 @@ end
 
 # generated shapes of fp_shapes.jl that must take the fixed-point reverse
 fpv_shape_cases() = Any[(:scalar, :none), (:scalar, :loop1), (:scalar, :loop2), (:scalar, :ifbranch), (:scalar, :solve_first), (:scalar, :solve_last),
-                        (:scalar, :two_in_body), (:scalar, :two_loops), (:scalar, :literal),
-                        (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal)]
+                        (:scalar, :two_in_body), (:scalar, :two_loops), (:scalar, :literal), (:scalar, :two_caps), (:scalar, :tdep_first), (:scalar, :pre_nl),
+                        (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal), (:array, :two_caps), (:array, :tdep_first), (:array, :read_before)]
 
 # the four regimes of one case; `run(regime)` is fpv_run or fpv_run_expr bound to the case
 function fpv_case_checks(say, name, run, verbose)

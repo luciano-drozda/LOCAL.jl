@@ -7,7 +7,7 @@
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 
 fps_nests() = [:none, :loop1, :loop2, :ifbranch, :solve_first, :solve_last, :two_in_body, :two_loops, :literal, :cold,
-               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps]
+               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps, :tdep_first, :read_before, :read_top, :read_between, :pre_nl, :tdep_nl, :read_nl]
 
 # the lines of one solve loop, with `@` replaced by the suffix (so two solves in one body use two sets of names)
 function fps_solve(body::Symbol, sfx::String)
@@ -53,6 +53,8 @@ fps_start(body) = body === :scalar ? "x = x0\n" : ""
 
 function fps_text(body::Symbol, nest::Symbol)
     S(sfx = "") = fps_solve(body, sfx)
+    # a solve whose fixed point changes with t
+    T(sfx = "") = (r = replace(replace(fps_solve(body, sfx), "+ p\n" => "+ p + 0.3 * pa[t]\n"), "+ f[j$sfx]\n" => "+ f[j$sfx] + 0.3 * pa[t]\n"); body === :scalar && !isempty(sfx) ? replace(r, "xq" => "x") : r)
     b = ""
     if nest === :none
         b = fps_start(body) * S()
@@ -78,9 +80,32 @@ function fps_text(body::Symbol, nest::Symbol)
     elseif nest === :indep
         # every iteration starts from its own state and writes its own result: independent iterations (a GPU stage offloads such a loop)
         b = body === :scalar ? "for t = 1:nt\n" * fps_ind("x = x0 + 0.1 * pa[t]\n" * S() * "ys[t] = x * x\n", 1) * "end\nx = x0\n" : ""
+    elseif nest === :tdep_first
+        # the fixed point changes with t, and the state is read after each solve: the reverse needs the value each solve left
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(T() * fps_post(body, ""), 1) * "end\n"
+    elseif nest === :read_before
+        # the state is read before each solve, the solve then overwrites it: the reverse of the read needs the value the solve found on entry
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(fps_post(body, "") * T(), 1) * "end\n"
+    elseif nest === :pre_nl
+        # a self-update that is nonlinear in the state, before the solve: its reverse needs the state it found
+        pre = body === :scalar ? "x = x * (1.0 + 0.1 * pa[t])\n" : "u[3] = u[3] * (1.0 + 0.1 * pa[t])\n"
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(pre * T() * fps_post(body, ""), 1) * "end\n"
+    elseif nest === :tdep_nl
+        # a read after the solve that is nonlinear in the state; the fixed point changes with t
+        post = body === :scalar ? fps_post(body, "") : "ys[t] = u[2] * u[3]\n"
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(T() * post, 1) * "end\n"
+    elseif nest === :read_nl
+        # a read before the solve that is nonlinear in the state
+        post = body === :scalar ? fps_post(body, "") : "ys[t] = u[2] * u[3]\n"
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(post * T(), 1) * "end\n"
+    elseif nest === :read_top
+        b = replace(fps_start(body) * fps_post(body, "") * T(), "[t]" => "[1]")
+    elseif nest === :read_between
+        # a read between two solves of the same state
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(T() * fps_post(body, "") * T("q"), 1) * "end\n"
     elseif nest === :two_caps
         # two solve loops with two different caps in one body
-        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(fps_pre(body, "") * S() * fps_post(body, "") * replace(replace(fps_solve(body, "q"), "xq" => "x"), "1:maxit" => "1:maxq"), 1) * "end\n"
+        b = fps_start(body) * "for t = 1:nt\n" * fps_ind(fps_pre(body, "") * S() * replace(replace(fps_solve(body, "q"), "xq" => "x"), "1:maxit" => "1:maxq") * fps_post(body, ""), 1) * "end\n"
     elseif nest === :ragged
         # the bound of the inner enclosing loop is assigned inside the outer one
         b = body === :scalar ? "x = x0\nfor t = 1:nt\n    mm = nt - t + 1\n    for s = 1:mm\n" * fps_ind(fps_pre(body, "") * S() * fps_post(body, ""), 2) * "    end\nend\n" : ""

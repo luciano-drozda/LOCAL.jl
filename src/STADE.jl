@@ -19098,7 +19098,7 @@ agen_fp_count_sym(e, s::Symbol) = e === s ? 1 : e isa Expr ? sum(agen_fp_count_s
 # The solve loops of a kernel with their state and their enclosing nest (`enclosing`, the loops and branches around each, outermost first; `loop` is the `for`
 # statement itself). Each carries the facts the refusal rule reads: `inside` (another solve loop encloses it), `holds` (it encloses another), `cap_elsewhere`
 # (uses of its cap outside the headers of solve loops and outside their bodies: the one-slot tape replaces every trip count of that cap).
-function agen_fp_detect(expr::Expr, kinds::Dict{Symbol,Symbol})
+function agen_fp_detect(expr::Expr, kinds::Dict{Symbol,Symbol}; kernel = nothing)
     found = Any[]
     agen_fp_walk_solves!(agen_fp_stmts(expr.args[2]), Any[], kinds, found)
     total = Dict{Symbol,Int}(); nhead = Dict{Symbol,Int}()
@@ -19106,14 +19106,123 @@ function agen_fp_detect(expr::Expr, kinds::Dict{Symbol,Symbol})
         haskey(total, d.hi) || (total[d.hi] = agen_fp_count_sym(expr.args[2], d.hi))
         nhead[d.hi] = get(nhead, d.hi, 0) + 1
     end
+    stale = isempty(found) ? Symbol[] : agen_fp_stale(expr, found, kinds, kernel === nothing ? parse_kernel(expr) : kernel)
     out = Any[]
     for d in found
         inside = any(o -> o.loop !== d.loop && any(e -> e === o.loop, d.enclosing), found)
         holds = any(o -> o.loop !== d.loop && any(e -> e === d.loop, o.enclosing), found)
         inbody = sum(agen_fp_count_sym(o.loop.args[2], d.hi) for o in found if o.hi === d.hi; init = 0)
-        push!(out, merge(d, (inside = inside, holds = holds, cap_elsewhere = total[d.hi] - nhead[d.hi] - inbody)))
+        push!(out, merge(d, (inside = inside, holds = holds, cap_elsewhere = total[d.hi] - nhead[d.hi] - inbody, stale = stale)))
     end
     return out
+end
+
+# ---- the entry value of a solve's state ----
+# The reverse of a solve loop leaves its state at the last iteration's value, not at the value the loop found on entry (the unrolled reverse rolls it back through the
+# whole history, the one-slot tape keeps one iteration). A statement that reads the state before a solve loop overwrites it, and whose adjoint needs that value, would
+# read the wrong one in the reverse. Scalars that an enclosing loop assigns are restored to their end-of-iteration value by the generated adjoint; arrays are not.
+
+# the value of `v` in the expression `e` is needed by the adjoint of the assignment whose right-hand side is `e` (act: the active variables). A sum, a difference and a
+# product or quotient with inactive factors pass the derivative through without reading the value; any other use reads it.
+function agen_fp_need(e, v::Symbol, act::Dict{Symbol,Bool})
+    e isa Expr || return false
+    isact(x) = (syms = Set{Symbol}(); agen_split_syms!(x, syms); any(a -> get(act, a, false), syms))
+    has(x) = agen_fp_count_sym(x, v) > 0
+    if e.head === :call && e.args[1] isa Symbol
+        op = e.args[1]; args = e.args[2:end]
+        any(a -> agen_fp_need(a, v, act), args) && return true
+        if op in (:+, :-)
+            return false
+        elseif op === :*
+            for (i, a) in enumerate(args)
+                has(a) && any(j -> j != i && isact(args[j]), eachindex(args)) && return true
+            end
+            return false
+        elseif op === :/ && length(args) == 2
+            has(args[2]) && (isact(args[1]) || isact(args[2])) && return true
+            has(args[1]) && isact(args[2]) && return true
+            return false
+        else
+            return any(has, args) && any(isact, args)
+        end
+    end
+    e.head === :ref && return false
+    return any(a -> agen_fp_need(a, v, act), e.args)
+end
+
+# is the value of v read by the assignment `st` and needed by its adjoint? A self-update (`x = ... x ...`, `u[i] = ... u[i] ...`) is exempt: the generated adjoint saves
+# the old value at the assignment itself.
+function agen_fp_stale_assign(st, v::Symbol, act::Dict{Symbol,Bool})
+    lhs = st.args[1]; rhs = st.args[2]
+    base = lhs isa Symbol ? lhs : (lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol ? lhs.args[1] : nothing)
+    (base === nothing || !get(act, base, false)) && return false
+    base === v && lhs isa Symbol && return false
+    if base === v
+        rhs = agen_fp_subst_ref(rhs, lhs)
+    end
+    return agen_fp_need(rhs, v, act)
+end
+
+agen_fp_subst_ref(e, r) = e == r ? 0 : e isa Expr ? Expr(e.head, Any[agen_fp_subst_ref(a, r) for a in e.args]...) : e
+
+# `after` is the set of states that a solve loop overwrites later on a path from the end of `stmts`; returns the set at the start of `stmts` and records in `hits` each
+# state a statement reads (value needed) while a solve loop that overwrites it follows. A plain assignment to a scalar ends the path for that scalar.
+function agen_fp_stale_scan!(stmts::Vector, after::Set{Symbol}, ctx, hits::Set{Symbol}, record::Bool)
+    R = copy(after)
+    for st in reverse(stmts)
+        st isa Expr || continue
+        di = findfirst(o -> o.loop === st, ctx.dets)
+        if di !== nothing
+            own = Set{Symbol}(vcat(ctx.dets[di].arrays, ctx.dets[di].scalars))
+            if record
+                for a in agen_fp_stmts(st.args[2]), x in agen_fp_flat_assigns(a)
+                    for v in R
+                        v in own || agen_fp_stale_assign(x, v, ctx.act) && push!(hits, v)
+                    end
+                end
+            end
+            union!(R, own)
+        elseif st.head === :for
+            body = agen_fp_stmts(st.args[2])
+            R0 = agen_fp_stale_scan!(body, R, ctx, hits, false)
+            wrap = Set{Symbol}(v for v in R0 if get(ctx.kinds, v, :none) == :array_float)
+            R1 = agen_fp_stale_scan!(body, union(R, wrap), ctx, hits, record)
+            union!(R, R1)
+        elseif st.head === :if
+            Rt = agen_fp_stale_scan!(agen_fp_stmts(st.args[2]), R, ctx, hits, record)
+            Re = length(st.args) == 3 ? agen_fp_stale_scan!(agen_fp_stmts(st.args[3]), R, ctx, hits, record) : R
+            R = union(Rt, Re)
+        elseif st.head === :(=)
+            if record
+                for v in R
+                    agen_fp_stale_assign(st, v, ctx.act) && push!(hits, v)
+                end
+            end
+            lhs = st.args[1]
+            lhs isa Symbol && get(ctx.kinds, lhs, :none) == :scalar_float && delete!(R, lhs)
+        end
+    end
+    return R
+end
+
+# every assignment inside a statement (any depth)
+function agen_fp_flat_assigns(e)
+    out = Any[]
+    function walk(x)
+        x isa Expr || return nothing
+        x.head === :(=) && push!(out, x)
+        foreach(walk, x.args)
+        return nothing
+    end
+    walk(e)
+    return out
+end
+
+function agen_fp_stale(expr::Expr, dets::Vector, kinds::Dict{Symbol,Symbol}, kernel)
+    ctx = (dets = dets, kinds = kinds, act = act_analyze(kernel))
+    hits = Set{Symbol}()
+    agen_fp_stale_scan!(agen_fp_stmts(expr.args[2]), Set{Symbol}(), ctx, hits, true)
+    return sort(collect(hits))
 end
 
 # `__oldb_N = <adjoint of a state>` is how the generated reverse of an overwrite reads the adjoint it consumes. After each one, the square of what it read
@@ -19760,6 +19869,7 @@ function agen_fp_refusal(det)
     f.cap_in_body && push!(why, "the body reads the loop's cap `$(det.hi)` (the one-slot tape sizes every stack by the cap, an inner bound that uses it would be sized wrongly)")
     bad = sort(collect(setdiff(f.calls, agen_fp_validated_calls())))
     isempty(bad) || push!(why, "the body calls " * join(string.(bad), ", ") * ", which have no validated case")
+    isempty(det.stale) || push!(why, "the state " * join(["`$v`" for v in det.stale], ", ") * " is read, in a statement whose adjoint needs the value, before a solve loop overwrites it (the fixed-point reverse keeps the last iteration's value of the state, not the value the loop found on entry)")
     append!(why, agen_fp_nest_reasons(det))
     return why
 end
@@ -19775,7 +19885,7 @@ end
 function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                                    dependents::Union{Vector{Symbol},Nothing}=nothing, tape::Symbol=:one_slot)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
-    found = agen_fp_detect(expr, kernel.sig.kinds)
+    found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
     isempty(found) && error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops (`for k = 1:n` holding one `if residual > tol`), it needs at least one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
     if tape === :one_slot
@@ -19894,8 +20004,8 @@ end
 # A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
 function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
                                     independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
-    kernel = parse_kernel(expr)
-    found = agen_fp_detect(expr, kernel.sig.kinds)
+    kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
+    found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
     isempty(found) && return nothing
     why = nothing
     if keep_push_pop
