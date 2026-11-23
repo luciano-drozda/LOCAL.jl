@@ -35,7 +35,7 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
                     end
                 verbose && println(rpad(name, 22), " ", ename, " ", regime, ": err=", round(r.err, sigdigits = 3), " info=", r.dev_info)
                 if regime === :cap
-                    say(r.raised && r.devraised && occursin("stopped on its cap", r.devmsg) && r.err <= 1e-12, "$ename $name cap: CPU raised ($(r.raised)), device raised ($(r.devraised): $(first(r.devmsg, 80))), err=$(r.err)")
+                    say(r.raised && r.devraised && occursin("stopped on its cap", r.devmsg), "$ename $name cap: CPU raised ($(r.raised)), device raised ($(r.devraised): $(first(r.devmsg, 80))); the shadows of an adjoint that raised are not compared (the CPU one stops between the nests, the device one at its end)")
                     say(r.dev_info[4] >= 1 && r.dev_info[5] == 2, "$ename $name cap: device fp_info $(r.dev_info)")
                 else
                     say(r.err <= 1e-12 && !r.devraised && !r.raised, "$ename $name $regime: device vs CPU fixed-point adjoint err=$(r.err) (raised: $(r.raised)/$(r.devraised) $(r.devmsg))")
