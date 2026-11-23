@@ -4,9 +4,9 @@
 #              1e-9, a central difference of the primal (the tolerance held fixed) to 1e-5, the sweeps ran (at least one), neither flag is set, and the state
 #              arrays it leaves hold the primal result (the unrolled reverse rolls them back to their entry values)
 #   zero       the guard is closed before the first iteration: no sweep, the two adjoints equal
-#   cap        maxit = 3: the forward flag is set and stade_adjoint_fixedpoint_check raises; the fixed-point adjoint and the unrolled one differ for some kernel
-#              (the comparison is sensitive to the tape the sweeps replay)
-# and the refusals: two loops, a counter read in the body, an accumulation (no state adjoint consumed).
+#   cap        maxit = 3: the forward flag is set, no sweep runs and the adjoint is the unrolled one (equal to stade_adjoint with keep_push_pop = false)
+# and the unsettled case (fp_slow_linear: the loop converges, the reverse sweeps cannot settle: the adjoint raises and fp_info[5] is set), the refusal rule
+# (a whitelist of the features the validated kernels show) and the refusals: two loops, a counter read in the body, an accumulation (no state adjoint consumed).
 #   julia validate_fixedpoint.jl [kernel names] [--sabotage]
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :sab_read) || include(joinpath(@__DIR__, "sabotage_run.jl"))
@@ -106,11 +106,13 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")); kernel = STADE.parse_kernel(primal)
     pins2 = copy(pins)
     regime === :cap && (pins2[:maxit] = 3)
+    regime === :unsettled && (pins2[:maxit] = 14)
     Random.seed!(20261122)
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
     for (k, v) in floats; vals[k] = v; end
+    regime === :unsettled && for (k, v) in Dict(:a => 1.0, :x0 => 0.0, :omega => 0.1, :tol => 1e-3); vals[k] = v; end
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
@@ -119,7 +121,9 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     snames = Symbol[a for a in fp.initstacks.args[1].args[2:end]]
     a1, t1 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
     s1 = sg_init_stacks(cpu_init, sg_stack_extra(snames, int_args, vals, identity))
-    r1 = Base.invokelatest(cpu_adj, a1..., s1...)
+    # the CPU adjoint raises when the sweeps do not settle; the device one has no raise yet, so its returned scalars are not compared then
+    raised = false
+    r1 = try Base.invokelatest(cpu_adj, a1..., s1...) catch e; raised = true; nothing end
     plan_init = env.plan(fp.initstacks, nothing)
     plan_adj = env.plan(fp.adjoint, env.initmap(plan_init, fp.initstacks))
     dev_init = sg_eval_plan!(env.mod, plan_init); dev_adj = sg_eval_plan!(env.mod, plan_adj)
@@ -131,8 +135,8 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
         ct.kind == :array_float || continue
         err = max(err, sg_relerr(ct.sh, env.tohost(t2[a].sh)))
     end
-    err = max(err, sg_scalar_err(count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args), r1, r2))
-    return (err = err, cpu_info = Float64.(s1[end]), dev_info = Float64.(env.tohost(s2[end])))
+    raised || (err = max(err, sg_scalar_err(count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args), r1, r2)))
+    return (err = err, cpu_info = Float64.(s1[end]), dev_info = Float64.(env.tohost(s2[end])), raised = raised)
 end
 
 # the converged loop whose reverse cannot settle in as many sweeps as the loop has iterations: what the adjoint raises and what it leaves in fp_info

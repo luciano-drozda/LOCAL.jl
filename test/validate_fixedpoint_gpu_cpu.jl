@@ -33,12 +33,21 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
             end
         end
     end
+    # a converged loop whose reverse cannot settle: the CPU adjoint raises, the device one reports it in fp_info[5] only
+    for (ename, mk) in (("cuda", scc_env), ("jacc", spj_env))
+        isempty(only) || "fp_slow_linear" in only || continue
+        r = try fpv_device("fp-corpus", "fp_slow_linear", Dict{Symbol,Int}(), Dict{Symbol,Float64}(), 4, nothing, mk(), :unsettled)
+            catch e; say(false, "$ename fp_slow_linear unsettled: " * first(split(sprint(showerror, e), "\n"))); continue; end
+        verbose && println(rpad("fp_slow_linear", 22), " ", ename, " unsettled: err=", round(r.err, sigdigits = 3), " raised=", r.raised, " info=", r.dev_info)
+        say(r.raised && r.dev_info[4] == 0 && r.dev_info[5] == 1 && r.err <= 1e-12, "$ename fp_slow_linear unsettled: the CPU raised ($(r.raised)), the device flags it in fp_info[5] ($(r.dev_info)), shadows agree ($(r.err))")
+    end
     verbose && println("validate_fixedpoint_gpu_cpu: $(checks - bad)/$checks ok")
     if sabotage
         text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
         # No case for the CUDA dead-stack pass on a fixed-point adjoint: it deletes only the `*_stack` arrays an initstacks host allocates, fp_info is not one,
         # and the adjoint is one function holding both the record and the replay, so running the pass there changes nothing (an equivalent mutant, four kernels checked).
         cases = [
+            ("the ingest keeps the raise of a fixed-point adjoint", " && !cgen_is_fp_raise(s)]", "]", ["fp_scalar_cos"]),
             ("the stage drops the fp_info stores (CUDA)", "dead_scalars && !(split_half in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))", "dead_scalars && (expr = cgen_dead_pops(expr, init_hosts))", ["fp_scalar_cos"]),
             ("the fixed-point adjoint is not recognised", ":fp_info in expr.args[1].args[2:end] && return :fixedpoint", ":fp_infox in expr.args[1].args[2:end] && return :fixedpoint", ["fp_scalar_cos"]),
         ]
