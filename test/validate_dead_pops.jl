@@ -228,7 +228,7 @@ function validate_dead_pops(; phases = (:units, :sabotage), slice = 1:typemax(In
             ("the stores of a stack that is read are dropped", "st[:mode] === :drop && lhs.args[1] in st[:eligible] && !(key in st[:reads]) && return nothing", "st[:mode] === :drop && lhs.args[1] in st[:eligible] && return nothing"),
             ("a caller's array that ends in _stack is cleaned", "return Set{Symbol}(x for x in params if x in alloc || (", "return Set{Symbol}(x for x in params if endswith(string(x), \"_stack\") || x in alloc || ("),
             ("the pass is off", "cgen_dead_pops_enabled() = get(ENV, \"STADE_DEAD_POPS\", \"1\") != \"0\"", "cgen_dead_pops_enabled() = false"),
-            ("the pass is not applied before the offload decision", "    dead_scalars && split_half !== :fwd && (expr = cgen_dead_pops(expr, init_hosts))\n", ""),
+            ("the pass is not applied before the offload decision", "    dead_scalars && !(split_half in (:fwd, :fixedpoint)) && (expr = cgen_dead_pops(expr, init_hosts))\n", ""),
             ("the index scalars are not expanded", "            env[lhs] = cgen_dp_canon(rhs, env, st)\n", "            nothing\n"),
             ("a read that no store matches is ignored", "all(r -> r in st[:stores], (r for r in st[:reads] if r[1] === k)) && push!(st[:eligible], k)", "push!(st[:eligible], k)"),
         ]
