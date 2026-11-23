@@ -19117,47 +19117,63 @@ function agen_fp_rewrite(adj::Expr, init::Expr, det)
     cond_k = agen_substitute_vars(cond, sub)
     kk = det.var; hi = det.hi; tolx = det.tol; rn = det.rn
     fwd_flag = Expr(:call, det.cmp, rn, tolx)
+    kname = call.args[1]
+    msg = "$(kname): the reverse sweeps did not settle the state adjoint, the iteration does not contract"
+    # a loop that ran to its cap is not at a fixed point: its reverse is the original one, every iteration. A converged loop gets the sweeps.
     new = agen_fp_stmts(quote
+        fp_info[1] = 0.0
+        fp_info[2] = 0.0
+        fp_info[3] = 0.0
         fp_info[4] = 0.0
+        fp_info[5] = 0.0
+        __fp_cut = 0
+        __fp_go = 0
         if $fwd_flag
+            __fp_cut = 1
             fp_info[4] = 1.0
         end
-        __fp_last = 0
-        for __fp_k = 1:$hi
-            $(scan_pre...)
-            if $cond_k
-                __fp_last = __fp_k
-            end
-        end
-        __fp_cn = 0.0
-        __fp_c0 = 0.0
-        __fp_sw = 0
-        __fp_go = 1
-        if __fp_last == 0
-            __fp_go = 0
-        end
-        for __fp_s = 1:$hi
-            if __fp_go == 1
-                __fp_cn = 0.0
-                $kk = __fp_last
-                $(pre...)
-                $(then_s...)
-                if __fp_sw == 0
-                    __fp_c0 = __fp_cn
-                end
-                __fp_sw = __fp_sw + 1
-                if __fp_cn <= $tolx * __fp_c0
-                    __fp_go = 0
+        if __fp_cut == 0
+            __fp_last = 0
+            for __fp_k = 1:$hi
+                $(scan_pre...)
+                if $cond_k
+                    __fp_last = __fp_k
                 end
             end
+            __fp_cn = 0.0
+            __fp_c0 = 0.0
+            __fp_sw = 0
+            __fp_go = 1
+            if __fp_last == 0
+                __fp_go = 0
+            end
+            for __fp_s = 1:$hi
+                if __fp_go == 1
+                    __fp_cn = 0.0
+                    $kk = __fp_last
+                    $(pre...)
+                    $(then_s...)
+                    if __fp_sw == 0
+                        __fp_c0 = __fp_cn
+                    end
+                    __fp_sw = __fp_sw + 1
+                    if __fp_cn <= $tolx * __fp_c0
+                        __fp_go = 0
+                    end
+                end
+            end
+            fp_info[1] = __fp_last
+            fp_info[2] = __fp_sw
+            if __fp_c0 > 0.0
+                fp_info[3] = __fp_cn / __fp_c0
+            end
+            fp_info[5] = __fp_go
+        else
+            $rev
         end
-        fp_info[1] = __fp_last
-        fp_info[2] = __fp_sw
-        fp_info[3] = 0.0
-        if __fp_c0 > 0.0
-            fp_info[3] = __fp_cn / __fp_c0
+        if __fp_go == 1
+            error($msg)
         end
-        fp_info[5] = __fp_go
     end)
     out = Any[stmts[1:pos[1]-1]; new; stmts[pos[1]+1:end]]
     adj2 = Expr(:function, Expr(:call, call.args..., :fp_info), Expr(:block, out...))
@@ -19182,6 +19198,72 @@ end
 function stade_adjoint_split(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                               dependents::Union{Vector{Symbol},Nothing}=nothing)
     return stade_adjoint_(expr, independents, dependents, false, false, true, true)
+end
+
+# What the fixed-point path is validated on. A function name outside this set has no validated case.
+agen_fp_validated_calls() = Set{Symbol}([:div, :mod, :sin, :cos, :tanh])
+
+# One walk of the then-block of a counted-guard loop: the deepest loop nesting, whether an `if` sits inside, the functions called, and the scalars that hold a
+# reduction (accumulated in a nested loop, or assigned from such a scalar). `red` grows across calls until it stops changing.
+function agen_fp_scan!(e, d::Int, inloop::Bool, red::Set{Symbol}, calls::Set{Symbol}, depth::Ref{Int}, inner_if::Ref{Bool})
+    e isa Expr || return nothing
+    if e.head === :for
+        depth[] = max(depth[], d + 1)
+        agen_fp_scan!(e.args[2], d + 1, true, red, calls, depth, inner_if)
+        return nothing
+    end
+    e.head === :if && (inner_if[] = true)
+    if e.head === :(=) && e.args[1] isa Symbol
+        rsyms = Set{Symbol}(); agen_split_syms!(e.args[2], rsyms)
+        rhs = e.args[2]
+        (inloop && rhs isa Expr && rhs.head === :call && rhs.args[1] === :+ && e.args[1] in rsyms) && push!(red, e.args[1])
+        isempty(intersect(rsyms, red)) || push!(red, e.args[1])
+    end
+    e.head === :call && e.args[1] isa Symbol && !(e.args[1] in (:+, :-, :*, :/, :>, :<, :>=, :<=, :(==), :^, :ref)) && push!(calls, e.args[1])
+    for a in e.args
+        agen_fp_scan!(a, d, inloop, red, calls, depth, inner_if)
+    end
+    return nothing
+end
+
+function agen_fp_divides_by!(e, red::Set{Symbol}, hit::Ref{Bool})
+    e isa Expr || return nothing
+    if e.head === :call && e.args[1] === :/ && length(e.args) == 3
+        s = Set{Symbol}(); agen_split_syms!(e.args[3], s)
+        isempty(intersect(s, red)) || (hit[] = true)
+    end
+    for a in e.args
+        agen_fp_divides_by!(a, red, hit)
+    end
+    return nothing
+end
+
+# The features of the body of one detected loop (`det` from agen_fp_detect, `body` the top-level statements of the kernel).
+function agen_fp_features(det, body::Vector)
+    th = agen_fp_stmts(body[det.index].args[2])[1].args[2]
+    red = Set{Symbol}(); calls = Set{Symbol}(); depth = Ref(0); inner_if = Ref(false)
+    for _ in 1:16
+        n0 = length(red)
+        agen_fp_scan!(th, 0, false, red, calls, depth, inner_if)
+        length(red) == n0 && break
+    end
+    hit = Ref(false); agen_fp_divides_by!(th, red, hit)
+    return (depth = depth[], inner_if = inner_if[], div_by_reduction = hit[], literal_tol = det.tol isa Number, calls = calls)
+end
+
+# Why the fixed-point path does not apply to a detected loop: the reasons, empty when it applies. The path is a whitelist: a loop is accepted only when every
+# feature it shows is one a validated corpus kernel shows (Newton and cosine on a scalar, Jacobi and Gauss-Seidel and tanh sweeps on arrays, a mixed state,
+# a 3-level multigrid). A feature none of them shows is a reason, so a new shape stays on the unrolled adjoint until a corpus kernel validates it.
+function agen_fp_refusal(det, body::Vector)
+    f = agen_fp_features(det, body)
+    why = String[]
+    f.div_by_reduction && push!(why, "the body divides by a value computed from a reduction (a Krylov or normalised iteration has no validated case)")
+    f.depth > 2 && push!(why, "the body nests loops deeper than 2")
+    f.inner_if && push!(why, "the body holds an if")
+    f.literal_tol && push!(why, "the tolerance is a literal")
+    bad = sort(collect(setdiff(f.calls, agen_fp_validated_calls())))
+    isempty(bad) || push!(why, "the body calls " * join(string.(bad), ", ") * ", which have no validated case")
+    return why
 end
 
 # The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration: the reverse reads the last active
@@ -19300,11 +19382,45 @@ function agen_host_stack_note(kernel, generated_fn)
            "If the bound keeps its value from one pass to the next, assigning it once before the loops removes them; otherwise writing those loops with a constant bound and an `if X <= bound` mask does (README)."
 end
 
+# The adjoint of `expr` with the fixed-point reverse of its counted-guard loop (stade_adjoint_fixedpoint), or `nothing` with one @info line that gives the reason.
+# It applies only to a kernel with exactly one such loop, keep_push_pop = false, no fusion, primal_outputs = true and a loop the agen_fp_refusal rule accepts.
+# A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
+function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool)
+    kernel = parse_kernel(expr)
+    found = agen_fp_detect(expr, kernel.sig.kinds)
+    isempty(found) && return nothing
+    why = nothing
+    if keep_push_pop
+        why = "keep_push_pop = true (the fixed-point reverse needs keep_push_pop = false)"
+    elseif fuse_ii_loops
+        why = "fuse_ii_loops = true (the fixed-point reverse needs no fusion)"
+    elseif !primal_outputs
+        why = "primal_outputs = false"
+    elseif length(found) != 1
+        why = "the kernel has $(length(found)) counted-guard loops, the path needs exactly one"
+    else
+        r = agen_fp_refusal(found[1], agen_fp_stmts(expr.args[2]))
+        isempty(r) || (why = join(r, "; "))
+    end
+    if why !== nothing
+        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
+        return nothing
+    end
+    try
+        return stade_adjoint_fixedpoint(expr)
+    catch e
+        (e isa ErrorException && startswith(e.msg, "stade_adjoint_fixedpoint:")) || rethrow()
+        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
+        return nothing
+    end
+end
+
 function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
-    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
+    generated = agen_fp_adjoint_or_nothing(inlined[entry_name], keep_push_pop, fuse_ii_loops, primal_outputs)
+    generated === nothing && (generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs))
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
     keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
