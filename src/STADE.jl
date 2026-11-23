@@ -7424,7 +7424,8 @@ end
 
 function cgen_fp_raise_append(host::Expr, allowscalar)
     (host.head === :function && :fp_info in host.args[1].args[2:end]) || return host
-    chk = Expr(:macrocall, allowscalar, nothing, Expr(:block, :(fp_info[5] == 0.0 || error($(agen_fp_unsettled_message(host.args[1].args[1]))))))
+    name = host.args[1].args[1]
+    chk = Expr(:macrocall, allowscalar, nothing, Expr(:block, :(fp_info[5] == 0.0 || error(fp_info[5] == 2.0 ? $(agen_fp_cutoff_message(name)) : $(agen_fp_unsettled_message(name))))))
     out = cgen_fp_raise_insert(Any[s for s in host.args[2].args if !(s isa LineNumberNode)], chk)
     out === nothing && return host
     return Expr(:function, host.args[1], Expr(:block, out...))
@@ -19216,6 +19217,202 @@ function agen_fp_rewrite(adj::Expr, init::Expr, det)
     return (adjoint = adj2, initstacks = init2)
 end
 
+# ---- the one-slot tape of the fixed-point adjoint ----
+# The sweeps read the tape of the last active iteration only, so the forward loop writes every iteration to the same slot: the counter of the loop leaves
+# the tape positions and the trip count leaves the stack sizes. A loop that stopped on its cap has no tape of the earlier iterations: it raises.
+
+# Integer literal arithmetic the substitution leaves behind: 0 * x, x + 0, 1 * x, (1 - 1).
+function agen_fp_fold(e)
+    e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] in (:+, :-, :*) || return e
+    op, x, y = e.args[1], e.args[2], e.args[3]
+    (x isa Integer && y isa Integer) && return op === :+ ? x + y : op === :- ? x - y : x * y
+    op === :+ && x isa Integer && x == 0 && return y
+    (op === :+ || op === :-) && y isa Integer && y == 0 && return x
+    op === :* && ((x isa Integer && x == 0) || (y isa Integer && y == 0)) && return 0
+    op === :* && x isa Integer && x == 1 && return y
+    op === :* && y isa Integer && y == 1 && return x
+    return e
+end
+
+# Replaces the trip count `trip` of the counted loop by 1 and, when `kk_on`, its counter `kk` by 1; folds the arithmetic along the changed paths only.
+function agen_fp_slot_walk(e, trip, kk::Symbol, kk_on::Bool)
+    kk_on && e === kk && return (1, true)
+    e isa Expr && e == trip && return (1, true)
+    e isa Expr || return (e, false)
+    changed = false
+    args = Any[]
+    for a in e.args
+        (na, ch) = agen_fp_slot_walk(a, trip, kk, kk_on)
+        push!(args, na); changed |= ch
+    end
+    changed || return (e, false)
+    return (agen_fp_fold(Expr(e.head, args...)), true)
+end
+
+agen_fp_slot(e, trip, kk::Symbol, kk_on::Bool) = agen_fp_slot_walk(e, trip, kk, kk_on)[1]
+
+# a statement the generator wrote for the tape: an index assignment or a store into a stack
+agen_fp_is_tape_stmt(s) = s isa Expr && s.head === :(=) &&
+    ((s.args[1] isa Symbol && (startswith(string(s.args[1]), "__idx_") || startswith(string(s.args[1]), "__icse_"))) ||
+     (s.args[1] isa Expr && s.args[1].head === :ref && s.args[1].args[1] isa Symbol && endswith(string(s.args[1].args[1]), "_stack")))
+
+function agen_fp_uses(x, name::Symbol)
+    syms = Set{Symbol}(); agen_split_syms!(x, syms)
+    return name in syms
+end
+
+# The forward loop of the unrolled adjoint becomes `for kk = 1:hi; if cond; body; tape writes; __fp_last = kk; end; end`: the branch flag and the writes after the
+# guard are gone (an iteration after the last active one writes nothing), and `__fp_last` counts the iterations that ran. Returns the loop and the name of the branch stack.
+function agen_fp_one_slot_forward(floop::Expr, det, trip)
+    kk = det.var
+    stmts = agen_fp_stmts(floop.args[2])
+    (!isempty(stmts) && stmts[1] isa Expr && stmts[1].head === :if && length(stmts[1].args) == 3 && count(s -> s isa Expr && s.head === :if, stmts) == 1) ||
+        error("agen_adjoint_fixedpoint: the forward loop over `$kk` is not one guard with an else branch followed by tape writes")
+    ifs = stmts[1]; post = stmts[2:end]
+    all(agen_fp_is_tape_stmt, post) || error("agen_adjoint_fixedpoint: the forward loop over `$kk` holds a statement after the guard that is not a tape write")
+    els = agen_fp_stmts(ifs.args[3])
+    stores = [s for s in els if s isa Expr && s.head === :(=) && s.args[1] isa Expr && s.args[1].head === :ref]
+    (length(stores) == 1 && stores[1].args[2] == 0 && all(agen_fp_is_tape_stmt, els)) ||
+        error("agen_adjoint_fixedpoint: the else branch of the guard in the loop over `$kk` is not one branch-flag store")
+    bstack = stores[1].args[1].args[1]
+    then = agen_fp_stmts(ifs.args[2])
+    flag = findall(s -> s isa Expr && s.head === :(=) && s.args[1] isa Expr && s.args[1].head === :ref && s.args[1].args[1] === bstack, then)
+    length(flag) == 1 || error("agen_adjoint_fixedpoint: the guard of the loop over `$kk` records its branch flag $(length(flag)) times")
+    idxvar = then[flag[1]].args[1].args[2]
+    keep = Any[then[j] for j in 1:length(then) if j != flag[1]]
+    if idxvar isa Symbol
+        keep = Any[s for s in keep if !(s isa Expr && s.head === :(=) && s.args[1] === idxvar)]
+        any(s -> agen_fp_uses(s, idxvar), keep) && error("agen_adjoint_fixedpoint: the branch-flag index of the loop over `$kk` is used elsewhere")
+    end
+    body = Any[agen_fp_slot(s, trip, kk, true) for s in Any[keep; post]]
+    any(s -> agen_fp_uses(s, bstack), body) && error("agen_adjoint_fixedpoint: the branch stack `$bstack` is used in the guard besides its flag")
+    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = $kk)))
+    return (Expr(:for, floop.args[1], Expr(:block, guard)), bstack)
+end
+
+function agen_fp_cutoff_message(name)
+    return "$(name): the loop stopped on its cap before the residual reached the tolerance, there is no fixed point to differentiate (raise the cap or the tolerance, or use keep_push_pop = true for the derivative of the iterations that ran)"
+end
+
+# agen_fp_rewrite with the one-slot tape: no unrolled reverse, a loop that stopped on its cap raises.
+function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, det)
+    call = adj.args[1]
+    stmts = Any[s for s in adj.args[2].args if !(s isa LineNumberNode)]
+    kk = det.var; hi = det.hi; tolx = det.tol; rn = det.rn
+    trip = :(max(0, div($hi - 1, 1) + 1))
+    fpos = findall(st -> (h = agen_fp_header(st); h !== nothing && h.step === 1 && h.var === kk && h.hi == hi && h.lo == 1), stmts)
+    rpos = findall(st -> (h = agen_fp_header(st); h !== nothing && h.step == -1 && h.var === kk && h.hi == hi && h.lo == 1), stmts)
+    (length(fpos) == 1 && length(rpos) == 1) || error("agen_adjoint_fixedpoint: the forward and the reversed loop over `$kk` were found $(length(fpos)) and $(length(rpos)) times in the generated adjoint")
+    (newf, bstack) = agen_fp_one_slot_forward(stmts[fpos[1]], det, trip)
+    rev = stmts[rpos[1]]
+    rbody = agen_fp_stmts(rev.args[2])
+    lastst = rbody[end]
+    (lastst isa Expr && lastst.head === :if && length(lastst.args) == 2) || error("agen_adjoint_fixedpoint: the reversed loop over `$kk` does not end in the branch of the guard")
+    pre = rbody[1:end-1]; then = agen_fp_stmts(lastst.args[2]); cond = lastst.args[1]
+    # the reads of the branch flag only feed the test of the guard: the sweeps run the last active iteration, so they need neither
+    sl = agen_fp_slice(pre, cond)
+    pre_rest = Any[]
+    for (j, st) in enumerate(pre)
+        if any(t -> t === st, sl)
+            lhs = st.args[1]
+            later = Any[pre[j+1:end]..., then...]
+            # a statement of the slice that reads the branch stack, or that nothing else reads, is dropped; an index shared with another read stays
+            (agen_fp_uses(st, bstack) || !(lhs isa Symbol && any(t -> !any(u -> u === t, sl) && agen_fp_uses(t, lhs), later))) && continue
+        end
+        push!(pre_rest, st)
+    end
+    argset = Set{Symbol}(a isa Symbol ? a : a.args[1] for a in call.args[2:end])
+    syms = Set{Symbol}(); agen_split_syms!(adj.args[2], syms)
+    arrays_b = Symbol[agen_shadow(a) for a in det.arrays if agen_shadow(a) in argset]
+    scalars_b = Symbol[agen_shadow(v) for v in det.scalars if agen_shadow(v) in syms]
+    names = Set{Symbol}(vcat(arrays_b, scalars_b))
+    isempty(names) && error("agen_adjoint_fixedpoint: no state of the loop over `$kk` is active, there is no state adjoint to iterate")
+    (then_i, count) = agen_fp_instrument(Expr(:block, then...), names, :__fp_cn)
+    count > 0 || error("agen_adjoint_fixedpoint: the reverse of the loop over `$kk` never consumes a state adjoint (the loop accumulates and does not overwrite), so there is no fixed point to iterate")
+    sweep = Any[agen_fp_slot(x, trip, kk, true) for x in Any[pre_rest; agen_fp_stmts(then_i)]]
+    any(s -> agen_fp_uses(s, bstack), sweep) && error("agen_adjoint_fixedpoint: the sweeps of the loop over `$kk` still read the branch stack")
+    outside = Any[]
+    for (j, st) in enumerate(stmts)
+        (j == fpos[1] || j == rpos[1]) && continue
+        agen_fp_uses(st, kk) && !(st isa Expr && st.head === :for && agen_fp_header(st) !== nothing && agen_fp_header(st).var === kk) &&
+            error("agen_adjoint_fixedpoint: the counter `$kk` of the loop is used outside the loop in the generated adjoint")
+    end
+    fwd_flag = Expr(:call, det.cmp, rn, tolx)
+    kname = call.args[1]
+    msg = agen_fp_unsettled_message(kname); msgcut = agen_fp_cutoff_message(kname)
+    new = agen_fp_stmts(quote
+        fp_info[2] = 0.0
+        fp_info[3] = 0.0
+        fp_info[4] = 0.0
+        fp_info[5] = 0.0
+        __fp_cut = 0
+        __fp_go = 0
+        if $hi >= 1
+            if $fwd_flag
+                __fp_cut = 1
+                fp_info[4] = 1.0
+                fp_info[5] = 2.0
+            end
+        end
+        if __fp_cut == 0
+            __fp_cn = 0.0
+            __fp_c0 = 0.0
+            __fp_sw = 0
+            if __fp_last > 0
+                __fp_go = 1
+            end
+            for __fp_s = 1:$hi
+                if __fp_go == 1
+                    __fp_cn = 0.0
+                    $(sweep...)
+                    if __fp_sw == 0
+                        __fp_c0 = __fp_cn
+                    end
+                    __fp_sw = __fp_sw + 1
+                    if __fp_cn <= $tolx * __fp_c0
+                        __fp_go = 0
+                    end
+                end
+            end
+            fp_info[2] = __fp_sw
+            if __fp_c0 > 0.0
+                fp_info[3] = __fp_cn / __fp_c0
+            end
+            fp_info[5] = __fp_go
+        end
+        fp_info[1] = __fp_last
+        if __fp_cut == 1
+            error($msgcut)
+        end
+        if __fp_go == 1
+            error($msg)
+        end
+    end)
+    out = Any[]
+    for (j, st) in enumerate(stmts)
+        if j == fpos[1]
+            push!(out, :(__fp_last = 0)); push!(out, newf)
+        elseif j == rpos[1]
+            append!(out, new)
+        else
+            push!(out, agen_fp_slot(st, trip, kk, false))
+        end
+    end
+    args2 = Any[a for a in call.args if a !== bstack]
+    adj2 = Expr(:function, Expr(:call, args2..., :fp_info), Expr(:block, out...))
+    ib = Any[s for s in init.args[2].args if !(s isa LineNumberNode)]
+    ret = ib[end]
+    (ret isa Expr && ret.head === :return) || error("agen_adjoint_fixedpoint: initstacks does not end in a return")
+    items = ret.args[1] isa Expr && ret.args[1].head === :tuple ? Any[ret.args[1].args...] : Any[ret.args[1]]
+    body_i = Any[]
+    for st in ib[1:end-1]
+        (st isa Expr && st.head === :(=) && st.args[1] === bstack) && continue
+        push!(body_i, agen_fp_slot(st, trip, kk, false))
+    end
+    init2 = Expr(:function, init.args[1], Expr(:block, body_i..., :(fp_info = Vector{Float64}(undef, 5)), Expr(:return, Expr(:tuple, Any[i for i in items if i !== bstack]..., :fp_info))))
+    return (adjoint = adj2, initstacks = init2)
+end
+
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
                         keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
@@ -19288,7 +19485,8 @@ function agen_fp_features(det, body::Vector)
         length(red) == n0 && break
     end
     hit = Ref(false); agen_fp_divides_by!(th, red, hit)
-    return (depth = depth[], inner_if = inner_if[], div_by_reduction = hit[], literal_tol = det.tol isa Number, calls = calls)
+    used = Set{Symbol}(); agen_split_syms!(th, used)
+    return (depth = depth[], inner_if = inner_if[], div_by_reduction = hit[], literal_tol = det.tol isa Number, calls = calls, cap_in_body = det.hi isa Symbol && det.hi in used)
 end
 
 # Why the fixed-point path does not apply to a detected loop: the reasons, empty when it applies. The path is a whitelist: a loop is accepted only when every
@@ -19301,30 +19499,34 @@ function agen_fp_refusal(det, body::Vector)
     f.depth > 2 && push!(why, "the body nests loops deeper than 2")
     f.inner_if && push!(why, "the body holds an if")
     f.literal_tol && push!(why, "the tolerance is a literal")
+    f.cap_in_body && push!(why, "the body reads the loop's cap `$(det.hi)` (the one-slot tape sizes every stack by the cap, an inner bound that uses it would be sized wrongly)")
     bad = sort(collect(setdiff(f.calls, agen_fp_validated_calls())))
     isempty(bad) || push!(why, "the body calls " * join(string.(bad), ", ") * ", which have no validated case")
     return why
 end
 
-# The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration: the reverse reads the last active
-# iteration's slice of the full (cap-sized) tape, sweeps repeated until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many
-# sweeps as the loop has iterations. keep_push_pop = false, no fusion. Returns (initstacks, adjoint, loop); the last stack is `fp_info`, five Float64:
-# [1] last active iteration, [2] sweeps run, [3] final over first squared norm, [4] 1 when the forward loop stopped on its cap, [5] 1 when the sweeps did.
+# The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration. `tape = :one_slot` (the default):
+# the forward loop keeps one slot of tape, the last active iteration's, and the sweeps repeat the reverse of that iteration until the state adjoint, in squared
+# norm, is below `tol` times its first value (`tol` is the loop's own), at most as many sweeps as the loop has iterations. A loop that stopped on its cap
+# raises (there is no fixed point). `tape = :full` keeps the cap-sized tape and the unrolled reverse for a cut-off loop (the reference the one-slot text is tested against).
+# keep_push_pop = false, no fusion. Returns (initstacks, adjoint, primal_pruned, loop); the last stack is `fp_info`, five Float64:
+# [1] iterations that ran (:full: the last active iteration), [2] sweeps run, [3] final over first squared norm, [4] 1 when the forward loop stopped on its cap,
+# [5] status: 0 ok, 1 the sweeps did not settle, 2 the forward loop stopped on its cap (:full: 1 for the sweeps, 0 otherwise).
 function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
-                                   dependents::Union{Vector{Symbol},Nothing}=nothing)
+                                   dependents::Union{Vector{Symbol},Nothing}=nothing, tape::Symbol=:one_slot)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     found = agen_fp_detect(expr, kernel.sig.kinds)
     length(found) == 1 || error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
-    w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
+    w = tape === :one_slot ? agen_fp_rewrite_one_slot(r.adjoint, r.initstacks, found[1]) : agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
     return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1])
 end
 
-# The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (the
-# state is not at a fixed point) or the sweeps did (the reverse of the iteration does not contract). Returns the sweeps run.
+# The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (status 2, the
+# state is not at a fixed point) or the sweeps did (status 1, the reverse of the iteration does not contract). Returns the sweeps run.
 function agen_adjoint_fixedpoint_check(info::AbstractVector)
     length(info) == 5 || error("agen_adjoint_fixedpoint_check: fp_info has $(length(info)) entries, expected 5")
-    info[4] == 0 || error("agen_adjoint_fixedpoint_check: the forward loop stopped on its cap of $(Int(info[1])) iterations, the state is not at a fixed point and the fixed-point adjoint does not apply")
+    (info[4] == 0 && info[5] != 2) || error("agen_adjoint_fixedpoint_check: the forward loop stopped on its cap of $(Int(info[1])) iterations, the state is not at a fixed point and the fixed-point adjoint does not apply")
     info[5] == 0 || error("agen_adjoint_fixedpoint_check: $(Int(info[2])) reverse sweeps did not settle the state adjoint (its squared norm is still $(info[3]) of the first sweep's), the iteration does not contract")
     return Int(info[2])
 end
