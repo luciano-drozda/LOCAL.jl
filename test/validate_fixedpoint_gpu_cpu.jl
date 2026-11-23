@@ -15,10 +15,15 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
     for (ename, mk) in (("cuda", scc_env), ("jacc", spj_env))
         env = mk()
-        for (dir, name, pins, floats, gs, prep) in fpv_cases()
+        cases = Any[(dir, name, pins, floats, gs, prep, nothing) for (dir, name, pins, floats, gs, prep) in fpv_cases()]
+        for (body, nest) in fpv_shape_cases()
+            sp = fpv_shape_params(body, nest)
+            push!(cases, ("", "fps_$(body)_$(nest)", sp.pins, sp.floats, sp.gs, sp.prep, sp.primal))
+        end
+        for (dir, name, pins, floats, gs, prep, shape) in cases
             isempty(only) || name in only || continue
             for regime in (:converged, :zero, :cap, :nocap)
-                r = try fpv_device(dir, name, pins, floats, gs, prep, env, regime)
+                r = try shape === nothing ? fpv_device(dir, name, pins, floats, gs, prep, env, regime) : fpv_device_expr(shape, pins, floats, gs, prep, env, regime)
                     catch e
                         # the stand-in JACC has no block reduction: a loop long enough to launch one cannot run here (the V100 job covers it)
                         msg = first(split(sprint(showerror, e), "\n"))
@@ -31,7 +36,7 @@ function validate_fixedpoint_gpu_cpu(; verbose = true, only = String[], sabotage
                 verbose && println(rpad(name, 22), " ", ename, " ", regime, ": err=", round(r.err, sigdigits = 3), " info=", r.dev_info)
                 if regime === :cap
                     say(r.raised && r.devraised && occursin("stopped on its cap", r.devmsg) && r.err <= 1e-12, "$ename $name cap: CPU raised ($(r.raised)), device raised ($(r.devraised): $(first(r.devmsg, 80))), err=$(r.err)")
-                    say(r.dev_info[4] == 1 && r.dev_info[5] == 2, "$ename $name cap: device fp_info $(r.dev_info)")
+                    say(r.dev_info[4] >= 1 && r.dev_info[5] == 2, "$ename $name cap: device fp_info $(r.dev_info)")
                 else
                     say(r.err <= 1e-12 && !r.devraised && !r.raised, "$ename $name $regime: device vs CPU fixed-point adjoint err=$(r.err) (raised: $(r.raised)/$(r.devraised) $(r.devmsg))")
                 end

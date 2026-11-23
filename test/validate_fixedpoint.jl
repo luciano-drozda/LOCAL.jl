@@ -81,7 +81,7 @@ function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool =
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
-    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0)))
+    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0), haskey(int_args, :maxq) ? Dict(:maxq => 0) : Dict{Symbol,Int}()))
     for (k, v) in floats2; vals[k] = v; end
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
@@ -139,7 +139,12 @@ end
 # the same draw run by the device code of the fixed-point adjoint (`env` of validate_adjoint_split_gpu.jl): the worst relative error of every shadow and
 # returned scalar against the CPU fixed-point adjoint, and the fp_info of both
 function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :converged)
-    primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")); kernel = STADE.parse_kernel(primal)
+    return fpv_device_expr(STADE.io_read_corpus_entry(joinpath(@__DIR__, dir, name * ".jl")), pins, floats, gs, prep, env, regime)
+end
+
+# the same for a kernel given as an Expr (a generated shape of fp_shapes.jl)
+function fpv_device_expr(primal, pins, floats, gs, prep, env, regime::Symbol = :converged)
+    kernel = STADE.parse_kernel(primal)
     pins2 = copy(pins)
     regime === :cap && (pins2[:maxit] = 3)
     regime === :unsettled && (pins2[:maxit] = 14)
@@ -147,7 +152,7 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
-    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0)))
+    regime === :nocap && (int_args = merge(int_args, Dict(:maxit => 0), haskey(int_args, :maxq) ? Dict(:maxq => 0) : Dict{Symbol,Int}()))
     for (k, v) in floats; vals[k] = v; end
     regime === :unsettled && for (k, v) in Dict(:a => 1.0, :x0 => 0.0, :omega => 0.1, :tol => 1e-3); vals[k] = v; end
     prep === nothing || prep(vals)
@@ -343,6 +348,16 @@ fpv_shape_cases() = Any[(:scalar, :none), (:scalar, :loop1), (:scalar, :loop2), 
                         (:scalar, :two_in_body), (:scalar, :two_loops), (:scalar, :literal), (:scalar, :two_caps), (:scalar, :tdep_first), (:scalar, :pre_nl),
                         (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal), (:array, :two_caps), (:array, :tdep_first), (:array, :read_before)]
 
+# (pins, floats, array start size, preparation or nothing) of a generated shape
+function fpv_shape_params(body, nest)
+    primal = fps_kernel(body, nest)
+    args = Set(STADE.parse_kernel(primal).sig.args)
+    pins = Dict(k => v for (k, v) in (body === :scalar ? Dict(:maxit => 500, :maxq => 500, :nt => 3, :ns => 2) : Dict(:n => 6, :maxit => 800, :maxq => 800, :nt => 3, :ns => 2)) if k in args)
+    floats = Dict(k => v for (k, v) in (body === :scalar ? Dict(:c => 0.6, :tol => 1e-30) : Dict(:c => 0.3, :tol => 1e-30)) if k in args)
+    prep = :pa in args ? (v -> (v[:pa] .= [iseven(i) ? 0.2 : 0.9 for i in eachindex(v[:pa])])) : nothing
+    return (primal = primal, pins = pins, floats = floats, gs = body === :scalar ? 4 : 8, prep = prep)
+end
+
 # the four regimes of one case; `run(regime)` is fpv_run or fpv_run_expr bound to the case
 function fpv_case_checks(say, name, run, verbose)
     r = run(:converged)
@@ -380,12 +395,8 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     for (body, nest) in fpv_shape_cases()
         name = "fps_$(body)_$(nest)"
         isempty(only) || name in only || continue
-        primal = fps_kernel(body, nest)
-        args = Set(STADE.parse_kernel(primal).sig.args)
-        pins = Dict(k => v for (k, v) in (body === :scalar ? Dict(:maxit => 500, :maxq => 500, :nt => 3, :ns => 2) : Dict(:n => 6, :maxit => 800, :maxq => 800, :nt => 3, :ns => 2)) if k in args)
-        floats = Dict(k => v for (k, v) in (body === :scalar ? Dict(:c => 0.6, :tol => 1e-30) : Dict(:c => 0.3, :tol => 1e-30)) if k in args)
-        prep = v -> (v[:pa] .= [iseven(i) ? 0.2 : 0.9 for i in eachindex(v[:pa])])
-        fpv_case_checks(say, name, reg -> fpv_run_expr(primal, pins, floats, body === :scalar ? 4 : 8, :pa in args ? prep : nothing, reg; fd = reg === :converged), verbose)
+        sp = fpv_shape_params(body, nest); primal = sp.primal
+        fpv_case_checks(say, name, reg -> fpv_run_expr(primal, sp.pins, sp.floats, sp.gs, sp.prep, reg; fd = reg === :converged), verbose)
     end
     u = fpv_unsettled()
     say(occursin("did not settle", u.msg), "fp_slow_linear: a converged loop whose reverse cannot settle raises (got: $(first(u.msg, 100)))")
