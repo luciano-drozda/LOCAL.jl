@@ -69,7 +69,7 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
-    full = STADE.stade_adjoint_(primal, nothing, nothing, false, false, true, false)   # the unrolled reference: stade_adjoint itself takes the fixed-point path
+    full = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)   # the unrolled reference: stade_adjoint itself takes the fixed-point path
     fp = STADE.agen_adjoint_fixedpoint(primal)
     fi = STADE.val_compile(full.initstacks); fg = STADE.val_compile(full.adjoint)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
@@ -193,6 +193,17 @@ function fpv_dispatch_checks(say)
     with_i = STADE.agen_adjoint_fixedpoint(cos_; independents = [:c]); without_i = STADE.agen_adjoint_fixedpoint(cos_)
     say(string(with_i.adjoint) != string(without_i.adjoint), "the independents change the fixed-point adjoint of fp_scalar_cos")
     say(string(ri.adjoint) == string(with_i.adjoint), "stade_adjoint passes independents = [:c] to the fixed-point adjoint")
+    # the validators check the unrolled adjoint and the HVP shares its stacks: a fixed-point adjoint here would not call
+    mktempdir() do tmp
+        f = joinpath(tmp, "fp_scalar_cos.jl"); cp(joinpath(root, "fp-corpus", "fp_scalar_cos.jl"), f); yp = joinpath(tmp, "fp_scalar_cos.yaml")
+        fpv_logged(() -> STADE.stade_generate_baseline_file(f; yaml_path = yp, int_lo = 3, int_hi = 5))
+        rd_ = fpv_logged(() -> STADE.stade_validate_dotprod_file(f; yaml_path = yp, keep_push_pop = false))
+        say(rd_.value.ok && occursin("this validator checks the unrolled adjoint", rd_.log), "stade_validate_dotprod_file: the exact identity holds for the unrolled adjoint and the log says which adjoint it checks (ok = $(rd_.value.ok))")
+        ra = fpv_logged(() -> STADE.stade_validate_from_baseline(:adjoint, f, yp; keep_push_pop = false))
+        say(ra.value.ok && occursin("this validator checks the unrolled adjoint", ra.log), "stade_validate_from_baseline(:adjoint) on a counted-guard loop (ok = $(ra.value.ok))")
+        rh = try fpv_logged(() -> STADE.stade_validate_from_baseline(:hvp, f, yp; keep_push_pop = false)).value.ok catch e; false end
+        say(rh, "stade_validate_from_baseline(:hvp) on a counted-guard loop")
+    end
     # the file entry goes through the same choice
     mktempdir() do tmp
         for (kpp, want) in ((false, true), (true, false))
@@ -293,6 +304,8 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("the acceptance is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", "        nothing; \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", ["fp_scalar_cos"]),
             ("a refusal is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: \$why\"\n", "        nothing\n", ["fp_scalar_cos"]),
             ("the independents are dropped", "agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)", "agen_adjoint_fixedpoint(expr)", ["fp_scalar_cos"]),
+            ("the HVP validator takes the fixed-point adjoint", "        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", "        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", ["fp_scalar_cos"]),
+            ("a validator says nothing about the adjoint it checks", "    @info \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", "    nothing; \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", ["fp_scalar_cos"]),
             ("the first sweep's norm is not kept", "                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos", "fp_array_tanh"]),
         ]
         mktempdir() do tmp

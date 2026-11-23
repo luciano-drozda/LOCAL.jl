@@ -114,8 +114,8 @@ function ir_check(nm, path, ind, dep, lo, yp, say)
     relerr(a, b) = sqrt(sum(abs2, a .- b)) / max(sqrt(sum(abs2, b)), 1e-12)
     for (kp, fz) in ((true, false), (false, false), (false, true))
         tag = "$nm keep_push_pop=$kp fuse=$fz int_lo=$lo"
-        g = STADE.stade_adjoint(primal; independents = ind, dependents = dep, keep_push_pop = kp, fuse_ii_loops = fz)
-        gd = STADE.stade_adjoint(primal; keep_push_pop = kp, fuse_ii_loops = fz)
+        g = STADE.agen_adjoint_unrolled(primal; independents = ind, dependents = dep, keep_push_pop = kp, fuse_ii_loops = fz)
+        gd = STADE.agen_adjoint_unrolled(primal; keep_push_pop = kp, fuse_ii_loops = fz)
         sn(o) = kp ? Symbol[] : Symbol[a for a in o.initstacks.args[1].args[2:end]]
         # both codes carry the same function names, so the default one is compiled and run first and the restricted one defined afterwards
         xbd = STADE.val_call_adjoint(STADE.val_compile(gd.adjoint), STADE.val_compile(gd.initstacks), kernel, ia, deepcopy(base.values), seed; stack_arg_names = sn(gd))
@@ -259,7 +259,7 @@ end
 function ir_nopush(say)
     primal = STADE.io_read_corpus_entry(joinpath(@__DIR__, "inactive-read-corpus", "ur_norm.jl"))
     for kp in (true, false), fz in (false, true), mode in (:adjoint, :hvp)
-        g = mode == :adjoint ? STADE.stade_adjoint(primal; independents = [:x, :r], keep_push_pop = kp, fuse_ii_loops = fz).adjoint :
+        g = mode == :adjoint ? STADE.agen_adjoint_unrolled(primal; independents = [:x, :r], keep_push_pop = kp, fuse_ii_loops = fz).adjoint :
                                STADE.stade_hvp(primal; independents = [:x, :r], keep_push_pop = kp, fuse_ii_loops = fz).hvp
         src = string(g)
         n = kp ? count("push!(rn_stack", src) : count(r"rn_stack\[[^\]]*\]\s*=[^=]", src)
