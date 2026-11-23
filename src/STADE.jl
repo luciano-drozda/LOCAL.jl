@@ -7399,8 +7399,39 @@ end
 # ingest drops it instead of refusing the whole initstacks.
 cgen_is_sizehint(s) = s isa Expr && s.head == :call && !isempty(s.args) && s.args[1] == :sizehint!
 
+# `if cond; error("...") end` is the raise of a fixed-point adjoint whose sweeps did not settle (agen_fp_rewrite). The ingest drops it and the stage puts the
+# raise back on the host function (cgen_fp_raise_append).
+cgen_is_fp_raise(s) = s isa Expr && s.head === :if && length(s.args) == 2 && (b = agen_fp_stmts(s.args[2]); length(b) == 1 && b[1] isa Expr && b[1].head === :call &&
+                      b[1].args[1] === :error && length(b[1].args) == 2 && b[1].args[2] isa String)
+
+# The message of the raise of a fixed-point adjoint whose sweeps did not settle: the CPU adjoint (agen_fp_rewrite) and the device host function (cgen_fp_raise_append) share it.
+agen_fp_unsettled_message(name) = "$(name): the reverse sweeps did not settle the state adjoint, the iteration does not contract"
+
+# The raise for a device adjoint, as the last host statement before the return: one scalar read of `fp_info` inside the backend's allowscalar block
+# (about 12 us on a V100). The ingest dropped the CPU form of it. The JACC exit wait leaves the return inside a trailing block (after its synchronize): the
+# raise goes in front of the return there. A host function without an `fp_info` parameter, or without a trailing return, is returned unchanged.
+function cgen_fp_raise_insert(stmts::Vector, chk)
+    isempty(stmts) && return nothing
+    last = stmts[end]
+    last isa Expr && last.head === :return && return Any[stmts[1:end-1]..., chk, last]
+    if last isa Expr && last.head === :block
+        inner = cgen_fp_raise_insert(Any[s for s in last.args if !(s isa LineNumberNode)], chk)
+        inner === nothing && return nothing
+        return Any[stmts[1:end-1]..., Expr(:block, inner...)]
+    end
+    return nothing
+end
+
+function cgen_fp_raise_append(host::Expr, allowscalar)
+    (host.head === :function && :fp_info in host.args[1].args[2:end]) || return host
+    chk = Expr(:macrocall, allowscalar, nothing, Expr(:block, :(fp_info[5] == 0.0 || error($(agen_fp_unsettled_message(host.args[1].args[1]))))))
+    out = cgen_fp_raise_insert(Any[s for s in host.args[2].args if !(s isa LineNumberNode)], chk)
+    out === nothing && return host
+    return Expr(:function, host.args[1], Expr(:block, out...))
+end
+
 function cgen_parse_generated_statements(stmts::Vector)
-    return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s)]
+    return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s) && !cgen_is_fp_raise(s)]
 end
 
 function cgen_parse_generated_statement(stmt)
@@ -13116,7 +13147,7 @@ function cgen_split_half(expr::Expr)
     name = string(expr.args[1].args[1])
     endswith(name, "_b_fwd") && return :fwd
     endswith(name, "_b_bwd") && return :bwd
-    # a stade_adjoint_fixedpoint adjoint writes its `fp_info` and nothing in the function reads it: the stage must keep those stores
+    # a agen_adjoint_fixedpoint adjoint writes its `fp_info` and nothing in the function reads it: the stage must keep those stores
     :fp_info in expr.args[1].args[2:end] && return :fixedpoint
     return nothing
 end
@@ -18989,7 +19020,7 @@ end
 # A counted loop `for kk = 1:maxit` whose whole body is `if rn > tol ... end` is how a solver stops on a residual without a `while`. Its adjoint is
 # one reverse sweep per forward iteration. At the fixed point every iteration is the same map, so the reverse needs one iteration's tape (the last
 # active one) and repeats the sweep until the state adjoint stops changing. agen_fp_detect finds the loop in the source, agen_fp_rewrite replaces
-# the reversed loop in the generated adjoint, stade_adjoint_fixedpoint is the entry.
+# the reversed loop in the generated adjoint, agen_adjoint_fixedpoint is the entry.
 
 agen_fp_stmts(b) = b isa Expr && b.head === :block ? Any[s for s in b.args if !(s isa LineNumberNode)] : Any[b]
 
@@ -19097,73 +19128,89 @@ function agen_fp_rewrite(adj::Expr, init::Expr, det)
     call = adj.args[1]
     stmts = Any[s for s in adj.args[2].args if !(s isa LineNumberNode)]
     pos = findall(st -> (h = agen_fp_header(st); h !== nothing && h.step == -1 && h.var === det.var && h.hi == det.hi && h.lo == 1), stmts)
-    length(pos) == 1 || error("stade_adjoint_fixedpoint: the reversed loop over `$(det.var)` was found $(length(pos)) times in the generated adjoint")
+    length(pos) == 1 || error("agen_adjoint_fixedpoint: the reversed loop over `$(det.var)` was found $(length(pos)) times in the generated adjoint")
     rev = stmts[pos[1]]
     rbody = agen_fp_stmts(rev.args[2])
     lastst = rbody[end]
-    (lastst isa Expr && lastst.head === :if && length(lastst.args) == 2) || error("stade_adjoint_fixedpoint: the reversed loop over `$(det.var)` does not end in the branch of the guard")
+    (lastst isa Expr && lastst.head === :if && length(lastst.args) == 2) || error("agen_adjoint_fixedpoint: the reversed loop over `$(det.var)` does not end in the branch of the guard")
     pre = rbody[1:end-1]; then = agen_fp_stmts(lastst.args[2]); cond = lastst.args[1]
     argset = Set{Symbol}(a isa Symbol ? a : a.args[1] for a in call.args[2:end])
     syms = Set{Symbol}(); agen_split_syms!(adj.args[2], syms)
     arrays_b = Symbol[agen_shadow(a) for a in det.arrays if agen_shadow(a) in argset]
     scalars_b = Symbol[agen_shadow(v) for v in det.scalars if agen_shadow(v) in syms]
     names = Set{Symbol}(vcat(arrays_b, scalars_b))
-    isempty(names) && error("stade_adjoint_fixedpoint: no state of the loop over `$(det.var)` is active, there is no state adjoint to iterate")
+    isempty(names) && error("agen_adjoint_fixedpoint: no state of the loop over `$(det.var)` is active, there is no state adjoint to iterate")
     (then_i, count) = agen_fp_instrument(Expr(:block, then...), names, :__fp_cn)
-    count > 0 || error("stade_adjoint_fixedpoint: the reverse of the loop over `$(det.var)` never consumes a state adjoint (the loop accumulates and does not overwrite), so there is no fixed point to iterate")
+    count > 0 || error("agen_adjoint_fixedpoint: the reverse of the loop over `$(det.var)` never consumes a state adjoint (the loop accumulates and does not overwrite), so there is no fixed point to iterate")
     then_s = agen_fp_stmts(then_i)
     sub = Dict{Symbol,Any}(det.var => :__fp_k)
     scan_pre = Any[agen_substitute_vars(x, sub) for x in agen_fp_slice(pre, cond)]
     cond_k = agen_substitute_vars(cond, sub)
     kk = det.var; hi = det.hi; tolx = det.tol; rn = det.rn
     fwd_flag = Expr(:call, det.cmp, rn, tolx)
+    kname = call.args[1]
+    msg = agen_fp_unsettled_message(kname)
+    # a loop that ran to its cap is not at a fixed point: its reverse is the original one, every iteration. A converged loop gets the sweeps.
     new = agen_fp_stmts(quote
+        fp_info[1] = 0.0
+        fp_info[2] = 0.0
+        fp_info[3] = 0.0
         fp_info[4] = 0.0
+        fp_info[5] = 0.0
+        __fp_cut = 0
+        __fp_go = 0
         if $fwd_flag
+            __fp_cut = 1
             fp_info[4] = 1.0
         end
-        __fp_last = 0
-        for __fp_k = 1:$hi
-            $(scan_pre...)
-            if $cond_k
-                __fp_last = __fp_k
-            end
-        end
-        __fp_cn = 0.0
-        __fp_c0 = 0.0
-        __fp_sw = 0
-        __fp_go = 1
-        if __fp_last == 0
-            __fp_go = 0
-        end
-        for __fp_s = 1:$hi
-            if __fp_go == 1
-                __fp_cn = 0.0
-                $kk = __fp_last
-                $(pre...)
-                $(then_s...)
-                if __fp_sw == 0
-                    __fp_c0 = __fp_cn
-                end
-                __fp_sw = __fp_sw + 1
-                if __fp_cn <= $tolx * __fp_c0
-                    __fp_go = 0
+        if __fp_cut == 0
+            __fp_last = 0
+            for __fp_k = 1:$hi
+                $(scan_pre...)
+                if $cond_k
+                    __fp_last = __fp_k
                 end
             end
+            __fp_cn = 0.0
+            __fp_c0 = 0.0
+            __fp_sw = 0
+            __fp_go = 1
+            if __fp_last == 0
+                __fp_go = 0
+            end
+            for __fp_s = 1:$hi
+                if __fp_go == 1
+                    __fp_cn = 0.0
+                    $kk = __fp_last
+                    $(pre...)
+                    $(then_s...)
+                    if __fp_sw == 0
+                        __fp_c0 = __fp_cn
+                    end
+                    __fp_sw = __fp_sw + 1
+                    if __fp_cn <= $tolx * __fp_c0
+                        __fp_go = 0
+                    end
+                end
+            end
+            fp_info[1] = __fp_last
+            fp_info[2] = __fp_sw
+            if __fp_c0 > 0.0
+                fp_info[3] = __fp_cn / __fp_c0
+            end
+            fp_info[5] = __fp_go
+        else
+            $rev
         end
-        fp_info[1] = __fp_last
-        fp_info[2] = __fp_sw
-        fp_info[3] = 0.0
-        if __fp_c0 > 0.0
-            fp_info[3] = __fp_cn / __fp_c0
+        if __fp_go == 1
+            error($msg)
         end
-        fp_info[5] = __fp_go
     end)
     out = Any[stmts[1:pos[1]-1]; new; stmts[pos[1]+1:end]]
     adj2 = Expr(:function, Expr(:call, call.args..., :fp_info), Expr(:block, out...))
     ib = Any[s for s in init.args[2].args if !(s isa LineNumberNode)]
     ret = ib[end]
-    (ret isa Expr && ret.head === :return) || error("stade_adjoint_fixedpoint: initstacks does not end in a return")
+    (ret isa Expr && ret.head === :return) || error("agen_adjoint_fixedpoint: initstacks does not end in a return")
     items = ret.args[1] isa Expr && ret.args[1].head === :tuple ? Any[ret.args[1].args...] : Any[ret.args[1]]
     init2 = Expr(:function, init.args[1], Expr(:block, ib[1:end-1]..., :(fp_info = Vector{Float64}(undef, 5)), Expr(:return, Expr(:tuple, items..., :fp_info))))
     return (adjoint = adj2, initstacks = init2)
@@ -19184,26 +19231,92 @@ function stade_adjoint_split(expr::Expr; independents::Union{Vector{Symbol},Noth
     return stade_adjoint_(expr, independents, dependents, false, false, true, true)
 end
 
+# What the fixed-point path is validated on. A function name outside this set has no validated case.
+agen_fp_validated_calls() = Set{Symbol}([:div, :mod, :sin, :cos, :tanh])
+
+# One walk of the then-block of a counted-guard loop: the deepest loop nesting, whether an `if` sits inside, the functions called, and the scalars that hold a
+# reduction (accumulated in a nested loop, or assigned from such a scalar). `red` grows across calls until it stops changing.
+function agen_fp_scan!(e, d::Int, inloop::Bool, red::Set{Symbol}, calls::Set{Symbol}, depth::Ref{Int}, inner_if::Ref{Bool})
+    e isa Expr || return nothing
+    if e.head === :for
+        depth[] = max(depth[], d + 1)
+        agen_fp_scan!(e.args[2], d + 1, true, red, calls, depth, inner_if)
+        return nothing
+    end
+    e.head === :if && (inner_if[] = true)
+    if e.head === :(=) && e.args[1] isa Symbol
+        rsyms = Set{Symbol}(); agen_split_syms!(e.args[2], rsyms)
+        rhs = e.args[2]
+        (inloop && rhs isa Expr && rhs.head === :call && rhs.args[1] === :+ && e.args[1] in rsyms) && push!(red, e.args[1])
+        isempty(intersect(rsyms, red)) || push!(red, e.args[1])
+    end
+    e.head === :call && e.args[1] isa Symbol && !(e.args[1] in (:+, :-, :*, :/, :>, :<, :>=, :<=, :(==), :^, :ref)) && push!(calls, e.args[1])
+    for a in e.args
+        agen_fp_scan!(a, d, inloop, red, calls, depth, inner_if)
+    end
+    return nothing
+end
+
+function agen_fp_divides_by!(e, red::Set{Symbol}, hit::Ref{Bool})
+    e isa Expr || return nothing
+    if e.head === :call && e.args[1] === :/ && length(e.args) == 3
+        s = Set{Symbol}(); agen_split_syms!(e.args[3], s)
+        isempty(intersect(s, red)) || (hit[] = true)
+    end
+    for a in e.args
+        agen_fp_divides_by!(a, red, hit)
+    end
+    return nothing
+end
+
+# The features of the body of one detected loop (`det` from agen_fp_detect, `body` the top-level statements of the kernel).
+function agen_fp_features(det, body::Vector)
+    th = agen_fp_stmts(body[det.index].args[2])[1].args[2]
+    red = Set{Symbol}(); calls = Set{Symbol}(); depth = Ref(0); inner_if = Ref(false)
+    for _ in 1:16
+        n0 = length(red)
+        agen_fp_scan!(th, 0, false, red, calls, depth, inner_if)
+        length(red) == n0 && break
+    end
+    hit = Ref(false); agen_fp_divides_by!(th, red, hit)
+    return (depth = depth[], inner_if = inner_if[], div_by_reduction = hit[], literal_tol = det.tol isa Number, calls = calls)
+end
+
+# Why the fixed-point path does not apply to a detected loop: the reasons, empty when it applies. The path is a whitelist: a loop is accepted only when every
+# feature it shows is one a validated corpus kernel shows (Newton and cosine on a scalar, Jacobi and Gauss-Seidel and tanh sweeps on arrays, a mixed state,
+# a 3-level multigrid). A feature none of them shows is a reason, so a new shape stays on the unrolled adjoint until a corpus kernel validates it.
+function agen_fp_refusal(det, body::Vector)
+    f = agen_fp_features(det, body)
+    why = String[]
+    f.div_by_reduction && push!(why, "the body divides by a value computed from a reduction (a Krylov or normalised iteration has no validated case)")
+    f.depth > 2 && push!(why, "the body nests loops deeper than 2")
+    f.inner_if && push!(why, "the body holds an if")
+    f.literal_tol && push!(why, "the tolerance is a literal")
+    bad = sort(collect(setdiff(f.calls, agen_fp_validated_calls())))
+    isempty(bad) || push!(why, "the body calls " * join(string.(bad), ", ") * ", which have no validated case")
+    return why
+end
+
 # The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration: the reverse reads the last active
 # iteration's slice of the full (cap-sized) tape, sweeps repeated until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many
 # sweeps as the loop has iterations. keep_push_pop = false, no fusion. Returns (initstacks, adjoint, loop); the last stack is `fp_info`, five Float64:
 # [1] last active iteration, [2] sweeps run, [3] final over first squared norm, [4] 1 when the forward loop stopped on its cap, [5] 1 when the sweeps did.
-function stade_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
+function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                                    dependents::Union{Vector{Symbol},Nothing}=nothing)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     found = agen_fp_detect(expr, kernel.sig.kinds)
-    length(found) == 1 || error("stade_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
+    length(found) == 1 || error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
     w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
     return (initstacks = w.initstacks, adjoint = w.adjoint, loop = found[1])
 end
 
-# The host-side verdict on the `fp_info` of one run of a stade_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (the
+# The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (the
 # state is not at a fixed point) or the sweeps did (the reverse of the iteration does not contract). Returns the sweeps run.
-function stade_adjoint_fixedpoint_check(info::AbstractVector)
-    length(info) == 5 || error("stade_adjoint_fixedpoint_check: fp_info has $(length(info)) entries, expected 5")
-    info[4] == 0 || error("stade_adjoint_fixedpoint_check: the forward loop stopped on its cap of $(Int(info[1])) iterations, the state is not at a fixed point and the fixed-point adjoint does not apply")
-    info[5] == 0 || error("stade_adjoint_fixedpoint_check: $(Int(info[2])) reverse sweeps did not settle the state adjoint (its squared norm is still $(info[3]) of the first sweep's), the iteration does not contract")
+function agen_adjoint_fixedpoint_check(info::AbstractVector)
+    length(info) == 5 || error("agen_adjoint_fixedpoint_check: fp_info has $(length(info)) entries, expected 5")
+    info[4] == 0 || error("agen_adjoint_fixedpoint_check: the forward loop stopped on its cap of $(Int(info[1])) iterations, the state is not at a fixed point and the fixed-point adjoint does not apply")
+    info[5] == 0 || error("agen_adjoint_fixedpoint_check: $(Int(info[2])) reverse sweeps did not settle the state adjoint (its squared norm is still $(info[3]) of the first sweep's), the iteration does not contract")
     return Int(info[2])
 end
 
@@ -19300,11 +19413,45 @@ function agen_host_stack_note(kernel, generated_fn)
            "If the bound keeps its value from one pass to the next, assigning it once before the loops removes them; otherwise writing those loops with a constant bound and an `if X <= bound` mask does (README)."
 end
 
+# The adjoint of `expr` with the fixed-point reverse of its counted-guard loop (agen_adjoint_fixedpoint), or `nothing` with one @info line that gives the reason.
+# It applies only to a kernel with exactly one such loop, keep_push_pop = false, no fusion, primal_outputs = true and a loop the agen_fp_refusal rule accepts.
+# A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
+function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool)
+    kernel = parse_kernel(expr)
+    found = agen_fp_detect(expr, kernel.sig.kinds)
+    isempty(found) && return nothing
+    why = nothing
+    if keep_push_pop
+        why = "keep_push_pop = true (the fixed-point reverse needs keep_push_pop = false)"
+    elseif fuse_ii_loops
+        why = "fuse_ii_loops = true (the fixed-point reverse needs no fusion)"
+    elseif !primal_outputs
+        why = "primal_outputs = false"
+    elseif length(found) != 1
+        why = "the kernel has $(length(found)) counted-guard loops, the path needs exactly one"
+    else
+        r = agen_fp_refusal(found[1], agen_fp_stmts(expr.args[2]))
+        isempty(r) || (why = join(r, "; "))
+    end
+    if why !== nothing
+        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
+        return nothing
+    end
+    try
+        return agen_adjoint_fixedpoint(expr)
+    catch e
+        (e isa ErrorException && startswith(e.msg, "agen_adjoint_fixedpoint:")) || rethrow()
+        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
+        return nothing
+    end
+end
+
 function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
-    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
+    generated = agen_fp_adjoint_or_nothing(inlined[entry_name], keep_push_pop, fuse_ii_loops, primal_outputs)
+    generated === nothing && (generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs))
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
     keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
@@ -19805,6 +19952,7 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
     fresh_check && (host = cgen_fresh_check(host, fresh))
+    host = cgen_fp_raise_append(host, backend.allowscalar_macro)
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
     return (host = cgen_convert_precision(host, p),
@@ -19882,6 +20030,7 @@ function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}}
     end
     jacc_async && (host = jgen_async_launches(host))
     jacc_async && jacc_async_wait && (host = jgen_async_exit_wait(host))
+    host = cgen_fp_raise_append(host, jgen_default_allowscalar_macro())
     warp_atomics && (kernels = Expr[jgen_contraction_tile_kernel(k) ? k : jgen_warp_atomics(k) for k in kernels])
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     helpers = any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) ? cgen_warp_helper_exprs(; jacc = true) : Expr[]

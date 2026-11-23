@@ -1,5 +1,5 @@
 # fp_two_loops
-# Two counted loops with a guard at the top level: stade_adjoint_fixedpoint needs exactly one and refuses this.
+# Two counted loops with a guard at the top level: agen_adjoint_fixedpoint needs exactly one and refuses this.
 # x0: start; a, b: coefficients; tol: tolerance on the squared update; maxit: cap; y: length-1 result
 function fp_two_loops(x0, a, b, tol, maxit, y)
     x = x0
