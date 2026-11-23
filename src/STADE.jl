@@ -17749,7 +17749,7 @@ function val_generate_baseline(kernel, primal_expr::Expr;
     sizing_arg_names = Symbol[]
     if self_check
         try
-            init_expr = stade_adjoint(primal_expr; keep_push_pop = false).initstacks
+            init_expr = agen_adjoint_unrolled(primal_expr; keep_push_pop = false).initstacks
             sizing_arg_names = Symbol[a for a in init_expr.args[1].args[2:end]]
             sizing_fn = val_compile(init_expr)
         catch
@@ -19219,6 +19219,15 @@ end
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
                         keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
+    fp = agen_fp_adjoint_or_nothing(expr, keep_push_pop, fuse_ii_loops, primal_outputs, independents, dependents)
+    fp === nothing || return fp
+    return agen_adjoint_unrolled(expr; independents = independents, dependents = dependents, keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
+end
+
+# The adjoint that reverses every forward iteration, whatever the loops of the kernel: stade_adjoint without the choice of the fixed-point reverse. A test that compares
+# the generated code with the loop as executed, or that needs the exact dot-product identity with the tangent, asks for this one.
+function agen_adjoint_unrolled(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing,
+                               keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
     return stade_adjoint_(expr, independents, dependents, keep_push_pop, fuse_ii_loops, primal_outputs, false)
 end
 
@@ -19308,7 +19317,7 @@ function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},
     length(found) == 1 || error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
     w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
-    return (initstacks = w.initstacks, adjoint = w.adjoint, loop = found[1])
+    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1])
 end
 
 # The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (the
@@ -19416,7 +19425,8 @@ end
 # The adjoint of `expr` with the fixed-point reverse of its counted-guard loop (agen_adjoint_fixedpoint), or `nothing` with one @info line that gives the reason.
 # It applies only to a kernel with exactly one such loop, keep_push_pop = false, no fusion, primal_outputs = true and a loop the agen_fp_refusal rule accepts.
 # A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
-function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool)
+function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
+                                    independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
     kernel = parse_kernel(expr)
     found = agen_fp_detect(expr, kernel.sig.kinds)
     isempty(found) && return nothing
@@ -19434,24 +19444,35 @@ function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loo
         isempty(r) || (why = join(r, "; "))
     end
     if why !== nothing
-        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
         return nothing
     end
     try
-        return agen_adjoint_fixedpoint(expr)
+        fp = agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and takes the fixed-point reverse: a loop that converged leaves its arrays at the converged field, a loop that stopped on its cap runs the unrolled reverse"
+        return fp
     catch e
         (e isa ErrorException && startswith(e.msg, "agen_adjoint_fixedpoint:")) || rethrow()
-        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
         return nothing
     end
+end
+
+# The validators check the unrolled adjoint. For a kernel on which stade_adjoint takes the fixed-point reverse they say so once: that adjoint is the derivative of the
+# limit, which a finite difference at the baseline's random tolerance, or the exact identity with the tangent, does not check (test/validate_fixedpoint.jl does, at a tight tolerance).
+function agen_fp_validator_note(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool)
+    kernel = parse_kernel(expr)
+    found = agen_fp_detect(expr, kernel.sig.kinds)
+    (length(found) == 1 && !keep_push_pop && !fuse_ii_loops && isempty(agen_fp_refusal(found[1], agen_fp_stmts(expr.args[2])))) || return nothing
+    @info "`$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags, and this validator checks the unrolled adjoint (a converged loop's fixed-point adjoint is the derivative of the limit, not of the iterations that ran)"
+    return nothing
 end
 
 function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
-    generated = agen_fp_adjoint_or_nothing(inlined[entry_name], keep_push_pop, fuse_ii_loops, primal_outputs)
-    generated === nothing && (generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs))
+    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
     keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
@@ -20127,7 +20148,9 @@ function stade_validate_dotprod_file(in_path::String; yaml_path::Union{String,No
     baseline = io_read_baseline_yaml(yp)
     val_coerce_int_arrays!(kernel, baseline.values)
     tangent_expr = stade_tangent(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
-    adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+    agen_fp_validator_note(primal_expr, keep_push_pop, fuse_ii_loops)
+    # the exact identity <Yb, J Xd> = <J' Yb, Xd> holds for the unrolled adjoint, not for the fixed-point one (the derivative of the limit): the baseline check covers that one
+    adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
     stack_names = Symbol[a for a in adjoint_out.initstacks.args[1].args[2:end]]
     return val_validate_dotprod(kernel, tangent_expr, adjoint_out, baseline;
                                  trials = trials, rtol = rtol, stack_arg_names = stack_names)
@@ -20147,7 +20170,8 @@ function stade_validate_from_baseline(mode::Symbol, in_path::String, yaml_path::
         return val_validate_tangent(kernel, primal_expr, tangent_expr, baseline;
                                      trials = trials, epsilon = epsilon, rtol = rtol)
     elseif mode == :adjoint
-        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+        agen_fp_validator_note(primal_expr, keep_push_pop, fuse_ii_loops)
+        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
 # Under keep_push_pop=false, initstacks_*'s own signature is whatever agen_emit built it with -- read it back from
 # the generated Expr rather than recomputing it here, so this can never drift from what agen_init_emit decided. NB:
 # Symbol.(...) on an empty Any[] yields Vector{Any}, not Vector{Symbol}, so a kernel whose indexed-mode initstacks_*
@@ -20158,7 +20182,8 @@ function stade_validate_from_baseline(mode::Symbol, in_path::String, yaml_path::
         return val_validate_adjoint(kernel, primal_expr, adjoint_out, baseline;
                                      trials = trials, epsilon = epsilon, rtol = rtol, stack_arg_names = stack_arg_names)
     else
-        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+        # the HVP differentiates the unrolled adjoint and shares its stacks: the oracle is that adjoint, not the fixed-point one
+        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
         hvp_out = stade_hvp(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
 # NB: Symbol.(...) on an empty Any[] yields Vector{Any}, not Vector{Symbol}, so a kernel
 # whose indexed-mode initstacks_* takes no arguments (no stacks at all) tripped the
@@ -20618,7 +20643,7 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
     val_coerce_int_arrays!(kernel, baseline.values)
 
     gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
-                             stade_adjoint(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
+                             agen_adjoint_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
     gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, glue_kernels = glue_kernels)
     # reduction_threshold reaches the GPU parity oracle. Without it the choice had
     # no test that ran on a device: validate_corpus is CPU and
@@ -20695,7 +20720,7 @@ function stade_validate_jacc_file(in_path::String, out_path::String;
     val_coerce_int_arrays!(kernel, baseline.values)
 
     gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
-                             stade_adjoint(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
+                             agen_adjoint_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
     backend = val_jacc_backend()
     jacc_init = stade_jacc(gen_out.initstacks; hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, glue_kernels = glue_kernels, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait, jacc_contraction = jacc_contraction)
     jacc_gen  = stade_jacc(mode == :hvp ? gen_out.hvp : gen_out.adjoint; reduction_threshold = reduction_threshold, hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait, jacc_contraction = jacc_contraction, jacc_dead_pops = jacc_dead_pops, jacc_tile_fill = jacc_tile_fill, glue_kernels = glue_kernels, init_hosts = Dict{Symbol,Expr}(gen_out.initstacks.args[1].args[1] => gen_out.initstacks))

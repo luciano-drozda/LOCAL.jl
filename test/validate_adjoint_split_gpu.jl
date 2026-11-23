@@ -169,7 +169,7 @@ end
 # the plans of one kernel: the CPU full adjoint, the device plans of the tape allocator and of the two halves. Returns a NamedTuple, or a status tuple.
 function sg_setup(primal, kernel, env)
     sig = kernel.sig
-    full = try STADE.stade_adjoint(primal; keep_push_pop = false) catch; return (:refused, "", NaN, 0) end
+    full = try STADE.agen_adjoint_unrolled(primal; keep_push_pop = false) catch; return (:refused, "", NaN, 0) end
     sp = try STADE.stade_adjoint_split(primal) catch e; return (:split_refused, first(split(sprint(showerror, e), "\n")), NaN, 0) end
     isempty(sp.consume) || return (:host_stacks, "consume=" * join(sp.consume, ","), NaN, 0)
     # CPU reference: the full adjoint, evaluated in Main (an anonymous Module() in a function crashes the Julia 1.10 compiler here); the stand-in lives in its own module

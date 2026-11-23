@@ -10,7 +10,7 @@
 #   julia validate_fixedpoint.jl [kernel names] [--sabotage]
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :sab_read) || include(joinpath(@__DIR__, "sabotage_run.jl"))
-using Random, LinearAlgebra
+using Random, LinearAlgebra, Logging
 isdefined(@__MODULE__, :sg_build_call) || include(joinpath(@__DIR__, "validate_adjoint_split_gpu.jl"))
 
 # the multigrid kernel keeps a zero ghost layer on every level; a random draw has none, and its residual then stagnates and never closes the guard
@@ -69,7 +69,7 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
-    full = STADE.stade_adjoint(primal; keep_push_pop = false)
+    full = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)   # the unrolled reference: stade_adjoint itself takes the fixed-point path
     fp = STADE.agen_adjoint_fixedpoint(primal)
     fi = STADE.val_compile(full.initstacks); fg = STADE.val_compile(full.adjoint)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
@@ -159,6 +159,61 @@ function fpv_unsettled()
     return (msg = msg, info = Float64.(s2[end]))
 end
 
+# stade_adjoint is the one place that chooses between the unrolled and the fixed-point reverse; stade_adjoint_file and the validators go through it
+function fpv_logged(f)
+    io = IOBuffer()
+    r = Logging.with_logger(f, Logging.SimpleLogger(io, Logging.Info))
+    return (value = r, log = String(take!(io)))
+end
+
+fpv_has_fp_info(g) = last(g.adjoint.args[1].args) === :fp_info
+
+function fpv_dispatch_checks(say)
+    root = @__DIR__
+    rd(dir, nm) = STADE.io_read_corpus_entry(joinpath(root, dir, nm * ".jl"))
+    cos_ = rd("fp-corpus", "fp_scalar_cos")
+    r = fpv_logged(() -> STADE.stade_adjoint(cos_; keep_push_pop = false))
+    say(fpv_has_fp_info(r.value), "stade_adjoint on a counted-guard loop with keep_push_pop = false returns the fixed-point adjoint")
+    say(occursin("takes the fixed-point reverse", r.log) && occursin("fp_scalar_cos", r.log), "the fixed-point path says so with one @info line (got: $(first(r.log, 120)))")
+    say(count("takes the fixed-point reverse", r.log) == 1, "the acceptance line appears once")
+    say(hasproperty(r.value, :primal_pruned) && hasproperty(r.value, :initstacks), "the fixed-point result has the keys of a stade_adjoint result")
+    for (kw, frag) in ((:(keep_push_pop = true), "keep_push_pop = true"), (:(fuse_ii_loops = true), "fuse_ii_loops = true"), (:(primal_outputs = false), "primal_outputs = false"))
+        kws = kw.args[1] === :keep_push_pop ? (; keep_push_pop = kw.args[2]) : (; keep_push_pop = false, (kw.args[1] => kw.args[2],)...)
+        rr = fpv_logged(() -> STADE.stade_adjoint(cos_; kws...))
+        say(!fpv_has_fp_info(rr.value) && occursin("keeps its unrolled reverse", rr.log) && occursin(frag, rr.log), "$frag: the unrolled adjoint and one line that names the flag (got: $(first(rr.log, 140)))")
+    end
+    cg = rd("counted-corpus", "phc_cg_laplace2d")
+    rc = fpv_logged(() -> STADE.stade_adjoint(cg; keep_push_pop = false))
+    say(!fpv_has_fp_info(rc.value) && occursin("divides by a value computed from a reduction", rc.log), "a refused loop keeps the unrolled adjoint and the log gives the reason (got: $(first(rc.log, 140)))")
+    plain = rd("val-corpus", "advection")
+    rp = fpv_logged(() -> STADE.stade_adjoint(plain; keep_push_pop = false))
+    say(!fpv_has_fp_info(rp.value) && isempty(rp.log), "a kernel without a counted-guard loop: the unrolled adjoint and no line (got: $(first(rp.log, 100)))")
+    # independents reach the fixed-point adjoint: the same text as the generator with them, and not the text without them
+    ri = fpv_logged(() -> STADE.stade_adjoint(cos_; independents = [:c], keep_push_pop = false)).value
+    with_i = STADE.agen_adjoint_fixedpoint(cos_; independents = [:c]); without_i = STADE.agen_adjoint_fixedpoint(cos_)
+    say(string(with_i.adjoint) != string(without_i.adjoint), "the independents change the fixed-point adjoint of fp_scalar_cos")
+    say(string(ri.adjoint) == string(with_i.adjoint), "stade_adjoint passes independents = [:c] to the fixed-point adjoint")
+    # the validators check the unrolled adjoint and the HVP shares its stacks: a fixed-point adjoint here would not call
+    mktempdir() do tmp
+        f = joinpath(tmp, "fp_scalar_cos.jl"); cp(joinpath(root, "fp-corpus", "fp_scalar_cos.jl"), f); yp = joinpath(tmp, "fp_scalar_cos.yaml")
+        fpv_logged(() -> STADE.stade_generate_baseline_file(f; yaml_path = yp, int_lo = 3, int_hi = 5))
+        rd_ = fpv_logged(() -> STADE.stade_validate_dotprod_file(f; yaml_path = yp, keep_push_pop = false))
+        say(rd_.value.ok && occursin("this validator checks the unrolled adjoint", rd_.log), "stade_validate_dotprod_file: the exact identity holds for the unrolled adjoint and the log says which adjoint it checks (ok = $(rd_.value.ok))")
+        ra = fpv_logged(() -> STADE.stade_validate_from_baseline(:adjoint, f, yp; keep_push_pop = false))
+        say(ra.value.ok && occursin("this validator checks the unrolled adjoint", ra.log), "stade_validate_from_baseline(:adjoint) on a counted-guard loop (ok = $(ra.value.ok))")
+        rh = try fpv_logged(() -> STADE.stade_validate_from_baseline(:hvp, f, yp; keep_push_pop = false)).value.ok catch e; false end
+        say(rh, "stade_validate_from_baseline(:hvp) on a counted-guard loop")
+    end
+    # the file entry goes through the same choice
+    mktempdir() do tmp
+        for (kpp, want) in ((false, true), (true, false))
+            out = joinpath(tmp, "o_$(kpp).jl")
+            fpv_logged(() -> STADE.stade_adjoint_file(joinpath(root, "fp-corpus", "fp_scalar_cos.jl"), out; keep_push_pop = kpp))
+            say(occursin("fp_info", read(out, String)) == want, "stade_adjoint_file with keep_push_pop = $kpp: the generated file " * (want ? "has" : "has no") * " fp_info")
+        end
+    end
+end
+
 function fpv_unit_checks(say)
     root = @__DIR__
     for (nm, frag) in (("fp_two_loops", "has 2 counted-guard loops"), ("fp_counter_used", "has 0 counted-guard loops"), ("fp_accumulate", "never consumes a state adjoint"))
@@ -201,6 +256,7 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
     checks = 0; bad = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
     fpv_unit_checks(say)
+    fpv_dispatch_checks(say)
     cap_diff = 0.0
     for (dir, name, pins, floats, gs, prep) in fpv_cases()
         isempty(only) || name in only || continue
@@ -244,6 +300,12 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("deep nesting is not a reason", "    f.depth > 2 && push!(why,", "    f.depth > 99 && push!(why,", ["fp_scalar_cos"]),
             ("every call is validated", "agen_fp_validated_calls() = Set{Symbol}([:div, :mod, :sin, :cos, :tanh])", "agen_fp_validated_calls() = Set{Symbol}([:div, :mod, :sin, :cos, :tanh, :sqrt, :abs])", ["fp_scalar_cos"]),
             ("a scalar assigned from a reduction is not one", "        isempty(intersect(rsyms, red)) || push!(red, e.args[1])\n", "", ["fp_scalar_cos"]),
+            ("stade_adjoint does not choose the fixed-point reverse", "    fp === nothing || return fp\n", "    fp === nothing || nothing\n", ["fp_scalar_cos"]),
+            ("the acceptance is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", "        nothing; \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", ["fp_scalar_cos"]),
+            ("a refusal is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: \$why\"\n", "        nothing\n", ["fp_scalar_cos"]),
+            ("the independents are dropped", "agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)", "agen_adjoint_fixedpoint(expr)", ["fp_scalar_cos"]),
+            ("the HVP validator takes the fixed-point adjoint", "        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", "        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", ["fp_scalar_cos"]),
+            ("a validator says nothing about the adjoint it checks", "    @info \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", "    nothing; \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", ["fp_scalar_cos"]),
             ("the first sweep's norm is not kept", "                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos", "fp_array_tanh"]),
         ]
         mktempdir() do tmp

@@ -33,7 +33,7 @@ function sp_kernel(path; verbose = false)
     primal = try STADE.io_read_corpus_entry(path) catch; return (:skipped, "") end
     kernel = try STADE.parse_kernel(primal) catch; return (:skipped, "") end
     sig = kernel.sig
-    full = try STADE.stade_adjoint(primal; keep_push_pop = false) catch; return (:refused, "") end
+    full = try STADE.agen_adjoint_unrolled(primal; keep_push_pop = false) catch; return (:refused, "") end
     sp = try STADE.stade_adjoint_split(primal) catch e; return (:split_refused, first(split(sprint(showerror, e), "\n"))) end
     pos, shpos, nsig = sp_positions(sig)
     comp(e) = STADE.val_compile(e)
