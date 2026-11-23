@@ -121,7 +121,7 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     snames = Symbol[a for a in fp.initstacks.args[1].args[2:end]]
     a1, t1 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
     s1 = sg_init_stacks(cpu_init, sg_stack_extra(snames, int_args, vals, identity))
-    # the CPU adjoint raises when the sweeps do not settle; the device one has no raise yet, so its returned scalars are not compared then
+    # the adjoint raises when the sweeps do not settle (on the CPU and on the device): the returned scalars are not compared then
     raised = false
     r1 = try Base.invokelatest(cpu_adj, a1..., s1...) catch e; raised = true; nothing end
     plan_init = env.plan(fp.initstacks, nothing)
@@ -129,14 +129,15 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     dev_init = sg_eval_plan!(env.mod, plan_init); dev_adj = sg_eval_plan!(env.mod, plan_adj)
     a2, t2 = sg_build_call(kernel.sig, int_args, vals, seed, env.wrap)
     s2 = sg_init_stacks(dev_init, sg_stack_extra(snames, int_args, vals, env.wrap))
-    r2 = Base.invokelatest(dev_adj, a2..., s2...)
+    devraised = false
+    r2 = try Base.invokelatest(dev_adj, a2..., s2...) catch e; devraised = true; first(sprint(showerror, e), 160) end
     err = 0.0
     for (a, ct) in t1
         ct.kind == :array_float || continue
         err = max(err, sg_relerr(ct.sh, env.tohost(t2[a].sh)))
     end
-    raised || (err = max(err, sg_scalar_err(count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args), r1, r2)))
-    return (err = err, cpu_info = Float64.(s1[end]), dev_info = Float64.(env.tohost(s2[end])), raised = raised)
+    raised || devraised || (err = max(err, sg_scalar_err(count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args), r1, r2)))
+    return (err = err, cpu_info = Float64.(s1[end]), dev_info = Float64.(env.tohost(s2[end])), raised = raised, devraised = devraised, devmsg = devraised ? r2 : "")
 end
 
 # the converged loop whose reverse cannot settle in as many sweeps as the loop has iterations: what the adjoint raises and what it leaves in fp_info

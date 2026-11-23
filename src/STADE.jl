@@ -7399,10 +7399,36 @@ end
 # ingest drops it instead of refusing the whole initstacks.
 cgen_is_sizehint(s) = s isa Expr && s.head == :call && !isempty(s.args) && s.args[1] == :sizehint!
 
-# `if cond; error("...") end` is the raise of a fixed-point adjoint whose sweeps did not settle (agen_fp_rewrite). The host function of a device adjoint has no
-# such statement yet: the ingest drops it, and `fp_info[5]` is the only signal there.
+# `if cond; error("...") end` is the raise of a fixed-point adjoint whose sweeps did not settle (agen_fp_rewrite). The ingest drops it and the stage puts the
+# raise back on the host function (cgen_fp_raise_append).
 cgen_is_fp_raise(s) = s isa Expr && s.head === :if && length(s.args) == 2 && (b = agen_fp_stmts(s.args[2]); length(b) == 1 && b[1] isa Expr && b[1].head === :call &&
                       b[1].args[1] === :error && length(b[1].args) == 2 && b[1].args[2] isa String)
+
+# The message of the raise of a fixed-point adjoint whose sweeps did not settle: the CPU adjoint (agen_fp_rewrite) and the device host function (cgen_fp_raise_append) share it.
+agen_fp_unsettled_message(name) = "$(name): the reverse sweeps did not settle the state adjoint, the iteration does not contract"
+
+# The raise for a device adjoint, as the last host statement before the return: one scalar read of `fp_info` inside the backend's allowscalar block
+# (about 12 us on a V100). The ingest dropped the CPU form of it. The JACC exit wait leaves the return inside a trailing block (after its synchronize): the
+# raise goes in front of the return there. A host function without an `fp_info` parameter, or without a trailing return, is returned unchanged.
+function cgen_fp_raise_insert(stmts::Vector, chk)
+    isempty(stmts) && return nothing
+    last = stmts[end]
+    last isa Expr && last.head === :return && return Any[stmts[1:end-1]..., chk, last]
+    if last isa Expr && last.head === :block
+        inner = cgen_fp_raise_insert(Any[s for s in last.args if !(s isa LineNumberNode)], chk)
+        inner === nothing && return nothing
+        return Any[stmts[1:end-1]..., Expr(:block, inner...)]
+    end
+    return nothing
+end
+
+function cgen_fp_raise_append(host::Expr, allowscalar)
+    (host.head === :function && :fp_info in host.args[1].args[2:end]) || return host
+    chk = Expr(:macrocall, allowscalar, nothing, Expr(:block, :(fp_info[5] == 0.0 || error($(agen_fp_unsettled_message(host.args[1].args[1]))))))
+    out = cgen_fp_raise_insert(Any[s for s in host.args[2].args if !(s isa LineNumberNode)], chk)
+    out === nothing && return host
+    return Expr(:function, host.args[1], Expr(:block, out...))
+end
 
 function cgen_parse_generated_statements(stmts::Vector)
     return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s) && !cgen_is_fp_raise(s)]
@@ -19123,7 +19149,7 @@ function agen_fp_rewrite(adj::Expr, init::Expr, det)
     kk = det.var; hi = det.hi; tolx = det.tol; rn = det.rn
     fwd_flag = Expr(:call, det.cmp, rn, tolx)
     kname = call.args[1]
-    msg = "$(kname): the reverse sweeps did not settle the state adjoint, the iteration does not contract"
+    msg = agen_fp_unsettled_message(kname)
     # a loop that ran to its cap is not at a fixed point: its reverse is the original one, every iteration. A converged loop gets the sweeps.
     new = agen_fp_stmts(quote
         fp_info[1] = 0.0
@@ -19926,6 +19952,7 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
     fresh_check && (host = cgen_fresh_check(host, fresh))
+    host = cgen_fp_raise_append(host, backend.allowscalar_macro)
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
     return (host = cgen_convert_precision(host, p),
@@ -20003,6 +20030,7 @@ function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}}
     end
     jacc_async && (host = jgen_async_launches(host))
     jacc_async && jacc_async_wait && (host = jgen_async_exit_wait(host))
+    host = cgen_fp_raise_append(host, jgen_default_allowscalar_macro())
     warp_atomics && (kernels = Expr[jgen_contraction_tile_kernel(k) ? k : jgen_warp_atomics(k) for k in kernels])
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     helpers = any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) ? cgen_warp_helper_exprs(; jacc = true) : Expr[]
