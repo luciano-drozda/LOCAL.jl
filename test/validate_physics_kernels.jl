@@ -244,7 +244,7 @@ function ph_check(spec; verbose = true, kpp = true)
     end
     res[:tan_ref] = e2; res[:tan_fd] = e3
     # (4)-(6) adjoint and HVP, stack mode
-    ad = STADE.stade_adjoint(expr; keep_push_pop = kpp)
+    ad = STADE.agen_adjoint_unrolled(expr; keep_push_pop = kpp)
     adf = STADE.val_compile(ad.adjoint); isf = STADE.val_compile(ad.initstacks)
     hv = STADE.stade_hvp(expr; keep_push_pop = kpp)
     hvf = STADE.val_compile(hv.hvp); hsf = STADE.val_compile(hv.initstacks)
