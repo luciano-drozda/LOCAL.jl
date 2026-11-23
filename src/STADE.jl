@@ -19219,6 +19219,8 @@ end
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
                         keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
+    fp = agen_fp_adjoint_or_nothing(expr, keep_push_pop, fuse_ii_loops, primal_outputs, independents, dependents)
+    fp === nothing || return fp
     return stade_adjoint_(expr, independents, dependents, keep_push_pop, fuse_ii_loops, primal_outputs, false)
 end
 
@@ -19308,7 +19310,7 @@ function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},
     length(found) == 1 || error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
     w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
-    return (initstacks = w.initstacks, adjoint = w.adjoint, loop = found[1])
+    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1])
 end
 
 # The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (the
@@ -19416,7 +19418,8 @@ end
 # The adjoint of `expr` with the fixed-point reverse of its counted-guard loop (agen_adjoint_fixedpoint), or `nothing` with one @info line that gives the reason.
 # It applies only to a kernel with exactly one such loop, keep_push_pop = false, no fusion, primal_outputs = true and a loop the agen_fp_refusal rule accepts.
 # A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
-function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool)
+function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
+                                    independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
     kernel = parse_kernel(expr)
     found = agen_fp_detect(expr, kernel.sig.kinds)
     isempty(found) && return nothing
@@ -19434,14 +19437,16 @@ function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loo
         isempty(r) || (why = join(r, "; "))
     end
     if why !== nothing
-        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
         return nothing
     end
     try
-        return agen_adjoint_fixedpoint(expr)
+        fp = agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and takes the fixed-point reverse: a loop that converged leaves its arrays at the converged field, a loop that stopped on its cap runs the unrolled reverse"
+        return fp
     catch e
         (e isa ErrorException && startswith(e.msg, "agen_adjoint_fixedpoint:")) || rethrow()
-        @info "stade_adjoint_file: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
+        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
         return nothing
     end
 end
@@ -19450,8 +19455,7 @@ function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bo
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
-    generated = agen_fp_adjoint_or_nothing(inlined[entry_name], keep_push_pop, fuse_ii_loops, primal_outputs)
-    generated === nothing && (generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs))
+    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
     keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
