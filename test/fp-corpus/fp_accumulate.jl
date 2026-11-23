@@ -1,5 +1,5 @@
 # fp_accumulate
-# Not a fixed-point iteration: a counted loop with a guard whose body only adds to the state (u grows by a fixed amount each step until the guard closes). Its reverse never consumes a state adjoint, so stade_adjoint_fixedpoint refuses it.
+# Not a fixed-point iteration: a counted loop with a guard whose body only adds to the state (u grows by a fixed amount each step until the guard closes). Its reverse never consumes a state adjoint, so agen_adjoint_fixedpoint refuses it.
 # u: running state (updated in place); f: increments; tol: guard tolerance; n: entries; maxit: cap; s: length-1 result
 function fp_accumulate(u, f, tol, n, maxit, s)
     rn = 1.0

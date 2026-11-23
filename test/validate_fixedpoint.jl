@@ -1,4 +1,4 @@
-# Regression for v0.5.37: stade_adjoint_fixedpoint, the fixed-point reverse of a counted loop with a guard (`for kk = 1:maxit`, one `if rn > tol`).
+# Regression for v0.5.37: agen_adjoint_fixedpoint, the fixed-point reverse of a counted loop with a guard (`for kk = 1:maxit`, one `if rn > tol`).
 # For each kernel and three regimes:
 #   converged  the loop stops on its tolerance: the fixed-point adjoint (every shadow and returned scalar) equals the full adjoint of the unrolled loop to
 #              1e-9, a central difference of the primal (the tolerance held fixed) to 1e-5, the sweeps ran (at least one), neither flag is set, and the state
@@ -69,7 +69,7 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
     full = STADE.stade_adjoint(primal; keep_push_pop = false)
-    fp = STADE.stade_adjoint_fixedpoint(primal)
+    fp = STADE.agen_adjoint_fixedpoint(primal)
     fi = STADE.val_compile(full.initstacks); fg = STADE.val_compile(full.adjoint)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
     names_full = Symbol[a for a in full.initstacks.args[1].args[2:end]]
@@ -95,7 +95,7 @@ function fpv_run(dir, name, pins, floats, gs, prep, regime::Symbol; fd::Bool = f
         kernel.sig.kinds[a] == :array_float && a in fp.loop.arrays && (vleft = max(vleft, sg_relerr(pargs[i], t2[a].val)))
     end
     info = Float64.(s2[end])
-    verdict = try STADE.stade_adjoint_fixedpoint_check(info); "" catch e; first(split(sprint(showerror, e), "\n")) end
+    verdict = try STADE.agen_adjoint_fixedpoint_check(info); "" catch e; first(split(sprint(showerror, e), "\n")) end
     fderr = fd ? fpv_fd(kernel, primal, fp, int_args, vals, names_full, :tol) : NaN
     return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft)
 end
@@ -116,7 +116,7 @@ function fpv_device(dir, name, pins, floats, gs, prep, env, regime::Symbol = :co
     prep === nothing || prep(vals)
     regime === :zero && (vals[:tol] = 1e30)
     seed = STADE.val_random_values_like(kernel, vals)
-    fp = STADE.stade_adjoint_fixedpoint(primal)
+    fp = STADE.agen_adjoint_fixedpoint(primal)
     cpu_init = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init_cpu)); cpu_adj = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj_cpu))
     snames = Symbol[a for a in fp.initstacks.args[1].args[2:end]]
     a1, t1 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
@@ -149,7 +149,7 @@ function fpv_unsettled()
     int_args = merge(bl.int_args, pins); vals = bl.values
     for (k, v) in Dict(:a => 1.0, :x0 => 0.0, :omega => 0.1, :tol => 1e-3); vals[k] = v; end
     seed = STADE.val_random_values_like(kernel, vals)
-    fp = STADE.stade_adjoint_fixedpoint(primal)
+    fp = STADE.agen_adjoint_fixedpoint(primal)
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init_slow)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj_slow))
     snames = Symbol[a for a in fp.initstacks.args[1].args[2:end]]
     a2, t2 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
@@ -162,7 +162,7 @@ function fpv_unit_checks(say)
     root = @__DIR__
     for (nm, frag) in (("fp_two_loops", "has 2 counted-guard loops"), ("fp_counter_used", "has 0 counted-guard loops"), ("fp_accumulate", "never consumes a state adjoint"))
         primal = STADE.io_read_corpus_entry(joinpath(root, "fp-corpus", nm * ".jl"))
-        msg = try STADE.stade_adjoint_fixedpoint(primal); "" catch e; sprint(showerror, e) end
+        msg = try STADE.agen_adjoint_fixedpoint(primal); "" catch e; sprint(showerror, e) end
         say(occursin(frag, msg), "$nm is refused with `$frag` (got: $(first(msg, 120)))")
     end
     # the state the detector reads
@@ -191,9 +191,9 @@ function fpv_unit_checks(say)
         say(isempty(why) == ok, "a loop that calls $fn: the rule " * (ok ? "accepts" : "refuses") * " (got: $(isempty(why) ? "accepted" : join(why, " | ")))")
     end
     # the verdict raises on each flag
-    say(try STADE.stade_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 1.0, 0.0]); false catch; true end, "check raises when the forward loop hit its cap")
-    say(try STADE.stade_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 0.0, 1.0]); false catch; true end, "check raises when the sweeps did not settle")
-    say(STADE.stade_adjoint_fixedpoint_check([3.0, 2.0, 0.0, 0.0, 0.0]) == 2, "check returns the sweeps when nothing is flagged")
+    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 1.0, 0.0]); false catch; true end, "check raises when the forward loop hit its cap")
+    say(try STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.1, 0.0, 1.0]); false catch; true end, "check raises when the sweeps did not settle")
+    say(STADE.agen_adjoint_fixedpoint_check([3.0, 2.0, 0.0, 0.0, 0.0]) == 2, "check returns the sweeps when nothing is flagged")
 end
 
 function validate_fixedpoint(; verbose = true, only = String[], sabotage = false)
@@ -232,8 +232,8 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("the forward flag is never set", "        if \$fwd_flag\n            __fp_cut = 1\n            fp_info[4] = 1.0\n        end\n", "", ["fp_scalar_cos"]),
             ("the adjoint flag is never set", "            fp_info[5] = __fp_go\n", "            fp_info[5] = 0.0\n", ["fp_scalar_cos"]),
             ("the counter may be read in the body", "        h.var in syms && continue\n", "", ["fp_scalar_cos"]),
-            ("a second loop is accepted", "    length(found) == 1 || error(\"stade_adjoint_fixedpoint: `\$(kernel.sig.name)` has", "    length(found) >= 0 || error(\"stade_adjoint_fixedpoint: `\$(kernel.sig.name)` has", ["fp_scalar_cos"]),
-            ("accumulation loops are accepted", "    count > 0 || error(\"stade_adjoint_fixedpoint: the reverse", "    count >= 0 || error(\"stade_adjoint_fixedpoint: the reverse", ["fp_scalar_cos"]),
+            ("a second loop is accepted", "    length(found) == 1 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", "    length(found) >= 0 || error(\"agen_adjoint_fixedpoint: `\$(kernel.sig.name)` has", ["fp_scalar_cos"]),
+            ("accumulation loops are accepted", "    count > 0 || error(\"agen_adjoint_fixedpoint: the reverse", "    count >= 0 || error(\"agen_adjoint_fixedpoint: the reverse", ["fp_scalar_cos"]),
             ("the branch is inverted", "        if __fp_cut == 0\n            __fp_last = 0\n", "        if __fp_cut == 1\n            __fp_last = 0\n", ["fp_scalar_cos"]),
             ("a cut-off loop has no unrolled reverse", "        else\n            \$rev\n        end\n", "        else\n        end\n", ["fp_scalar_cos"]),
             ("the sweep error is not raised", "        if __fp_go == 1\n            error(\$msg)\n        end\n", "", ["fp_scalar_cos"]),

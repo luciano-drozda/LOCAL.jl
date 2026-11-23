@@ -1,4 +1,4 @@
-# Regression for v0.5.37: the device code (CUDA and JACC) of stade_adjoint_fixedpoint, run on the CPU with the serial stand-ins of
+# Regression for v0.5.37: the device code (CUDA and JACC) of agen_adjoint_fixedpoint, run on the CPU with the serial stand-ins of
 # validate_adjoint_split_cuda_cpu.jl and validate_adjoint_split_jacc_cpu.jl. For each kernel of validate_fixedpoint.jl and each regime, the device
 # adjoint equals the CPU fixed-point adjoint (every shadow, every returned scalar) and reports the same fp_info.
 #   The defect this guards: the GPU stage drops stores nothing in the function reads, and a fixed-point adjoint's `fp_info` is only written.
