@@ -292,7 +292,7 @@ function fpv_unit_checks(say)
     end
     for (nest, frag) in ((:cold, "independent iterations"), (:indep, "independent iterations"), (:solve_in_solve, "another solve loop"), (:hi_assigned, "assigned inside an enclosing loop"),
                          (:tol_assigned, "assigned inside an enclosing loop"), (:hi_assigned, "used outside the headers of solve loops"),
-                         (:ragged, "ragged nest"), (:triangle, "depends on an outer counter"), (:read_top, "before a solve loop overwrites it"), (:read_before, "before a solve loop overwrites it"),
+                         (:ragged, "ragged nest"), (:bound_self, "is assigned inside it"), (:triangle, "depends on an outer counter"), (:read_top, "before a solve loop overwrites it"), (:read_before, "before a solve loop overwrites it"),
                          (:read_between, "before a solve loop overwrites it"), (:read_nl, "before a solve loop overwrites it"))
         pr = fps_kernel(:scalar, nest); k = STADE.parse_kernel(pr)
         why = vcat(String[], [STADE.agen_fp_refusal(d) for d in STADE.agen_fp_detect(pr, k.sig.kinds)]...)
@@ -412,7 +412,7 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("the trip count stays in the positions outside the solve", "    out = Any[agen_fp_slot(st, trips, :__fp_none, false) for st in nst]\n", "    out = Any[st for st in nst]\n", ["fps_scalar_loop1"]),
             ("only the first cap is substituted", "    trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets])]\n", "    trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets[1:1]])]\n", ["fps_scalar_two_caps"]),
             ("the count stack is not reset before the loop", "    return (Any[:(\$bstack[\$E] = 0), Expr(:for, floop.args[1], Expr(:block, guard))], bstack, E)\n", "    return (Any[Expr(:for, floop.args[1], Expr(:block, guard))], bstack, E)\n", ["fps_scalar_ifbranch", "fps_scalar_loop1"]),
-            ("the count stack is read at the wrong instance", "        __fp_cnt = \$bstack[\$E]\n", "        __fp_cnt = \$bstack[1]\n", ["fps_scalar_loop1"]),
+            ("the count stack is read at the wrong instance", "        __fp_cnt = \$bstack[\$E]\n", "        __fp_cnt = \$bstack[1]\n", ["fps_scalar_ifbranch"]),
             ("the sweep counter is not reset per instance", "            __fp_sw = 0\n            __fp_go = 0\n            if __fp_cnt > 0\n", "            __fp_go = 0\n            if __fp_cnt > 0\n", ["fps_scalar_loop1"]),
             ("the sweeps run when no iteration ran", "            if __fp_cnt > 0\n                __fp_go = 1\n            end\n", "            __fp_go = 1\n", ["fp_scalar_cos", "fps_scalar_ifbranch"]),
             ("the first sweep's norm is not kept", "\$(sweep...)\n                    if __fp_sw == 0\n                        __fp_c0 = __fp_cn\n                    end\n", "\$(sweep...)\n                    __fp_c0 = __fp_cn\n", ["fp_scalar_cos"]),

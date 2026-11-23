@@ -7,7 +7,7 @@
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 
 fps_nests() = [:none, :loop1, :loop2, :ifbranch, :solve_first, :solve_last, :two_in_body, :two_loops, :literal, :cold,
-               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps, :tdep_first, :read_before, :read_top, :read_between, :pre_nl, :tdep_nl, :read_nl]
+               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps, :tdep_first, :read_before, :read_top, :read_between, :pre_nl, :tdep_nl, :read_nl, :bound_self]
 
 # the lines of one solve loop, with `@` replaced by the suffix (so two solves in one body use two sets of names)
 function fps_solve(body::Symbol, sfx::String)
@@ -98,6 +98,9 @@ function fps_text(body::Symbol, nest::Symbol)
         # a read before the solve that is nonlinear in the state
         post = body === :scalar ? fps_post(body, "") : "ys[t] = u[2] * u[3]\n"
         b = fps_start(body) * "for t = 1:nt\n" * fps_ind(post * T(), 1) * "end\n"
+    elseif nest === :bound_self
+        # the bound of the enclosing loop is assigned inside that loop
+        b = body === :scalar ? "x = x0\nmm = nt\nfor t = 1:mm\n" * fps_ind(fps_pre(body, "") * S() * fps_post(body, "") * "mm = nt\n", 1) * "end\n" : ""
     elseif nest === :read_top
         b = replace(fps_start(body) * fps_post(body, "") * T(), "[t]" => "[1]")
     elseif nest === :read_between
