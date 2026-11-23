@@ -19184,8 +19184,8 @@ function stade_adjoint_split(expr::Expr; independents::Union{Vector{Symbol},Noth
     return stade_adjoint_(expr, independents, dependents, false, false, true, true)
 end
 
-# The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration: the tape of the last active
-# iteration, sweeps repeated until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many
+# The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration: the reverse reads the last active
+# iteration's slice of the full (cap-sized) tape, sweeps repeated until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many
 # sweeps as the loop has iterations. keep_push_pop = false, no fusion. Returns (initstacks, adjoint, loop); the last stack is `fp_info`, five Float64:
 # [1] last active iteration, [2] sweeps run, [3] final over first squared norm, [4] 1 when the forward loop stopped on its cap, [5] 1 when the sweeps did.
 function stade_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
