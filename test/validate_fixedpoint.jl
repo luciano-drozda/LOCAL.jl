@@ -32,6 +32,7 @@ fpv_cases() = Any[
     ("fp-corpus", "fp_mixed_state", Dict(:n => 5, :maxit => 800), Dict(:a => 0.5, :tol => 1e-30), 6, nothing),
     ("counted-corpus", "phc_jacobi2d", Dict(:nint => 6, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.02), 8, nothing),
     ("counted-corpus", "phc_gs1d", Dict(:n => 8, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.05), 10, nothing),
+    ("host-box-corpus", "hb_gs1d", Dict(:n => 8, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.05), 10, nothing),
     ("inactive-read-corpus", "ir_mg2d_solve_3", Dict(:n1 => 7, :nu1 => 2, :nu2 => 2, :maxit => 200), Dict(:tol => 1e-24, :h1 => 0.125, :w => 0.8), 9, v -> fpv_zero_ghosts!(v, Dict('1' => 9, '2' => 5, '3' => 3))),
 ]
 
@@ -174,7 +175,7 @@ function fpv_unit_checks(say)
     end
     # the whitelist rule: every detected loop of the corpora, accepted or refused with a reason
     verdicts = (("fp-corpus", "fp_newton_sqrt", ""), ("fp-corpus", "fp_scalar_cos", ""), ("fp-corpus", "fp_array_tanh", ""), ("fp-corpus", "fp_gauss_seidel", ""), ("fp-corpus", "fp_mixed_state", ""),
-                ("counted-corpus", "phc_jacobi2d", ""), ("counted-corpus", "phc_gs1d", ""), ("inactive-read-corpus", "ir_mg2d_solve_3", ""),
+                ("counted-corpus", "phc_jacobi2d", ""), ("counted-corpus", "phc_gs1d", ""), ("host-box-corpus", "hb_gs1d", ""), ("inactive-read-corpus", "ir_mg2d_solve_3", ""),
                 ("counted-corpus", "phc_cg_laplace2d", "divides by a value computed from a reduction"), ("counted-corpus", "phc_power_iter", "divides by a value computed from a reduction"),
                 ("counted-corpus", "phc_mg_solve", "holds an if"), ("counted-corpus", "phc_mg_solve", "deeper than 2"), ("inactive-read-corpus", "ur_norm", "tolerance is a literal"))
     for (dir, nm, frag) in verdicts
