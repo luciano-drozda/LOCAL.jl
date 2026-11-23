@@ -34,6 +34,7 @@ fpv_cases() = Any[
     ("fp-corpus", "fp_array_tanh", Dict(:n => 6, :maxit => 800), Dict(:c => 0.3, :tol => 1e-30), 8, nothing),
     ("fp-corpus", "fp_gauss_seidel", Dict(:n => 6, :maxit => 800), Dict(:tol => 1e-30), 8, nothing),
     ("fp-corpus", "fp_mixed_state", Dict(:n => 5, :maxit => 800), Dict(:a => 0.5, :tol => 1e-30), 6, nothing),
+    ("fp-corpus", "fp_two_loops", Dict(:maxit => 500), Dict(:a => 0.6, :b => 0.5, :tol => 1e-30), 4, nothing),
     ("counted-corpus", "phc_jacobi2d", Dict(:nint => 6, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.02), 8, nothing),
     ("counted-corpus", "phc_gs1d", Dict(:n => 8, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.05), 10, nothing),
     ("host-box-corpus", "hb_gs1d", Dict(:n => 8, :maxit => 2000), Dict(:tol => 1e-28, :h2 => 0.05), 10, nothing),
