@@ -3550,7 +3550,7 @@ function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, 
                                    tier_b_extra_args = tier_b_extra_args, ii_plan = ii_plan, remat = remat, primal_outputs = true, split = true)
         # the unused-stack cleanup judges the two halves together: a stack the forward half records and the backward half reads is in use
         whole = Expr(:function, Expr(:call, agen_fname(kernel.sig.name), parts.fwd.args[1].args[2:end]...), Expr(:block, parts.fwd.args[2].args..., parts.bwd.args[2].args...))
-        (whole, initstacks_expr) = agen_finalize_stacks(whole, initstacks_expr, snapshot_plan, ii_plan; force = !keep_push_pop && (any(s -> agen_asnap_site_array(s, kernel.sig.kinds) !== nothing, snapshot_plan) || !isempty(agen_remat_cross_vars(remat))))
+        (whole, initstacks_expr) = agen_finalize_stacks(whole, initstacks_expr, snapshot_plan, ii_plan; force = !keep_push_pop)
         kept = Set{Symbol}(a for a in whole.args[1].args[2:end] if a isa Symbol)
         unused = Set{Symbol}(nm for nm in agen_stack_names(snapshot_plan) if !(nm in kept))
         return (initstacks = initstacks_expr, forward = agen_drop_unused_stack_args(parts.fwd, unused), backward = agen_drop_unused_stack_args(parts.bwd, unused),
@@ -3563,7 +3563,7 @@ function agen_emit(kernel, lin_plan, snapshot_plan; keep_push_pop::Bool = true, 
     # checked from the actual generated code, never predicted ahead of time, since a var's
     # ii_plan coverage does NOT by itself guarantee its stack is fully unused. Runs under both
     # keep_push_pop values; agen_finalize_stacks detects use under either storage mode.
-    (adjoint_expr, initstacks_expr) = agen_finalize_stacks(adjoint_expr, initstacks_expr, snapshot_plan, ii_plan; force = !keep_push_pop && (any(s -> agen_asnap_site_array(s, kernel.sig.kinds) !== nothing, snapshot_plan) || !isempty(agen_remat_cross_vars(remat))))
+    (adjoint_expr, initstacks_expr) = agen_finalize_stacks(adjoint_expr, initstacks_expr, snapshot_plan, ii_plan; force = !keep_push_pop)
     return (adjoint = adjoint_expr, initstacks = initstacks_expr, primal_pruned = primal_pruned)
 end
 
@@ -19960,7 +19960,7 @@ function stade_hvp(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothi
 # adjoint and hvp calls needs hvp_expr's signature to match. hvp_expr's fwd/bwd reuse the same agen_forward_body/agen_backward_body calls as
 # the adjoint path, landing on the same unused set. is_hvp=true additionally drops each dropped stack's orphaned `<stack>_d` shadow alloc.
     (hvp_expr, initstacks_expr) = agen_finalize_stacks(hvp_expr, initstacks_expr, snapshot_plan, ii_plan; is_hvp = true,
-                                                         force = !keep_push_pop && (any(s -> agen_asnap_site_array(s, kernel.sig.kinds) !== nothing, snapshot_plan) || !isempty(agen_remat_cross_vars(remat))))
+                                                         force = !keep_push_pop)
     return (hvp = hvp_expr, initstacks = initstacks_expr)
 end
 
