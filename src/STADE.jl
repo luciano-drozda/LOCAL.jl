@@ -19676,6 +19676,212 @@ end
 
 agen_fp_contains(e, target) = e === target || (e isa Expr && any(a -> agen_fp_contains(a, target), e.args))
 
+# ---- the converged value of the arrays a solve loop writes ----
+# The unrolled reverse restores, at each write of an array inside the guard, the value the write replaced; the one-slot tape keeps those values for the last iteration
+# only, n per instance. When every read of the array in the guard sees an iterate (before the first write of the body, or after the last), the sweeps may read the array as
+# the loop left it: at the fixed point the iterates agree to within the last residual, so the adjoint is the one at the converged state. Those saves are then not taken,
+# at the site-level decision, and the stack, its size and its restores go with them. It holds only if the reverse leaves the array as the loop left it (a later write that is
+# not saved, or one inside another solve loop, would change it first), and that is checked on the sites that survive the remat and asnap passes.
+
+# a solve loop of the kernel (kernel form) as the detected loop `d` describes it: `for kk = 1:hi` holding one `if` with no else
+function agen_fp_kis_solve(st, d)
+    (st.kind == :for && st.var === d.var && st.lo == 1 && st.hi == d.hi && st.step == 1) || return false
+    return length(st.body) == 1 && st.body[1].kind == :if && isempty(st.body[1].els)
+end
+
+# the solve loops of the kernel in program order, each with the index of the top-level statement that holds it and, when a loop encloses it, the body of the innermost one
+# and the index in that body of the statement that holds the solve; a solve body is not searched
+function agen_fp_ksolves!(body, top::Int, dets, out::Vector, lb = nothing, li::Int = 0, isfor::Bool = false)
+    for (idx, st) in enumerate(body)
+        t = top == 0 ? idx : top
+        (lb2, li2) = isfor ? (body, idx) : (lb, li)
+        if st.kind == :for
+            if any(d -> agen_fp_kis_solve(st, d), dets)
+                push!(out, (stmt = st, top = t, lbody = lb2, lidx = li2))
+            else
+                agen_fp_ksolves!(st.body, t, dets, out, lb2, li2, true)
+            end
+        elseif st.kind == :if
+            agen_fp_ksolves!(st.then, t, dets, out, lb2, li2, false)
+            agen_fp_ksolves!(st.els, t, dets, out, lb2, li2, false)
+        elseif st.kind == :while
+            agen_fp_ksolves!(st.body, t, dets, out, lb2, li2, false)
+        end
+    end
+    return out
+end
+
+# the statement reads the array `A` anywhere: right-hand side, subscripts of the target, loop bounds, condition (an unknown statement counts as a read)
+function agen_fp_kreads(st, A::Symbol)
+    if st.kind == :assign
+        sub = st.lhs isa Expr ? sum(agen_asnap_count_refs(a, A) for a in st.lhs.args[2:end]; init = 0) : 0
+        return sub > 0 || agen_asnap_count_refs(st.rhs, A) > 0
+    elseif st.kind == :for
+        return any(e -> agen_asnap_count_refs(e, A) > 0, (st.lo, st.hi, st.step)) || any(s -> agen_fp_kreads(s, A), st.body)
+    elseif st.kind == :if
+        return agen_asnap_count_refs(st.cond, A) > 0 || any(s -> agen_fp_kreads(s, A), st.then) || any(s -> agen_fp_kreads(s, A), st.els)
+    end
+    return true
+end
+
+# every read of `A` in the top-level statements `then` of a guard is in a statement that does not write it and lies before the first or after the last statement
+# that writes it (the array holds an iterate at every read); false when the guard does not write it
+function agen_fp_iterate_reads_ok(then::Vector, A::Symbol, kinds)
+    ws = [j for j in eachindex(then) if A in agen_asnap_written_arrays!([then[j]], Set{Symbol}(), kinds)]
+    isempty(ws) && return false
+    for j in eachindex(then)
+        agen_fp_kreads(then[j], A) || continue
+        (j in ws || (j > first(ws) && j < last(ws))) && return false
+    end
+    return true
+end
+
+# The arrays of the solve loops that can read the converged state: (solve, array, keys of the write sites inside the guard, top-level index of the loop's statement).
+# Only an array with a save still pending at one of those sites; `[]` when the kernel's solve loops do not match the detected ones one for one.
+function agen_fp_converged_cands(kernel, dets, sites)
+    kinds = kernel.sig.kinds
+    sol = agen_fp_ksolves!(kernel.body, 0, dets, Any[])
+    (length(sol) == length(dets) && all(j -> agen_fp_kis_solve(sol[j].stmt, dets[j]), eachindex(dets))) || return Any[]
+    cands = Any[]
+    for (j, s) in enumerate(sol)
+        then = s.stmt.body[1].then
+        for A in sort(collect(agen_asnap_written_arrays!(then, Set{Symbol}(), kinds)); by = string)
+            agen_fp_iterate_reads_ok(then, A, kinds) || continue
+            keys = agen_asnap_write_keys!(then, A, Any[])
+            any(k -> get(sites, k, false) === true, keys) || continue
+            push!(cands, (solve = j, array = A, keys = keys, top = s.top, lbody = s.lbody, lidx = s.lidx, then = then))
+        end
+    end
+    return cands
+end
+
+# the write sites of `A` in `body[rng]`: (key, inside a solve loop)
+function agen_fp_collect_writes!(body, rng, A::Symbol, insolve::Bool, dets, out::Vector)
+    for idx in rng
+        st = body[idx]
+        if st.kind == :assign
+            st.lhs isa Expr && st.lhs.head == :ref && st.lhs.args[1] == A && push!(out, (agen_site_key(body, idx), insolve))
+        elseif st.kind == :for
+            agen_fp_collect_writes!(st.body, eachindex(st.body), A, insolve || any(d -> agen_fp_kis_solve(st, d), dets), dets, out)
+        elseif st.kind == :while
+            agen_fp_collect_writes!(st.body, eachindex(st.body), A, insolve, dets, out)
+        elseif st.kind == :if
+            agen_fp_collect_writes!(st.then, eachindex(st.then), A, insolve, dets, out)
+            agen_fp_collect_writes!(st.els, eachindex(st.els), A, insolve, dets, out)
+        end
+    end
+    return out
+end
+
+# the scalars assigned, and the loop variables, anywhere in a kernel-form body
+function agen_fp_kassigned!(body, acc::Set{Symbol})
+    for st in body
+        if st.kind == :assign
+            st.lhs isa Symbol && push!(acc, st.lhs)
+        elseif st.kind == :for
+            push!(acc, st.var)
+            agen_fp_kassigned!(st.body, acc)
+        elseif st.kind == :while
+            agen_fp_kassigned!(st.body, acc)
+        elseif st.kind == :if
+            agen_fp_kassigned!(st.then, acc)
+            agen_fp_kassigned!(st.els, acc)
+        end
+    end
+    return acc
+end
+
+# every write of `A` in `stmts[rng]` as (key, canonical form, unconditional), the canonical form being the bounds of the loops that enclose it and its subscripts with each
+# loop variable renamed by its depth; a write under an `if` or a `while` is not unconditional
+function agen_fp_kwsites!(stmts, rng, A::Symbol, chain::Vector, cond::Bool, out::Vector)
+    for idx in rng
+        st = stmts[idx]
+        if st.kind == :assign
+            if st.lhs isa Expr && st.lhs.head == :ref && st.lhs.args[1] == A
+                ren = Dict{Symbol,Any}(c.var => Symbol("__cv", k) for (k, c) in enumerate(chain))
+                sub(e) = e isa Symbol ? get(ren, e, e) : (e isa Expr ? Expr(e.head, Any[sub(a) for a in e.args]...) : e)
+                form = (Any[(sub(c.lo), sub(c.hi), sub(c.step)) for c in chain], Any[sub(a) for a in st.lhs.args[2:end]])
+                push!(out, (key = agen_site_key(stmts, idx), form = form, cond = cond))
+            end
+        elseif st.kind == :for
+            agen_fp_kwsites!(st.body, eachindex(st.body), A, vcat(chain, [(var = st.var, lo = st.lo, hi = st.hi, step = st.step)]), cond, out)
+        elseif st.kind == :while
+            agen_fp_kwsites!(st.body, eachindex(st.body), A, chain, false, out)
+        elseif st.kind == :if
+            agen_fp_kwsites!(st.then, eachindex(st.then), A, chain, false, out)
+            agen_fp_kwsites!(st.els, eachindex(st.els), A, chain, false, out)
+        end
+    end
+    return out
+end
+
+# the symbols of a canonical form other than the renamed loop variables
+function agen_fp_form_syms(form)
+    acc = Set{Symbol}()
+    agen_fp_collect_form_syms!(form, acc)
+    return filter(x -> !startswith(string(x), "__cv"), acc)
+end
+function agen_fp_collect_form_syms!(e, acc)
+    e isa Symbol && (push!(acc, e); return nothing)
+    e isa Expr && foreach(a -> agen_fp_collect_form_syms!(a, acc), e.head === :call ? e.args[2:end] : e.args)
+    e isa Tuple && foreach(a -> agen_fp_collect_form_syms!(a, acc), e)
+    e isa AbstractVector && foreach(a -> agen_fp_collect_form_syms!(a, acc), e)
+    return nothing
+end
+
+# A solve loop inside a loop runs once per iteration, and the reverse of an instance leaves the array as that instance's loop left it (its own saves are not taken). The
+# next instance's reverse then finds the array rolled back only if, in the same iteration and before the loop, an unconditional write covers every element the loop writes
+# (a loop over the same bounds writing the same subscripts; bounds and subscripts must keep their value over the iteration), and that write has a save pending, so the
+# reverse restores it (agen_fp_converged_later_ok requires it of every write at or after the loop's top-level statement, this one included).
+# A loop that no loop encloses has one instance.
+function agen_fp_converged_rolled_back(c)
+    c.lbody === nothing && return true
+    lsites = agen_fp_kwsites!(c.then, eachindex(c.then), c.array, Any[], true, Any[])
+    isempty(lsites) && return false
+    assigned = agen_fp_kassigned!(c.lbody, Set{Symbol}())
+    pre = agen_fp_kwsites!(c.lbody, 1:c.lidx-1, c.array, Any[], true, Any[])
+    for l in lsites
+        isempty(intersect(agen_fp_form_syms(l.form), assigned)) || return false
+        any(p -> p.cond && p.form == l.form && isempty(intersect(agen_fp_form_syms(p.form), assigned)), pre) || return false
+    end
+    return true
+end
+
+# After the solve loop of `c`, nothing writes the array without a save pending at the write (the reverse of the statements after the loop restores it, so the sweeps find
+# the converged array), and nothing writes it inside a solve loop (the tape of a solve loop keeps the last iteration only). Statements before the top-level statement that holds
+# the loop run before every instance and do not count; every write at or after it does, wherever it stands in an enclosing loop.
+function agen_fp_converged_later_ok(kernel, dets, c, sites)
+    agen_fp_converged_rolled_back(c) || return false
+    out = agen_fp_collect_writes!(kernel.body, c.top:length(kernel.body), c.array, false, dets, Any[])
+    own = Set{Any}(c.keys)
+    for (key, insolve) in out
+        key in own && continue
+        (insolve || get(sites, key, false) !== true) && return false
+    end
+    return true
+end
+
+# The site decisions with the saves of the converged arrays removed: (snap_sites, agen_sites) copies, and `report` gets (array, solve) for each. A candidate whose condition
+# does not hold on the sites that the remat and asnap passes leave is dropped and the rest are tried again.
+function agen_fp_converged_apply(kernel, active_map, dets, snap_sites, agen_sites, ii_plan, report::Vector)
+    cur = agen_fp_converged_cands(kernel, dets, agen_sites)
+    while !isempty(cur)
+        s2 = copy(snap_sites); a2 = copy(agen_sites)
+        for c in cur, k in c.keys
+            s2[k] = false; a2[k] = false
+        end
+        (a3, _) = agen_remat_apply(kernel, agen_tape_map(kernel, active_map, a2), a2)
+        (a3, _) = agen_asnap_apply(kernel, agen_tape_map(kernel, active_map, a3), a3; ii_plan = ii_plan)
+        bad = [j for (j, c) in enumerate(cur) if !agen_fp_converged_later_ok(kernel, dets, c, a3)]
+        if isempty(bad)
+            append!(report, [(array = c.array, solve = c.solve) for c in cur])
+            return (s2, a2)
+        end
+        cur = [c for (j, c) in enumerate(cur) if !(j in bad)]
+    end
+    return (snap_sites, agen_sites)
+end
+
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
                         keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
@@ -19879,7 +20085,7 @@ end
 # repeat the reverse of that iteration until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many sweeps
 # as the loop has iterations. An instance that stopped on its cap raises (there is no fixed point). `tape = :full` keeps the cap-sized tape and the unrolled reverse for
 # a cut-off loop; it handles one top-level loop only (the reference the one-slot text is tested against).
-# keep_push_pop = false, no fusion. Returns (initstacks, adjoint, primal_pruned, loop, loops); the last stack is `fp_info`, five Float64:
+# keep_push_pop = false, no fusion. Returns (initstacks, adjoint, primal_pruned, loop, loops, converged), `converged` listing the (array, solve) whose in-loop saves are not taken (agen_fp_converged_apply); the last stack is `fp_info`, five Float64:
 # [1] iterations that ran in all instances, [2] most sweeps in one instance, [3] worst final over first squared norm, [4] instances that stopped on their cap,
 # [5] status: 0 ok, 1 the sweeps of an instance did not settle, 2 an instance stopped on its cap (:full: [1] last active iteration, [4] 0 or 1, [5] 1 or 0).
 function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
@@ -19887,14 +20093,16 @@ function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
     isempty(found) && error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops (`for k = 1:n` holding one `if residual > tol`), it needs at least one")
-    r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
+    converged = Any[]
+    r = tape === :one_slot ? stade_adjoint_(expr, independents, dependents, false, false, true, false, found, converged) :
+                             stade_adjoint_(expr, independents, dependents, false, false, true, false)
     if tape === :one_slot
         w = agen_fp_rewrite_one_slot(r.adjoint, r.initstacks, found)
     else
         (length(found) == 1 && isempty(found[1].enclosing)) || error("agen_adjoint_fixedpoint: tape = :full handles one top-level counted-guard loop only")
         w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
     end
-    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1], loops = found)
+    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1], loops = found, converged = converged)
 end
 
 # The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (status 2, the
@@ -19906,13 +20114,15 @@ function agen_adjoint_fixedpoint_check(info::AbstractVector)
     return Int(info[2])
 end
 
-function stade_adjoint_(expr::Expr, independents, dependents, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool, split::Bool)
+function stade_adjoint_(expr::Expr, independents, dependents, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool, split::Bool, fp_dets = nothing, fp_report = nothing)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     kernel = norm_insert_dead_entry_resets(kernel)   # see norm_dead_entry_vars
     active_map = act_analyze(kernel)
     ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing
     # the plan is classified from the conservative sites; the emitted sites then keep a condition read only inside a loop the plan recomputes
     snap_sites, agen_sites = stade_site_level_tbr_check(kernel; ii_plan = ii_plan)
+    # the fixed-point reverse (agen_adjoint_fixedpoint) reads the arrays of a solve loop as the loop left them where that is sound: their saves inside the loop are not taken
+    fp_dets === nothing || ((snap_sites, agen_sites) = agen_fp_converged_apply(kernel, active_map, fp_dets, snap_sites, agen_sites, ii_plan, fp_report))
     snapshot_plan = snap_plan(kernel, active_map; site_needed = snap_sites)
     keep_push_pop || agen_refuse_itbr_sized(snapshot_plan)
     lin_plan = lin_build(kernel, active_map)

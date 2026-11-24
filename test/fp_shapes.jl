@@ -1,16 +1,58 @@
 # Generator of kernels for the fixed-point adjoint of a solve loop at any depth: one solve body wrapped in an enclosing nest.
 # A solve loop is a counted loop with one guard (`for kk = 1:maxit`, `if rn > tol`). The nests are the shapes the detector can meet; no kernel is written by hand.
 #   fps_kernel(body, nest) -> Expr of one function named fps_<body>_<nest>
-#   body: :scalar (a scalar contraction, state x) or :array (an array contraction in place, state u)
+#   body: :scalar (a scalar contraction, state x), :array (an array contraction in place, state u), :buf (a pointwise contraction into a buffer and a copy back, state w,
+#         the shape of a time-stepping solver: the sweeps can read the state as the loop left it) or :mid (the same with a scratch array written, read and written again)
 #   nest: see fps_nests()
 # Tests build the kernels from here, nothing in STADE.jl reads this file.
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 
 fps_nests() = [:none, :loop1, :loop2, :ifbranch, :solve_first, :solve_last, :two_in_body, :two_loops, :literal, :cold,
-               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps, :tdep_first, :read_before, :read_top, :read_between, :pre_nl, :tdep_nl, :read_nl, :bound_self]
+               :indep, :solve_in_solve, :hi_assigned, :tol_assigned, :ragged, :triangle, :two_caps, :tdep_first, :read_before, :read_top, :read_between, :pre_nl, :tdep_nl, :read_nl, :bound_self,
+               :cover, :cover_partial, :cover_acc, :cover_post, :cover_postacc, :cover_two, :cover_if, :cover_ifpre, :cover_cond, :cover_loop2_inner, :cover_loop2_outer, :cover_nn]
 
 # the lines of one solve loop, with `@` replaced by the suffix (so two solves in one body use two sets of names)
 function fps_solve(body::Symbol, sfx::String)
+    body === :buf && return replace("""
+rn@ = 1.0
+for kk@ = 1:maxit
+    if rn@ > tol
+        for i@ = 1:n
+            wn[i@] = c * tanh(w[i@]) + u[i@]
+        end
+        rn@ = 0.0
+        for i2@ = 1:n
+            rn@ = rn@ + (wn[i2@] - w[i2@]) * (wn[i2@] - w[i2@])
+        end
+        for i3@ = 1:n
+            w[i3@] = wn[i3@]
+        end
+    end
+end
+""", "@" => sfx)
+    body === :mid && return replace("""
+rn@ = 1.0
+for kk@ = 1:maxit
+    if rn@ > tol
+        for i0@ = 1:n
+            w[i0@] = 0.5 * wo[i0@]
+        end
+        for i@ = 1:n
+            wn[i@] = c * tanh(w[i@]) + u[i@]
+        end
+        for i3@ = 1:n
+            w[i3@] = 2.0 * wn[i3@]
+        end
+        rn@ = 0.0
+        for i2@ = 1:n
+            rn@ = rn@ + (w[i2@] - wo[i2@]) * (w[i2@] - wo[i2@])
+        end
+        for i4@ = 1:n
+            wo[i4@] = w[i4@]
+        end
+    end
+end
+""", "@" => sfx)
     t = body === :scalar ? """
 rn@ = 1.0
 for kk@ = 1:maxit
@@ -46,15 +88,16 @@ end
 fps_ind(txt, k) = join([isempty(l) ? l : "    "^k * l for l in split(chomp(txt), "\n")], "\n") * "\n"
 
 # the statement that moves the state between two solves (a forcing), and the one that reads it after a solve
-fps_pre(body, sfx) = body === :scalar ? "x$sfx = x$sfx + 0.1 * pa[t]\n" : "u[3] = u[3] + 0.1 * pa[t]\n"
-fps_post(body, sfx) = body === :scalar ? "ys[t] = x$sfx * x$sfx\n" : "ys[t] = u[2] + u[3]\n"
-fps_out(body) = body === :scalar ? "out[1] = x\n" : "out[1] = u[2] * u[3]\n"
+fps_state(body) = body === :scalar ? :x : body === :mid ? :wo : body === :buf ? :w : :u
+fps_pre(body, sfx) = body === :scalar ? "x$sfx = x$sfx + 0.1 * pa[t]\n" : "$(fps_state(body))[3] = $(fps_state(body))[3] + 0.1 * pa[t]\n"
+fps_post(body, sfx) = body === :scalar ? "ys[t] = x$sfx * x$sfx\n" : "ys[t] = $(fps_state(body))[2] + $(fps_state(body))[3]\n"
+fps_out(body) = body === :scalar ? "out[1] = x\n" : "out[1] = $(fps_state(body))[2] * $(fps_state(body))[3]\n"
 fps_start(body) = body === :scalar ? "x = x0\n" : ""
 
 function fps_text(body::Symbol, nest::Symbol)
     S(sfx = "") = fps_solve(body, sfx)
     # a solve whose fixed point changes with t
-    T(sfx = "") = (r = replace(replace(fps_solve(body, sfx), "+ p\n" => "+ p + 0.3 * pa[t]\n"), "+ f[j$sfx]\n" => "+ f[j$sfx] + 0.3 * pa[t]\n"); body === :scalar && !isempty(sfx) ? replace(r, "xq" => "x") : r)
+    T(sfx = "") = (r = replace(replace(replace(fps_solve(body, sfx), "+ p\n" => "+ p + 0.3 * pa[t]\n"), "+ f[j$sfx]\n" => "+ f[j$sfx] + 0.3 * pa[t]\n"), "+ u[i$sfx]\n" => "+ u[i$sfx] + 0.3 * pa[t]\n"); body === :scalar && !isempty(sfx) ? replace(r, "xq" => "x") : r)
     b = ""
     if nest === :none
         b = fps_start(body) * S()
@@ -121,13 +164,49 @@ function fps_text(body::Symbol, nest::Symbol)
         b = body === :scalar ? "x = x0\nfor t = 1:nt\n    mi = maxit - t\n" * fps_ind(replace(S(), "1:maxit" => "1:mi"), 1) * "    ys[t] = x\nend\n" : ""
     elseif nest === :tol_assigned
         b = body === :scalar ? "x = x0\nfor t = 1:nt\n    tt = tol * pa[t]\n" * fps_ind(replace(S(), "rn > tol" => "rn > tt"), 1) * "    ys[t] = x\nend\n" : ""
+    elseif nest in (:cover, :cover_partial, :cover_acc, :cover_post, :cover_postacc, :cover_two, :cover_if, :cover_ifpre, :cover_cond, :cover_loop2_inner, :cover_loop2_outer, :cover_nn)
+        # a time loop around a solver of the :buf or :mid shape; the variants differ in what is written to the state before and after the solve
+        if body === :buf || body === :mid
+            st = String(fps_state(body))
+            pre(lo = "1", hi = "n") = "for ip = $lo:$hi\n    $st[ip] = u[ip] + 0.3 * pa[t]\nend\n"
+            copyout = "for io = 1:n\n    u[io] = $st[io]\nend\n"
+            tail = copyout * "ys[t] = u[2]\n"
+            loop(inner) = "for t = 1:nt\n" * fps_ind(inner, 1) * "end\n"
+            if nest === :cover
+                b = loop(pre() * T() * tail)
+            elseif nest === :cover_partial
+                b = loop(pre("2") * T() * tail)
+            elseif nest === :cover_acc
+                b = loop("for ip = 1:n\n    $st[ip] = $st[ip] + u[ip]\nend\n" * T() * tail)
+            elseif nest === :cover_post
+                b = loop(pre() * T() * "for iq = 1:n\n    $st[iq] = $st[iq] * $st[iq]\nend\n" * tail)
+            elseif nest === :cover_postacc
+                b = loop(pre() * T() * "for iq = 1:n\n    $st[iq] = $st[iq] + 0.5 * u[iq]\nend\n" * tail)
+            elseif nest === :cover_two
+                # the second solver has its own fixed point (twice the forcing): it starts from the first one's
+                b = loop(pre() * T() * replace(T("q"), "+ u[iq]" => "+ 2.0 * u[iq]") * tail)
+            elseif nest === :cover_if
+                b = loop(pre() * "if pa[t] > 0.5\n" * fps_ind(T(), 1) * "end\n" * tail)
+            elseif nest === :cover_ifpre
+                b = loop("if pa[t] > 0.5\n" * fps_ind(pre() * T(), 1) * "end\n" * tail)
+            elseif nest === :cover_cond
+                b = loop("if pa[t] > 0.5\n" * fps_ind(pre(), 1) * "end\n" * T() * tail)
+            elseif nest === :cover_loop2_inner
+                b = "for s = 1:ns\n" * fps_ind(loop(pre() * T() * tail), 1) * "end\n"
+            elseif nest === :cover_loop2_outer
+                b = "for s = 1:ns\n" * fps_ind(replace(pre(), "pa[t]" => "pa[s]") * loop(T() * tail), 1) * "end\n"
+            else
+                # the bound of every loop of the iteration is a scalar assigned at its top: the bound is the same text for the pre-write and the solver, and not a value fixed before the loop
+                b = loop("nn = n\n" * replace(pre(), "1:n" => "1:nn") * replace(T(), "1:n" => "1:nn") * replace(tail, "1:n" => "1:nn"))
+            end
+        end
     else
         error("fps_text: unknown nest $nest")
     end
     isempty(b) && return nothing
     b *= fps_out(body)
     # the arguments are the names the text reads, in a fixed order
-    order = ["x0", "u", "w", "f", "c", "p", "pa", "ys", "out", "tol", "n", "nt", "ns", "maxit", "maxq"]
+    order = ["x0", "u", "w", "wo", "wn", "f", "c", "p", "pa", "ys", "out", "tol", "n", "nt", "ns", "maxit", "maxq"]
     used = [a for a in order if occursin(Regex("\\b" * a * "\\b"), b)]
     name = "fps_$(body)_$(nest)"
     return "function $name($(join(used, ", ")))\n" * fps_ind(b, 1) * "    return nothing\nend\n"

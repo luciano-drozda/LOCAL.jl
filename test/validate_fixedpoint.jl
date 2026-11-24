@@ -2,8 +2,8 @@
 # For each kernel and four regimes:
 #   converged  the loop stops on its tolerance: the fixed-point adjoint (every shadow and returned scalar) equals the full adjoint of the unrolled loop to
 #              1e-9, a central difference of the primal (the tolerance held fixed) to 1e-5, the sweeps ran (at least one), no flag is set, the state arrays it
-#              leaves hold the primal result (the unrolled reverse rolls them back to their entry values), the result equals bit for bit that of the same adjoint
-#              with the cap-sized tape (`tape = :full`), and the tape holds the same number of elements for twice the cap
+#              leaves hold the primal result (the unrolled reverse rolls them back to their entry values), the result equals that of the same adjoint
+#              with the cap-sized tape (`tape = :full`) bit for bit, or to 1e-9 when a solve array was converted to the converged-state rule, and the tape holds the same number of elements for twice the cap
 #   zero       the guard is closed before the first iteration: no sweep, the two adjoints equal
 #   cap        maxit = 3: the loop stops on its cap, no sweep runs, fp_info[5] = 2 and the adjoint raises (there is no fixed point)
 #   nocap      maxit = 0: the loop does not run, nothing is cut off, nothing raises
@@ -95,17 +95,18 @@ function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool =
     pi_ = STADE.val_compile(sg_rename(fp.initstacks, :fpv_init)); pg = STADE.val_compile(sg_rename(fp.adjoint, :fpv_adj))
     li = nested ? nothing : STADE.val_compile(sg_rename(fl.initstacks, :fpv_init_full)); lg = nested ? nothing : STADE.val_compile(sg_rename(fl.adjoint, :fpv_adj_full))
     names_full = Symbol[a for a in full.initstacks.args[1].args[2:end]]
+    names_fp = Symbol[a for a in fp.initstacks.args[1].args[2:end]]   # the one-slot tape can need fewer sizes than the cap-sized one
     n_ret = count(a -> kernel.sig.kinds[a] == :scalar_float, kernel.sig.args)
     c1 = sg_cpu_run(kernel.sig, int_args, vals, seed, fi, fg, names_full)
     a2, t2 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
-    s2 = sg_init_stacks(pi_, sg_stack_extra(names_full, int_args, vals, identity))
+    s2 = sg_init_stacks(pi_, sg_stack_extra(names_fp, int_args, vals, identity))
     raised = ""; r2 = nothing
     try r2 = Base.invokelatest(pg, a2..., s2...) catch e; raised = first(split(sprint(showerror, e), "\n")) end
     info = Float64.(s2[end])
     verdict = try STADE.agen_adjoint_fixedpoint_check(info); "" catch e; first(split(sprint(showerror, e), "\n")) end
-    tape1 = fpv_tape_elems(pi_, names_full, int_args, vals)
-    tape2 = haskey(int_args, :maxit) && regime === :converged ? fpv_tape_elems(pi_, names_full, merge(int_args, Dict(:maxit => 2 * int_args[:maxit])), vals) : -1
-    isempty(raised) || return (err = NaN, info = info, changed = 0, fderr = NaN, verdict = verdict, vleft = NaN, raised = raised, errfull = NaN, tape = tape1, tape2 = tape2)
+    tape1 = fpv_tape_elems(pi_, names_fp, int_args, vals)
+    tape2 = haskey(int_args, :maxit) && regime === :converged ? fpv_tape_elems(pi_, names_fp, merge(int_args, Dict(:maxit => 2 * int_args[:maxit])), vals) : -1
+    isempty(raised) || return (err = NaN, info = info, changed = 0, fderr = NaN, verdict = verdict, vleft = NaN, raised = raised, errfull = NaN, tape = tape1, tape2 = tape2, conv = length(fp.converged))
     # the adjoints (every shadow, every returned scalar); the primal arrays are not compared: the unrolled reverse rolls them back to the entry values, the
     # fixed-point reverse leaves the state at the fixed point (checked against the primal below)
     m = 0.0; changed = 0
@@ -116,7 +117,7 @@ function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool =
     m = max(m, sg_scalar_err(n_ret, c1.ret, r2))
     errfull = 0.0; vleft = 0.0
     if !nested
-        # the same adjoint with the cap-sized tape: every shadow, every value and every returned scalar equal bit for bit
+        # the same adjoint with the cap-sized tape: every shadow, value and returned scalar equal bit for bit (1e-9 when a solve array was converted)
         a3, t3 = sg_build_call(kernel.sig, int_args, vals, seed, identity)
         s3 = sg_init_stacks(li, sg_stack_extra(names_full, int_args, vals, identity))
         r3 = Base.invokelatest(lg, a3..., s3...)
@@ -134,8 +135,8 @@ function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool =
             kernel.sig.kinds[a] == :array_float && a in fp.loop.arrays && (vleft = max(vleft, sg_relerr(pargs[i], t2[a].val)))
         end
     end
-    fderr = fd ? fpv_fd(kernel, primal, fp, int_args, vals, names_full, :tol) : NaN
-    return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft, raised = "", errfull = errfull, tape = tape1, tape2 = tape2)
+    fderr = fd ? fpv_fd(kernel, primal, fp, int_args, vals, names_fp, :tol) : NaN
+    return (err = m, info = info, changed = changed, fderr = fderr, verdict = verdict, vleft = vleft, raised = "", errfull = errfull, tape = tape1, tape2 = tape2, conv = length(fp.converged))
 end
 
 # the same draw run by the device code of the fixed-point adjoint (`env` of validate_adjoint_split_gpu.jl): the worst relative error of every shadow and
@@ -257,8 +258,49 @@ function fpv_dispatch_checks(say)
     end
 end
 
+# the candidates of the converged-state rule on a generated shape, and the pieces the rule reads
+function fpv_converged_parts(body, nest)
+    primal = fps_kernel(body, nest)
+    kernel = STADE.norm_insert_dead_entry_resets(STADE.parse_kernel(primal))
+    dets = STADE.agen_fp_detect(primal, kernel.sig.kinds; kernel = kernel)
+    _, sites = STADE.stade_site_level_tbr_check(kernel; ii_plan = nothing)
+    return (kernel = kernel, dets = dets, sites = sites, cands = STADE.agen_fp_converged_cands(kernel, dets, sites))
+end
+
+# The guards of the converged-state rule that a whole kernel cannot reach: a write after the solve that has no save pending (the generator's own decision makes every write
+# after a nonlinear read saved), and the one that is saved is what the reverse restores.
+function fpv_converged_unit_checks(say)
+    P = fpv_converged_parts(:buf, :cover_post)
+    c = P.cands[findfirst(x -> x.array === :w, P.cands)]
+    say(STADE.agen_fp_converged_later_ok(P.kernel, P.dets, c, P.sites), "converged state: the cover_post shape passes with every save pending")
+    outside = [k for (k, insolve) in STADE.agen_fp_collect_writes!(P.kernel.body, c.top:length(P.kernel.body), :w, false, P.dets, Any[]) if !insolve && !(k in c.keys)]
+    say(length(outside) == 2, "converged state: the cover_post shape writes `w` at two sites outside the solve (got $(length(outside)))")
+    for k in outside
+        s2 = copy(P.sites); s2[k] = false
+        say(!STADE.agen_fp_converged_later_ok(P.kernel, P.dets, c, s2), "converged state: a write of `w` with no save pending refuses the rule")
+    end
+    # a write inside another solve loop refuses it, whatever its save
+    Q = fpv_converged_parts(:buf, :cover_two)
+    say(!isempty(Q.cands) && all(c2 -> !STADE.agen_fp_converged_later_ok(Q.kernel, Q.dets, c2, Q.sites), Q.cands), "converged state: two solve loops writing one array refuse the rule")
+    # the bound of the pre-write is a scalar assigned in the iteration
+    R = fpv_converged_parts(:buf, :cover_nn)
+    say(!isempty(R.cands) && !STADE.agen_fp_converged_rolled_back(R.cands[1]), "converged state: a bound assigned in the iteration does not prove the cover")
+    # the first loop of the cover shape is covered, the partial one is not
+    S = fpv_converged_parts(:buf, :cover)
+    say(!isempty(S.cands) && STADE.agen_fp_converged_rolled_back(S.cands[1]), "converged state: the cover shape is rolled back")
+    T = fpv_converged_parts(:buf, :cover_partial)
+    say(!isempty(T.cands) && !STADE.agen_fp_converged_rolled_back(T.cands[1]), "converged state: a pre-write of fewer elements does not cover")
+    # a solve that no loop encloses has one instance
+    U = fpv_converged_parts(:buf, :none)
+    say(!isempty(U.cands) && STADE.agen_fp_converged_rolled_back(U.cands[1]), "converged state: a solve that no loop encloses is rolled back")
+    # the arrays of the body: a scratch array written, read and written again is not a candidate, the carried one is
+    M = fpv_converged_parts(:mid, :cover_post)
+    say(all(x -> x.array !== :w, M.cands) && any(x -> x.array === :wo, M.cands), "converged state: `w` (read between two writes) is not a candidate, `wo` is (got $([x.array for x in M.cands]))")
+end
+
 function fpv_unit_checks(say)
     root = @__DIR__
+    fpv_converged_unit_checks(say)
     for (nm, frag) in (("fp_counter_used", "has 0 counted-guard loops"), ("fp_accumulate", "never consumes a state adjoint"))
         primal = STADE.io_read_corpus_entry(joinpath(root, "fp-corpus", nm * ".jl"))
         msg = try STADE.agen_adjoint_fixedpoint(primal); "" catch e; sprint(showerror, e) end
@@ -348,7 +390,25 @@ end
 # generated shapes of fp_shapes.jl that must take the fixed-point reverse
 fpv_shape_cases() = Any[(:scalar, :none), (:scalar, :loop1), (:scalar, :loop2), (:scalar, :ifbranch), (:scalar, :solve_first), (:scalar, :solve_last),
                         (:scalar, :two_in_body), (:scalar, :two_loops), (:scalar, :literal), (:scalar, :two_caps), (:scalar, :tdep_first), (:scalar, :pre_nl),
-                        (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal), (:array, :two_caps), (:array, :tdep_first), (:array, :read_before)]
+                        (:array, :loop1), (:array, :ifbranch), (:array, :two_loops), (:array, :literal), (:array, :two_caps), (:array, :tdep_first), (:array, :read_before),
+                        (:array, :none), (:array, :read_top),
+                        (:buf, :none), (:buf, :read_top), (:buf, :loop1), (:buf, :tdep_first), (:buf, :read_before), (:buf, :two_loops),
+                        (:buf, :cover), (:buf, :cover_partial), (:buf, :cover_acc), (:buf, :cover_post), (:buf, :cover_postacc), (:buf, :cover_two), (:buf, :cover_if),
+                        (:buf, :cover_ifpre), (:buf, :cover_cond), (:buf, :cover_loop2_inner), (:buf, :cover_loop2_outer),
+                        (:mid, :none), (:mid, :cover), (:mid, :cover_post)]
+
+# the shapes the host path takes and the GPU ingest cannot: a loop bound assigned in the iteration gives tier-B tables read by an inline index (`prefix_x[t]`), which
+# cgen_ingest does not parse (not specific to the fixed-point path)
+fpv_shape_cases_host_only() = Any[(:buf, :cover_nn)]
+
+# Whether the sweeps of a generated shape read an array as the solve left it (agen_fp_converged_apply): a solve that no loop encloses, or one that a write with a save covering
+# everything it writes precedes in its iteration, and that nothing after it or in another solve disturbs. The shapes not listed are not asserted.
+fpv_expect_converged() = Dict{String,Bool}(
+    "fps_array_none" => true, "fps_array_read_top" => true, "fps_array_loop1" => false, "fps_array_tdep_first" => false,
+    "fps_buf_none" => true, "fps_buf_read_top" => true, "fps_buf_loop1" => false, "fps_buf_tdep_first" => false, "fps_buf_read_before" => false, "fps_buf_two_loops" => false,
+    "fps_buf_cover" => true, "fps_buf_cover_acc" => true, "fps_buf_cover_post" => true, "fps_buf_cover_postacc" => true, "fps_buf_cover_if" => true, "fps_buf_cover_loop2_inner" => true,
+    "fps_buf_cover_partial" => false, "fps_buf_cover_two" => false, "fps_buf_cover_ifpre" => false, "fps_buf_cover_cond" => false, "fps_buf_cover_loop2_outer" => false, "fps_buf_cover_nn" => false,
+    "fps_mid_none" => false, "fps_mid_cover" => false, "fps_mid_cover_post" => true)
 
 # (pins, floats, array start size, preparation or nothing) of a generated shape
 function fpv_shape_params(body, nest)
@@ -361,8 +421,9 @@ function fpv_shape_params(body, nest)
 end
 
 # the four regimes of one case; `run(regime)` is fpv_run or fpv_run_expr bound to the case
-function fpv_case_checks(say, name, run, verbose)
+function fpv_case_checks(say, name, run, verbose; expect_conv = nothing)
     r = run(:converged)
+    expect_conv === nothing || say((r.conv > 0) == expect_conv, "$name converged: the sweeps " * (expect_conv ? "should" : "should not") * " read an array as the solve left it (arrays: $(r.conv))")
     verbose && println(rpad(name, 22), " converged: err=", round(r.err, sigdigits = 3), " fd=", round(r.fderr, sigdigits = 3), " sweeps=", Int(r.info[2]), " iterations=", Int(r.info[1]), " ratio=", round(r.info[3], sigdigits = 3), " changed=", r.changed, " tape=", r.tape)
     say(isempty(r.raised), "$name converged: the adjoint raised ($(r.raised))")
     say(r.err <= 1e-9, "$name converged: fixed-point vs unrolled adjoint err=$(r.err)")
@@ -370,7 +431,8 @@ function fpv_case_checks(say, name, run, verbose)
     say(r.info[2] >= 1 && r.info[1] >= 1 && r.info[4] == 0 && r.info[5] == 0 && r.verdict == "", "$name converged: sweeps ran, no flag ($(r.info)) $(r.verdict)")
     say(r.changed > 0, "$name converged: nothing changed (vacuous)")
     say(r.vleft <= 1e-6, "$name converged: the state the adjoint leaves is not the primal result ($(r.vleft))")
-    say(r.errfull == 0.0, "$name converged: the one-slot tape and the cap-sized tape differ by $(r.errfull)")
+    # the same adjoint to the last bit, unless the sweeps read an array as the loop left it (its saves are not taken): the two then differ by the last residual's square root
+    say(r.conv == 0 ? r.errfull == 0.0 : r.errfull <= 1e-9, "$name converged: the one-slot tape and the cap-sized tape differ by $(r.errfull)" * (r.conv == 0 ? "" : " ($(r.conv) arrays read at the converged state)"))
     say(r.tape > 0 && r.tape == r.tape2, "$name converged: the tape has $(r.tape) elements for the cap and $(r.tape2) for twice the cap")
     z = run(:zero)
     say(isempty(z.raised) && z.err <= 1e-12 && z.info[1] == 0 && z.info[2] == 0 && z.info[4] == 0 && z.info[5] == 0, "$name zero: err=$(z.err) info=$(z.info) raised=$(z.raised)")
@@ -394,11 +456,11 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
         fpv_case_checks(say, name, reg -> fpv_run(dir, name, pins, floats, gs, prep, reg; fd = reg === :converged), verbose)
     end
     # generated shapes: one solve loop, or two, inside loops and branches at any depth (fp_shapes.jl)
-    for (body, nest) in fpv_shape_cases()
+    for (body, nest) in vcat(fpv_shape_cases(), fpv_shape_cases_host_only())
         name = "fps_$(body)_$(nest)"
         isempty(only) || name in only || continue
         sp = fpv_shape_params(body, nest); primal = sp.primal
-        fpv_case_checks(say, name, reg -> fpv_run_expr(primal, sp.pins, sp.floats, sp.gs, sp.prep, reg; fd = reg === :converged), verbose)
+        fpv_case_checks(say, name, reg -> fpv_run_expr(primal, sp.pins, sp.floats, sp.gs, sp.prep, reg; fd = reg === :converged), verbose; expect_conv = get(fpv_expect_converged(), name, nothing))
     end
     u = fpv_unsettled()
     say(occursin("did not settle", u.msg), "fp_slow_linear: a converged loop whose reverse cannot settle raises (got: $(first(u.msg, 100)))")
@@ -453,6 +515,17 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("the acceptance is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", "        nothing; \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and takes", ["fp_scalar_cos"]),
             ("a refusal is silent", "        @info \"stade_adjoint: `\$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: \$why\"\n", "        nothing\n", ["fp_scalar_cos"]),
             ("the independents are dropped", "agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)", "agen_adjoint_fixedpoint(expr)", ["fp_scalar_cos"]),
+            ("the arrays read between two writes are candidates", "        (j in ws || (j > first(ws) && j < last(ws))) && return false\n", "", ["fps_mid_none"]),
+            ("the sweeps never read the converged state", "    fp_dets === nothing || ((snap_sites, agen_sites) = agen_fp_converged_apply(", "    false && ((snap_sites, agen_sites) = agen_fp_converged_apply(", ["fps_buf_none"]),
+            ("a loop inside a loop needs no cover", "    c.lbody === nothing && return true\n", "    return true\n", ["fps_buf_cover_partial", "fps_buf_cover_cond", "fps_buf_loop1"]),
+            ("a pre-write of other elements covers", "        any(p -> p.cond && p.form == l.form && isempty(", "        any(p -> p.cond && isempty(", ["fps_buf_cover_partial"]),
+            ("a conditional pre-write covers", "        any(p -> p.cond && p.form == l.form && isempty(", "        any(p -> p.form == l.form && isempty(", ["fps_buf_cover_cond"]),
+            ("a bound assigned in the iteration proves the cover", "        isempty(intersect(agen_fp_form_syms(l.form), assigned)) || return false\n", "", ["fps_buf_cover_nn"]),
+            ("a write inside another solve loop is accepted", "        (insolve || get(sites, key, false) !== true) && return false\n", "        get(sites, key, false) !== true && return false\n", ["fps_buf_cover_two"]),
+            ("a write without a save pending is accepted", "        (insolve || get(sites, key, false) !== true) && return false\n", "        insolve && return false\n", ["fps_buf_none"]),
+            ("the writes of the loop's own statement do not count", "    out = agen_fp_collect_writes!(kernel.body, c.top:length(kernel.body), c.array, false, dets, Any[])\n", "    out = agen_fp_collect_writes!(kernel.body, c.top+1:length(kernel.body), c.array, false, dets, Any[])\n", ["fps_buf_cover_two"]),
+            ("a candidate that fails the check is kept", "        bad = [j for (j, c) in enumerate(cur) if !agen_fp_converged_later_ok(kernel, dets, c, a3)]\n", "        bad = Int[]\n", ["fps_buf_cover_two", "fps_buf_cover_partial"]),
+            ("the converged arrays are never reported", "            append!(report, [(array = c.array, solve = c.solve) for c in cur])\n", "", ["fps_buf_cover"]),
             ("the HVP validator takes the fixed-point adjoint", "        adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", "        adjoint_out = stade_adjoint(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)\n        hvp_out = stade_hvp(", ["fp_scalar_cos"]),
             ("a validator says nothing about the adjoint it checks", "    @info \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", "    nothing; \"`\$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags,", ["fp_scalar_cos"]),
         ]
