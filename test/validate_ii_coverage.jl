@@ -34,7 +34,7 @@ function validate_ii_coverage(dir::String = joinpath(@__DIR__, "val-corpus"))
     # ii_multiversion: 0.4.4 classified two of its loops and produced a wrong adjoint (the weight scalar is reassigned per tap).
     CEILINGS = Dict{String,Int}("idm_src_consume" => 0, "ii_multiversion" => 0)
     EXPECTED = Dict{String,Int}(
-        "idm_slots" => 0, "idm_zerotrip" => 0, "idm_acc_two" => 0, "idm_tile" => 2, "idm_dup_write" => 0,
+        "remat_unused_stack" => 0, "idm_slots" => 0, "idm_zerotrip" => 0, "idm_acc_two" => 0, "idm_tile" => 2, "idm_dup_write" => 0,
         "idm_refuse_cond_read" => 0, "idm_refuse_cond_read_nl" => 0, "idm_refuse_scalar_read" => 0, "idm_refuse_consume_gap" => 0,
         "idm_src_consume" => 0, "idm_cse_acc" => 0, "idm_gather_rmw" => 0, "idm_overlap_plain" => 0, "ii_multiversion" => 0,
         "so_carry" => 0, "so_hostread" => 0, "so_inner" => 0, "so_liveout" => 0, "so_tile" => 0,
