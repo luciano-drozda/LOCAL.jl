@@ -19841,7 +19841,6 @@ function agen_fp_converged_rolled_back(c)
     assigned = agen_fp_kassigned!(c.lbody, Set{Symbol}())
     pre = agen_fp_kwsites!(c.lbody, 1:c.lidx-1, c.array, Any[], true, Any[])
     for l in lsites
-        isempty(intersect(agen_fp_form_syms(l.form), assigned)) || return false
         any(p -> p.cond && p.form == l.form && isempty(intersect(agen_fp_form_syms(p.form), assigned)), pre) || return false
     end
     return true

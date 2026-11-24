@@ -520,7 +520,7 @@ function validate_fixedpoint(; verbose = true, only = String[], sabotage = false
             ("a loop inside a loop needs no cover", "    c.lbody === nothing && return true\n", "    return true\n", ["fps_buf_cover_partial", "fps_buf_cover_cond", "fps_buf_loop1"]),
             ("a pre-write of other elements covers", "        any(p -> p.cond && p.form == l.form && isempty(", "        any(p -> p.cond && isempty(", ["fps_buf_cover_partial"]),
             ("a conditional pre-write covers", "        any(p -> p.cond && p.form == l.form && isempty(", "        any(p -> p.form == l.form && isempty(", ["fps_buf_cover_cond"]),
-            ("a bound assigned in the iteration proves the cover", "        isempty(intersect(agen_fp_form_syms(l.form), assigned)) || return false\n", "", ["fps_buf_cover_nn"]),
+            ("a bound assigned in the iteration proves the cover", "p.form == l.form && isempty(intersect(agen_fp_form_syms(p.form), assigned)), pre)", "p.form == l.form, pre)", ["fps_buf_cover_nn"]),
             ("a write inside another solve loop is accepted", "        (insolve || get(sites, key, false) !== true) && return false\n", "        get(sites, key, false) !== true && return false\n", ["fps_buf_cover_two"]),
             ("a write without a save pending is accepted", "        (insolve || get(sites, key, false) !== true) && return false\n", "        insolve && return false\n", ["fps_buf_none"]),
             ("the writes of the loop's own statement do not count", "    out = agen_fp_collect_writes!(kernel.body, c.top:length(kernel.body), c.array, false, dets, Any[])\n", "    out = agen_fp_collect_writes!(kernel.body, c.top+1:length(kernel.body), c.array, false, dets, Any[])\n", ["fps_buf_cover_two"]),
