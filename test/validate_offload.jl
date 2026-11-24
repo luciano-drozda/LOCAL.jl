@@ -154,7 +154,7 @@ function validate_offload(dir::String = joinpath(@__DIR__, "val-corpus"))
         "gat_reduce_scalar" => 3, "gat_reverse" => 0, "gat_rows" => 0, "gat_stride" => 0, "gat_sum_scalar" => 0, "gat_two_targets" => 0, "gat_wide" => 0,
         "so_tile" => 0, "so_hostread" => 4, "so_liveout" => 9, "so_carry" => 3, "so_inner" => 5,
         # correctness kernels for the rematerialized-restore guards and the branch-scalar rewrite; not offload targets
-        "if_scalar_rewrite" => 0, "remat_shapes" => 20,
+        "if_scalar_rewrite" => 0, "remat_shapes" => 20, "remat_unused_stack" => 0,
         "liveout_red_nest" => 0, "liveout_red_fused" => 0, "liveout_red_top" => 1, "liveout_local_last" => 0, "remat_cross" => 6,
         "cross_readbefore" => 0, "cross_entry" => 0, "cross_after" => 0, "cross_ifwrite" => 0, "cross_nested" => 0, "cross_branchlocal" => 2,
         "cross_mixed" => 0, "cross_argread" => 3, "selfrace_conv" => 0, "selfrace_layout" => 0,
