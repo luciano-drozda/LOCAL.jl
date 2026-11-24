@@ -16,7 +16,7 @@ include(joinpath(@__DIR__, "validate_fixedpoint_tangent_hvp.jl"))
 # one call of a generated HVP: the flat output (like val_call_hv), the stacks (the last one is fp_info for a fixed-point HVP), the arrays after the call, what it raised
 function fph_call(fn, initfn, kernel, int_args, vals, seed, D, dseed, names; wrap = identity, tohost = identity)
     sig = kernel.sig
-    extra = Any[haskey(int_args, n) ? int_args[n] : wrap(deepcopy(vals[n])) for n in names]
+    extra = Any[haskey(int_args, n) ? int_args[n] : (vals[n] isa AbstractArray ? wrap(deepcopy(vals[n])) : vals[n]) for n in names]
     stacks = STADE.val_init_stacks(initfn, extra)
     args = STADE.val_hvp_call_args(sig, int_args, vals, seed, D, dseed, stacks)
     # a device run: the arrays of the kernel move to the device, the stacks (fp_info included) already are there
