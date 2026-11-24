@@ -73,13 +73,13 @@ end
 
 # the same for a kernel given as an Expr (a generated shape of fp_shapes.jl): the comparison with the cap-sized tape and the state left by the adjoint apply to
 # a solve loop at the top level only
-function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool = false)
+function fpv_run_expr(primal, pins, floats, gs, prep, regime::Symbol; fd::Bool = false, seed::Int = 20261122)
     kernel = STADE.parse_kernel(primal)
     dets = STADE.agen_fp_detect(primal, kernel.sig.kinds)
     nested = length(dets) > 1 || any(d -> !isempty(d.enclosing), dets)
     pins2 = copy(pins); floats2 = copy(floats)
     regime === :cap && (pins2[:maxit] = 3)
-    Random.seed!(20261122)
+    Random.seed!(seed)
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = pins2, int_lo = 3, int_hi = 5, grow_start = gs, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
     int_args = merge(bl.int_args, pins2); vals = bl.values
