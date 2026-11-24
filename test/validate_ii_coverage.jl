@@ -74,7 +74,7 @@ function validate_ii_coverage(dir::String = joinpath(@__DIR__, "val-corpus"))
         "windowed_relax_retire" => 0,
         # baselines added for 30 kernels that had none (measured with v0.4.14); asnap_* kernels pin array-snapshot shapes, whose loops mostly stay unclassified
         "asnap_2d" => 0, "asnap_condread" => 0, "asnap_direct" => 0, "asnap_ifwrite" => 0, "asnap_ii" => 1, "asnap_nameclash" => 0,
-        "asnap_nested" => 0, "asnap_nestedboth" => 0, "asnap_ok" => 0, "asnap_outside" => 0, "asnap_ragged" => 0, "asnap_readbefore" => 0,
+        "asnap_nested" => 0, "asnap_nestedboth" => 0, "asnap_noscatter" => 0, "asnap_ok" => 0, "asnap_outside" => 0, "asnap_ragged" => 0, "asnap_readbefore" => 0,
         "asnap_readbetween" => 0, "asnap_selfnl" => 0, "asnap_slice" => 0, "asnap_twoarrays" => 0, "asnap_zerocover" => 0, "asnap_zerotrip" => 0,
         "early_stage_offset" => 0, "if_in_outer_loop" => 1, "if_scalar_then_if" => 0, "if_scalar_then_loop_if" => 0, "if_top_scalar" => 0,
         # hoist_* (v0.4.25) and lin_* (v0.4.27) had no baseline; all are measured at 0 classified loops: the hoist kernels accumulate into shared bins, the lin_* loops carry or alias their arrays
