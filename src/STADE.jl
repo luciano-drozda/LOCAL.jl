@@ -19049,36 +19049,180 @@ function agen_fp_assigned_all!(x, acc)
     return nothing
 end
 
-# the counted-guard loops at the top level of a kernel, each with its state: the arrays the loop body writes and the float scalars it carries from one
-# iteration to the next (read before assigned, and assigned). The guard variable is not state.
-function agen_fp_detect(expr::Expr, kinds::Dict{Symbol,Symbol})
-    body = agen_fp_stmts(expr.args[2])
-    found = Any[]
-    for (i, st) in enumerate(body)
-        h = agen_fp_header(st)
-        (h !== nothing && h.step === 1 && h.lo === 1 && h.hi isa Symbol) || continue
-        inner = agen_fp_stmts(st.args[2])
-        (length(inner) == 1 && inner[1] isa Expr && inner[1].head === :if && length(inner[1].args) == 2) || continue
-        c = inner[1].args[1]
-        (c isa Expr && c.head === :call && length(c.args) == 3 && c.args[1] in (:>, :>=) && c.args[2] isa Symbol) || continue
-        rn = c.args[2]; tolx = c.args[3]
-        get(kinds, rn, :none) == :scalar_float || continue
-        (tolx isa Number || (tolx isa Symbol && get(kinds, tolx, :none) == :scalar_float)) || continue
-        syms = Set{Symbol}(); agen_split_syms!(inner[1], syms)
-        h.var in syms && continue
-        thenblk = inner[1].args[2]
-        assigned = Set{Symbol}(); agen_fp_assigned_all!(thenblk, assigned)
-        (rn in assigned && !(tolx isa Symbol && tolx in assigned) && !(h.hi in assigned)) || continue
-        pre = Set{Symbol}(); agen_split_top_assigned!(body[1:i-1], pre)
-        rn in pre || continue
-        written = Set{Symbol}(); agen_split_written_arrays!(thenblk, written)
-        arrays = sort(Symbol[a for a in written if get(kinds, a, :none) == :array_float])
-        uev = Set{Symbol}(); agen_split_uev!(thenblk, Set{Symbol}(), uev)
-        scalars = sort(Symbol[v for v in assigned if v in uev && v != rn && get(kinds, v, :none) == :scalar_float])
-        (isempty(arrays) && isempty(scalars)) && continue
-        push!(found, (index = i, var = h.var, hi = h.hi, rn = rn, cmp = c.args[1], tol = tolx, arrays = arrays, scalars = scalars))
+# One statement as a counted-guard loop (a solve loop): `for kk = 1:hi` whose body is one `if rn > tol` with no else, with its state (the arrays the loop body
+# writes and the float scalars it carries from one iteration to the next: read before assigned, and assigned). The guard variable is not state. `before` is the
+# statement list of the same block up to this statement. Nothing when the statement does not fit.
+function agen_fp_match_solve(st, before::Vector, kinds::Dict{Symbol,Symbol})
+    h = agen_fp_header(st)
+    (h !== nothing && h.step === 1 && h.lo === 1 && h.hi isa Symbol) || return nothing
+    inner = agen_fp_stmts(st.args[2])
+    (length(inner) == 1 && inner[1] isa Expr && inner[1].head === :if && length(inner[1].args) == 2) || return nothing
+    c = inner[1].args[1]
+    (c isa Expr && c.head === :call && length(c.args) == 3 && c.args[1] in (:>, :>=) && c.args[2] isa Symbol) || return nothing
+    rn = c.args[2]; tolx = c.args[3]
+    get(kinds, rn, :none) == :scalar_float || return nothing
+    (tolx isa Number || (tolx isa Symbol && get(kinds, tolx, :none) == :scalar_float)) || return nothing
+    syms = Set{Symbol}(); agen_split_syms!(inner[1], syms)
+    h.var in syms && return nothing
+    thenblk = inner[1].args[2]
+    assigned = Set{Symbol}(); agen_fp_assigned_all!(thenblk, assigned)
+    (rn in assigned && !(tolx isa Symbol && tolx in assigned) && !(h.hi in assigned)) || return nothing
+    pre = Set{Symbol}(); agen_split_top_assigned!(before, pre)
+    rn in pre || return nothing
+    written = Set{Symbol}(); agen_split_written_arrays!(thenblk, written)
+    arrays = sort(Symbol[a for a in written if get(kinds, a, :none) == :array_float])
+    uev = Set{Symbol}(); agen_split_uev!(thenblk, Set{Symbol}(), uev)
+    scalars = sort(Symbol[v for v in assigned if v in uev && v != rn && get(kinds, v, :none) == :scalar_float])
+    (isempty(arrays) && isempty(scalars)) && return nothing
+    return (var = h.var, hi = h.hi, rn = rn, cmp = c.args[1], tol = tolx, arrays = arrays, scalars = scalars, loop = st)
+end
+
+# every solve loop of a statement list, at any depth: the walk goes through each `for` and `if`. `enclosing` is the chain of statements around the list, outermost first.
+function agen_fp_walk_solves!(stmts::Vector, enclosing::Vector, kinds::Dict{Symbol,Symbol}, out::Vector)
+    for (i, st) in enumerate(stmts)
+        st isa Expr || continue
+        if st.head === :for
+            m = agen_fp_match_solve(st, stmts[1:i-1], kinds)
+            m === nothing || push!(out, merge(m, (enclosing = Any[enclosing...],)))
+            agen_fp_walk_solves!(agen_fp_stmts(st.args[2]), Any[enclosing..., st], kinds, out)
+        elseif st.head === :if
+            agen_fp_walk_solves!(agen_fp_stmts(st.args[2]), Any[enclosing..., st], kinds, out)
+            length(st.args) == 3 && agen_fp_walk_solves!(agen_fp_stmts(st.args[3]), Any[enclosing..., st], kinds, out)
+        end
     end
-    return found
+    return nothing
+end
+
+agen_fp_count_sym(e, s::Symbol) = e === s ? 1 : e isa Expr ? sum(agen_fp_count_sym(a, s) for a in e.args; init = 0) : 0
+
+# The solve loops of a kernel with their state and their enclosing nest (`enclosing`, the loops and branches around each, outermost first; `loop` is the `for`
+# statement itself). Each carries the facts the refusal rule reads: `inside` (another solve loop encloses it), `holds` (it encloses another), `cap_elsewhere`
+# (uses of its cap outside the headers of solve loops and outside their bodies: the one-slot tape replaces every trip count of that cap).
+function agen_fp_detect(expr::Expr, kinds::Dict{Symbol,Symbol}; kernel = nothing)
+    found = Any[]
+    agen_fp_walk_solves!(agen_fp_stmts(expr.args[2]), Any[], kinds, found)
+    total = Dict{Symbol,Int}(); nhead = Dict{Symbol,Int}()
+    for d in found
+        haskey(total, d.hi) || (total[d.hi] = agen_fp_count_sym(expr.args[2], d.hi))
+        nhead[d.hi] = get(nhead, d.hi, 0) + 1
+    end
+    stale = isempty(found) ? Symbol[] : agen_fp_stale(expr, found, kinds, kernel === nothing ? parse_kernel(expr) : kernel)
+    out = Any[]
+    for d in found
+        inside = any(o -> o.loop !== d.loop && any(e -> e === o.loop, d.enclosing), found)
+        holds = any(o -> o.loop !== d.loop && any(e -> e === d.loop, o.enclosing), found)
+        inbody = sum(agen_fp_count_sym(o.loop.args[2], d.hi) for o in found if o.hi === d.hi; init = 0)
+        push!(out, merge(d, (inside = inside, holds = holds, cap_elsewhere = total[d.hi] - nhead[d.hi] - inbody, stale = stale)))
+    end
+    return out
+end
+
+# ---- the entry value of a solve's state ----
+# The reverse of a solve loop leaves its state at the last iteration's value, not at the value the loop found on entry (the unrolled reverse rolls it back through the
+# whole history, the one-slot tape keeps one iteration). A statement that reads the state before a solve loop overwrites it, and whose adjoint needs that value, would
+# read the wrong one in the reverse. Scalars that an enclosing loop assigns are restored to their end-of-iteration value by the generated adjoint; arrays are not.
+
+# the value of `v` in the expression `e` is needed by the adjoint of the assignment whose right-hand side is `e` (act: the active variables). A sum, a difference and a
+# product or quotient with inactive factors pass the derivative through without reading the value; any other use reads it.
+function agen_fp_need(e, v::Symbol, act::Dict{Symbol,Bool})
+    e isa Expr || return false
+    isact(x) = (syms = Set{Symbol}(); agen_split_syms!(x, syms); any(a -> get(act, a, false), syms))
+    has(x) = agen_fp_count_sym(x, v) > 0
+    if e.head === :call && e.args[1] isa Symbol
+        op = e.args[1]; args = e.args[2:end]
+        any(a -> agen_fp_need(a, v, act), args) && return true
+        if op in (:+, :-)
+            return false
+        elseif op === :*
+            for (i, a) in enumerate(args)
+                has(a) && any(j -> j != i && isact(args[j]), eachindex(args)) && return true
+            end
+            return false
+        elseif op === :/ && length(args) == 2
+            has(args[2]) && (isact(args[1]) || isact(args[2])) && return true
+            has(args[1]) && isact(args[2]) && return true
+            return false
+        else
+            return any(has, args) && any(isact, args)
+        end
+    end
+    e.head === :ref && return false
+    return any(a -> agen_fp_need(a, v, act), e.args)
+end
+
+# is the value of v read by the assignment `st` and needed by its adjoint? A self-update (`x = ... x ...`, `u[i] = ... u[i] ...`) is exempt: the generated adjoint saves
+# the old value at the assignment itself.
+function agen_fp_stale_assign(st, v::Symbol, act::Dict{Symbol,Bool})
+    lhs = st.args[1]; rhs = st.args[2]
+    base = lhs isa Symbol ? lhs : (lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol ? lhs.args[1] : nothing)
+    (base === nothing || !get(act, base, false)) && return false
+    base === v && lhs isa Symbol && return false
+    if base === v
+        rhs = agen_fp_subst_ref(rhs, lhs)
+    end
+    return agen_fp_need(rhs, v, act)
+end
+
+agen_fp_subst_ref(e, r) = e == r ? 0 : e isa Expr ? Expr(e.head, Any[agen_fp_subst_ref(a, r) for a in e.args]...) : e
+
+# `after` is the set of states that a solve loop overwrites later on a path from the end of `stmts`; returns the set at the start of `stmts` and records in `hits` each
+# state a statement reads (value needed) while a solve loop that overwrites it follows. A plain assignment to a scalar ends the path for that scalar.
+function agen_fp_stale_scan!(stmts::Vector, after::Set{Symbol}, ctx, hits::Set{Symbol}, record::Bool)
+    R = copy(after)
+    for st in reverse(stmts)
+        st isa Expr || continue
+        di = findfirst(o -> o.loop === st, ctx.dets)
+        if di !== nothing
+            own = Set{Symbol}(vcat(ctx.dets[di].arrays, ctx.dets[di].scalars))
+            if record
+                for a in agen_fp_stmts(st.args[2]), x in agen_fp_flat_assigns(a)
+                    for v in R
+                        v in own || agen_fp_stale_assign(x, v, ctx.act) && push!(hits, v)
+                    end
+                end
+            end
+            union!(R, own)
+        elseif st.head === :for
+            body = agen_fp_stmts(st.args[2])
+            R0 = agen_fp_stale_scan!(body, R, ctx, hits, false)
+            wrap = Set{Symbol}(v for v in R0 if get(ctx.kinds, v, :none) == :array_float)
+            R1 = agen_fp_stale_scan!(body, union(R, wrap), ctx, hits, record)
+            union!(R, R1)
+        elseif st.head === :if
+            Rt = agen_fp_stale_scan!(agen_fp_stmts(st.args[2]), R, ctx, hits, record)
+            Re = length(st.args) == 3 ? agen_fp_stale_scan!(agen_fp_stmts(st.args[3]), R, ctx, hits, record) : R
+            R = union(Rt, Re)
+        elseif st.head === :(=)
+            if record
+                for v in R
+                    agen_fp_stale_assign(st, v, ctx.act) && push!(hits, v)
+                end
+            end
+            lhs = st.args[1]
+            lhs isa Symbol && get(ctx.kinds, lhs, :none) == :scalar_float && delete!(R, lhs)
+        end
+    end
+    return R
+end
+
+# every assignment inside a statement (any depth)
+function agen_fp_flat_assigns(e)
+    out = Any[]
+    function walk(x)
+        x isa Expr || return nothing
+        x.head === :(=) && push!(out, x)
+        foreach(walk, x.args)
+        return nothing
+    end
+    walk(e)
+    return out
+end
+
+function agen_fp_stale(expr::Expr, dets::Vector, kinds::Dict{Symbol,Symbol}, kernel)
+    ctx = (dets = dets, kinds = kinds, act = act_analyze(kernel))
+    hits = Set{Symbol}()
+    agen_fp_stale_scan!(agen_fp_stmts(expr.args[2]), Set{Symbol}(), ctx, hits, true)
+    return sort(collect(hits))
 end
 
 # `__oldb_N = <adjoint of a state>` is how the generated reverse of an overwrite reads the adjoint it consumes. After each one, the square of what it read
@@ -19218,14 +19362,16 @@ function agen_fp_rewrite(adj::Expr, init::Expr, det)
 end
 
 # ---- the one-slot tape of the fixed-point adjoint ----
-# The sweeps read the tape of the last active iteration only, so the forward loop writes every iteration to the same slot: the counter of the loop leaves
-# the tape positions and the trip count leaves the stack sizes. A loop that stopped on its cap has no tape of the earlier iterations: it raises.
+# The sweeps of one instance of a solve loop (one execution of it, at one point of its enclosing nest) read the tape of the last active iteration only, so the forward
+# loop writes every iteration to the same slot: the counter of the solve loop leaves the tape positions and its trip count leaves the stack sizes, the enclosing
+# counters stay. That gives one slot per instance, at any depth. A loop that stopped on its cap has no tape of the earlier iterations: it raises.
 
-# Integer literal arithmetic the substitution leaves behind: 0 * x, x + 0, 1 * x, (1 - 1).
+# Integer literal arithmetic the substitution leaves behind: 0 * x, x + 0, 1 * x, (1 - 1), max(0, 1).
 function agen_fp_fold(e)
-    e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] in (:+, :-, :*) || return e
+    e isa Expr && e.head === :call && length(e.args) == 3 && e.args[1] in (:+, :-, :*, :max) || return e
     op, x, y = e.args[1], e.args[2], e.args[3]
-    (x isa Integer && y isa Integer) && return op === :+ ? x + y : op === :- ? x - y : x * y
+    (x isa Integer && y isa Integer) && return op === :+ ? x + y : op === :- ? x - y : op === :* ? x * y : max(x, y)
+    op === :max && return e
     op === :+ && x isa Integer && x == 0 && return y
     (op === :+ || op === :-) && y isa Integer && y == 0 && return x
     op === :* && ((x isa Integer && x == 0) || (y isa Integer && y == 0)) && return 0
@@ -19234,22 +19380,25 @@ function agen_fp_fold(e)
     return e
 end
 
-# Replaces the trip count `trip` of the counted loop by 1 and, when `kk_on`, its counter `kk` by 1; folds the arithmetic along the changed paths only.
-function agen_fp_slot_walk(e, trip, kk::Symbol, kk_on::Bool)
+# The trip count of `for kk = 1:hi` as the generator writes it: `div(hi - 1, 1) + 1`, alone, inside `max(0, .)` or hoisted into a temporary.
+agen_fp_trip(hi) = :(div($hi - 1, 1) + 1)
+
+# Replaces each trip count in `trips` by 1 and, when `kk_on`, the counter `kk` by 1; folds the arithmetic along the changed paths only.
+function agen_fp_slot_walk(e, trips::Vector, kk::Symbol, kk_on::Bool)
     kk_on && e === kk && return (1, true)
-    e isa Expr && e == trip && return (1, true)
+    e isa Expr && any(t -> e == t, trips) && return (1, true)
     e isa Expr || return (e, false)
     changed = false
     args = Any[]
     for a in e.args
-        (na, ch) = agen_fp_slot_walk(a, trip, kk, kk_on)
+        (na, ch) = agen_fp_slot_walk(a, trips, kk, kk_on)
         push!(args, na); changed |= ch
     end
     changed || return (e, false)
     return (agen_fp_fold(Expr(e.head, args...)), true)
 end
 
-agen_fp_slot(e, trip, kk::Symbol, kk_on::Bool) = agen_fp_slot_walk(e, trip, kk, kk_on)[1]
+agen_fp_slot(e, trips::Vector, kk::Symbol, kk_on::Bool) = agen_fp_slot_walk(e, trips, kk, kk_on)[1]
 
 # a statement the generator wrote for the tape: an index assignment or a store into a stack
 agen_fp_is_tape_stmt(s) = s isa Expr && s.head === :(=) &&
@@ -19261,9 +19410,56 @@ function agen_fp_uses(x, name::Symbol)
     return name in syms
 end
 
-# The forward loop of the unrolled adjoint becomes `for kk = 1:hi; if cond; body; tape writes; __fp_last = kk; end; end`: the branch flag and the writes after the
-# guard are gone (an iteration after the last active one writes nothing), and `__fp_last` counts the iterations that ran. Returns the loop and the name of the branch stack.
-function agen_fp_one_slot_forward(floop::Expr, det, trip)
+# the definitions of the tape-index temporaries (`__icse_N = ...`) of a statement tree; a name defined twice with different text is an error
+function agen_fp_collect_defs!(e, defs::Dict{Symbol,Any})
+    e isa Expr || return nothing
+    if e.head === :(=) && e.args[1] isa Symbol && startswith(string(e.args[1]), "__icse_")
+        haskey(defs, e.args[1]) && defs[e.args[1]] != e.args[2] && error("agen_adjoint_fixedpoint: the index temporary `$(e.args[1])` is defined twice")
+        defs[e.args[1]] = e.args[2]
+    end
+    foreach(a -> agen_fp_collect_defs!(a, defs), e.args)
+    return nothing
+end
+
+# `e` with every tape-index temporary replaced by its definition, until none is left
+function agen_fp_inline(e, defs::Dict{Symbol,Any}, depth::Int = 0)
+    depth > 64 && error("agen_adjoint_fixedpoint: the index temporaries refer to each other too deeply")
+    e isa Symbol && haskey(defs, e) && return agen_fp_inline(defs[e], defs, depth + 1)
+    e isa Expr || return e
+    return Expr(e.head, Any[agen_fp_inline(a, defs, depth + 1) for a in e.args]...)
+end
+
+# every `for` statement of a tree that satisfies `pred`, in program order (never inside a match)
+function agen_fp_find_loops!(e, pred, out::Vector)
+    e isa Expr || return nothing
+    if e.head === :for && pred(e)
+        push!(out, e)
+        return nothing
+    end
+    foreach(a -> agen_fp_find_loops!(a, pred, out), e.args)
+    return nothing
+end
+
+# `e` with the statement `target` (found by identity) replaced by the statements `repl`
+function agen_fp_splice(e, target, repl::Vector)
+    e isa Expr || return e
+    args = Any[]; changed = false
+    for a in e.args
+        if a === target
+            append!(args, repl); changed = true
+        else
+            na = agen_fp_splice(a, target, repl)
+            push!(args, na); changed |= na !== a
+        end
+    end
+    return changed ? Expr(e.head, args...) : e
+end
+
+# The forward solve loop of the unrolled adjoint becomes
+#   bstack[E] = 0;  for kk = 1:hi; if cond; body; tape writes; bstack[E] = kk; end; end
+# where E is the instance's slot. The flag stores of the else branch and the writes after the guard are gone (an iteration after the last active one writes nothing),
+# and the branch stack holds, for each instance, the iterations that ran. Returns the statements that replace the loop, the name of the branch stack and E.
+function agen_fp_one_slot_forward(floop::Expr, det, trips::Vector, defs::Dict{Symbol,Any})
     kk = det.var
     stmts = agen_fp_stmts(floop.args[2])
     (!isempty(stmts) && stmts[1] isa Expr && stmts[1].head === :if && length(stmts[1].args) == 3 && count(s -> s isa Expr && s.head === :if, stmts) == 1) ||
@@ -19278,87 +19474,63 @@ function agen_fp_one_slot_forward(floop::Expr, det, trip)
     then = agen_fp_stmts(ifs.args[2])
     flag = findall(s -> s isa Expr && s.head === :(=) && s.args[1] isa Expr && s.args[1].head === :ref && s.args[1].args[1] === bstack, then)
     length(flag) == 1 || error("agen_adjoint_fixedpoint: the guard of the loop over `$kk` records its branch flag $(length(flag)) times")
-    idxvar = then[flag[1]].args[1].args[2]
-    keep = Any[then[j] for j in 1:length(then) if j != flag[1]]
-    if idxvar isa Symbol
-        keep = Any[s for s in keep if !(s isa Expr && s.head === :(=) && s.args[1] === idxvar)]
-        any(s -> agen_fp_uses(s, idxvar), keep) && error("agen_adjoint_fixedpoint: the branch-flag index of the loop over `$kk` is used elsewhere")
+    body = Any[agen_fp_slot(s, trips, kk, true) for s in Any[then; post]]
+    idx = body[flag[1]].args[1].args[2]
+    idxdef = idx
+    if idx isa Symbol
+        j = findfirst(s -> s isa Expr && s.head === :(=) && s.args[1] === idx, body)
+        j === nothing && error("agen_adjoint_fixedpoint: the branch-flag index `$idx` of the loop over `$kk` is not assigned in the guard")
+        idxdef = body[j].args[2]
     end
-    body = Any[agen_fp_slot(s, trip, kk, true) for s in Any[keep; post]]
-    any(s -> agen_fp_uses(s, bstack), body) && error("agen_adjoint_fixedpoint: the branch stack `$bstack` is used in the guard besides its flag")
-    guard = Expr(:if, ifs.args[1], Expr(:block, body..., :(__fp_last = $kk)))
-    return (Expr(:for, floop.args[1], Expr(:block, guard)), bstack)
+    ldefs = Dict{Symbol,Any}(k => agen_fp_slot(v, trips, kk, true) for (k, v) in defs)
+    agen_fp_collect_defs!(Expr(:block, body...), ldefs)
+    E = agen_fp_inline(idxdef, ldefs)
+    agen_fp_uses(E, kk) && error("agen_adjoint_fixedpoint: the slot of the loop over `$kk` still depends on its counter")
+    body[flag[1]] = :($bstack[$idx] = $kk)
+    any(s -> agen_fp_uses(s, bstack) && !(s === body[flag[1]]), body) && error("agen_adjoint_fixedpoint: the branch stack `$bstack` is used in the guard besides its flag")
+    guard = Expr(:if, ifs.args[1], Expr(:block, body...))
+    return (Any[:($bstack[$E] = 0), Expr(:for, floop.args[1], Expr(:block, guard))], bstack, E)
 end
 
 function agen_fp_cutoff_message(name)
     return "$(name): the loop stopped on its cap before the residual reached the tolerance, there is no fixed point to differentiate (raise the cap or the tolerance, or use keep_push_pop = true for the derivative of the iterations that ran)"
 end
 
-# agen_fp_rewrite with the one-slot tape: no unrolled reverse, a loop that stopped on its cap raises.
-function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, det)
-    call = adj.args[1]
-    stmts = Any[s for s in adj.args[2].args if !(s isa LineNumberNode)]
-    kk = det.var; hi = det.hi; tolx = det.tol; rn = det.rn
-    trip = :(max(0, div($hi - 1, 1) + 1))
-    fpos = findall(st -> (h = agen_fp_header(st); h !== nothing && h.step === 1 && h.var === kk && h.hi == hi && h.lo == 1), stmts)
-    rpos = findall(st -> (h = agen_fp_header(st); h !== nothing && h.step == -1 && h.var === kk && h.hi == hi && h.lo == 1), stmts)
-    (length(fpos) == 1 && length(rpos) == 1) || error("agen_adjoint_fixedpoint: the forward and the reversed loop over `$kk` were found $(length(fpos)) and $(length(rpos)) times in the generated adjoint")
-    (newf, bstack) = agen_fp_one_slot_forward(stmts[fpos[1]], det, trip)
-    rev = stmts[rpos[1]]
+# the sweeps of one instance, in place of its reversed solve loop: a list of statements (see agen_fp_rewrite_one_slot)
+function agen_fp_sweeps(rev::Expr, det, trips::Vector, bstack::Symbol, E, adjargs::Set{Symbol}, adjsyms::Set{Symbol})
+    kk = det.var; hi = det.hi; tolx = det.tol
     rbody = agen_fp_stmts(rev.args[2])
     lastst = rbody[end]
     (lastst isa Expr && lastst.head === :if && length(lastst.args) == 2) || error("agen_adjoint_fixedpoint: the reversed loop over `$kk` does not end in the branch of the guard")
     pre = rbody[1:end-1]; then = agen_fp_stmts(lastst.args[2]); cond = lastst.args[1]
     # the reads of the branch flag only feed the test of the guard: the sweeps run the last active iteration, so they need neither
     sl = agen_fp_slice(pre, cond)
-    pre_rest = Any[]
-    for (j, st) in enumerate(pre)
-        if any(t -> t === st, sl)
-            lhs = st.args[1]
-            later = Any[pre[j+1:end]..., then...]
-            # a statement of the slice that reads the branch stack, or that nothing else reads, is dropped; an index shared with another read stays
-            (agen_fp_uses(st, bstack) || !(lhs isa Symbol && any(t -> !any(u -> u === t, sl) && agen_fp_uses(t, lhs), later))) && continue
-        end
-        push!(pre_rest, st)
+    # decided from the last statement to the first: an index stays when a statement that stays reads it (so a chain of indices stays whole)
+    keep = trues(length(pre))
+    for j in length(pre):-1:1
+        st = pre[j]
+        any(t -> t === st, sl) || continue
+        lhs = st.args[1]
+        later = Any[Any[pre[i] for i in j+1:length(pre) if keep[i]]..., then...]
+        (agen_fp_uses(st, bstack) || !(lhs isa Symbol && any(t -> agen_fp_uses(t, lhs), later))) && (keep[j] = false)
     end
-    argset = Set{Symbol}(a isa Symbol ? a : a.args[1] for a in call.args[2:end])
-    syms = Set{Symbol}(); agen_split_syms!(adj.args[2], syms)
-    arrays_b = Symbol[agen_shadow(a) for a in det.arrays if agen_shadow(a) in argset]
-    scalars_b = Symbol[agen_shadow(v) for v in det.scalars if agen_shadow(v) in syms]
+    pre_rest = Any[pre[j] for j in eachindex(pre) if keep[j]]
+    arrays_b = Symbol[agen_shadow(a) for a in det.arrays if agen_shadow(a) in adjargs]
+    scalars_b = Symbol[agen_shadow(v) for v in det.scalars if agen_shadow(v) in adjsyms]
     names = Set{Symbol}(vcat(arrays_b, scalars_b))
     isempty(names) && error("agen_adjoint_fixedpoint: no state of the loop over `$kk` is active, there is no state adjoint to iterate")
     (then_i, count) = agen_fp_instrument(Expr(:block, then...), names, :__fp_cn)
     count > 0 || error("agen_adjoint_fixedpoint: the reverse of the loop over `$kk` never consumes a state adjoint (the loop accumulates and does not overwrite), so there is no fixed point to iterate")
-    sweep = Any[agen_fp_slot(x, trip, kk, true) for x in Any[pre_rest; agen_fp_stmts(then_i)]]
+    sweep = Any[agen_fp_slot(x, trips, kk, true) for x in Any[pre_rest; agen_fp_stmts(then_i)]]
     any(s -> agen_fp_uses(s, bstack), sweep) && error("agen_adjoint_fixedpoint: the sweeps of the loop over `$kk` still read the branch stack")
-    outside = Any[]
-    for (j, st) in enumerate(stmts)
-        (j == fpos[1] || j == rpos[1]) && continue
-        agen_fp_uses(st, kk) && !(st isa Expr && st.head === :for && agen_fp_header(st) !== nothing && agen_fp_header(st).var === kk) &&
-            error("agen_adjoint_fixedpoint: the counter `$kk` of the loop is used outside the loop in the generated adjoint")
-    end
-    fwd_flag = Expr(:call, det.cmp, rn, tolx)
-    kname = call.args[1]
-    msg = agen_fp_unsettled_message(kname); msgcut = agen_fp_cutoff_message(kname)
-    new = agen_fp_stmts(quote
-        fp_info[2] = 0.0
-        fp_info[3] = 0.0
-        fp_info[4] = 0.0
-        fp_info[5] = 0.0
-        __fp_cut = 0
-        __fp_go = 0
-        if $hi >= 1
-            if $fwd_flag
-                __fp_cut = 1
-                fp_info[4] = 1.0
-                fp_info[5] = 2.0
-            end
-        end
-        if __fp_cut == 0
+    return agen_fp_stmts(quote
+        __fp_cnt = $bstack[$E]
+        if __fp_ncut == 0
             __fp_cn = 0.0
             __fp_c0 = 0.0
             __fp_sw = 0
-            if __fp_last > 0
+            __fp_go = 0
+            if __fp_cnt > 0
                 __fp_go = 1
             end
             for __fp_s = 1:$hi
@@ -19374,44 +19546,135 @@ function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, det)
                     end
                 end
             end
-            fp_info[2] = __fp_sw
-            if __fp_c0 > 0.0
-                fp_info[3] = __fp_cn / __fp_c0
+            __fp_iters = __fp_iters + __fp_cnt
+            if __fp_sw > __fp_maxsw
+                __fp_maxsw = __fp_sw
             end
-            fp_info[5] = __fp_go
+            if __fp_c0 > 0.0
+                __fp_r = __fp_cn / __fp_c0
+                if __fp_r > __fp_maxr
+                    __fp_maxr = __fp_r
+                end
+            end
+            if __fp_go == 1
+                __fp_unset = __fp_unset + 1
+            end
         end
-        fp_info[1] = __fp_last
-        if __fp_cut == 1
+    end)
+end
+
+# The fixed-point adjoint with the one-slot tape, from the unrolled adjoint `adj` and its `initstacks` and the solve loops `dets` of the source (agen_fp_detect).
+# For each solve loop: the forward loop keeps one slot per instance, the reversed loop is replaced where it stands by the sweeps of its instance. Counters of the
+# function (all host scalars): __fp_ncut instances cut off (the guard still open after the loop, hi >= 1), __fp_iters iterations that ran, __fp_maxsw most sweeps in
+# one instance, __fp_maxr worst final over first norm, __fp_unset instances whose sweeps did not settle. Every raise is a top-level statement: the cut-off one right
+# after the forward statement that holds the last solve loop, the other one before the return.
+function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, dets::Vector)
+    call = adj.args[1]
+    stmts = Any[s for s in adj.args[2].args if !(s isa LineNumberNode)]
+    trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets])]
+    body = Expr(:block, stmts...)
+    # the forward and the reversed loops of every solve: the i-th solve of the source is the i-th forward loop and the i-th from the end of the reversed ones
+    fwd = Any[]; rev = Any[]
+    for d in dets
+        agen_fp_find_loops!(body, e -> (h = agen_fp_header(e); h !== nothing && h.step === 1 && h.var === d.var && h.hi == d.hi && h.lo == 1), fwd)
+    end
+    for d in dets
+        agen_fp_find_loops!(body, e -> (h = agen_fp_header(e); h !== nothing && h.step == -1 && h.var === d.var && h.hi == d.hi && h.lo == 1), rev)
+    end
+    fwd = unique(e -> objectid(e), fwd); rev = unique(e -> objectid(e), rev)
+    function order(loops)
+        pos = Dict{UInt,Int}(); n = Ref(0)
+        function walk(e)
+            e isa Expr || return nothing
+            any(l -> l === e, loops) && (pos[objectid(e)] = (n[] += 1))
+            foreach(walk, e.args)
+            return nothing
+        end
+        walk(body)
+        return sort(loops, by = l -> pos[objectid(l)])
+    end
+    fwd = order(fwd); rev = reverse(order(rev))
+    (length(fwd) == length(dets) && length(rev) == length(dets)) || error("agen_adjoint_fixedpoint: the source has $(length(dets)) solve loops, the generated adjoint $(length(fwd)) forward and $(length(rev)) reversed loops over their counters")
+    # the counter of a solve is read only inside its own loops
+    solve_loops = vcat(fwd, rev)
+    function counter_outside(e, v)
+        e === v && return true
+        e isa Expr || return false
+        (e.head === :for && any(l -> l === e, solve_loops)) && return false
+        return any(a -> counter_outside(a, v), e.args)
+    end
+    for d in dets
+        counter_outside(body, d.var) && error("agen_adjoint_fixedpoint: the counter `$(d.var)` of the loop is used outside the loop in the generated adjoint")
+    end
+    defs = Dict{Symbol,Any}(); agen_fp_collect_defs!(body, defs)
+    argset = Set{Symbol}(a isa Symbol ? a : a.args[1] for a in call.args[2:end])
+    syms = Set{Symbol}(); agen_split_syms!(adj.args[2], syms)
+    newbody = body
+    cuts = Any[]
+    bstacks = Symbol[]
+    for (i, d) in enumerate(dets)
+        (repl, bstack, E) = agen_fp_one_slot_forward(fwd[i], d, trips, defs)
+        push!(bstacks, bstack)
+        cut = :(if $(d.hi) >= 1
+                    if $(Expr(:call, d.cmp, d.rn, d.tol))
+                        __fp_ncut = __fp_ncut + 1
+                    end
+                end)
+        push!(cuts, cut)
+        newbody = agen_fp_splice(newbody, fwd[i], Any[repl..., cut])
+        sw = agen_fp_sweeps(rev[i], d, trips, bstack, E, argset, syms)
+        newbody = agen_fp_splice(newbody, rev[i], sw)
+    end
+    # the top-level statement that holds the last forward solve loop; every statement keeps its tape positions with the trip counts replaced
+    nst = agen_fp_stmts(newbody)
+    last_fwd = maximum(i for (i, st) in enumerate(nst) if any(c -> agen_fp_contains(st, c), cuts))
+    out = Any[agen_fp_slot(st, trips, :__fp_none, false) for st in nst]
+    msg = agen_fp_unsettled_message(call.args[1]); msgcut = agen_fp_cutoff_message(call.args[1])
+    start = agen_fp_stmts(quote
+        fp_info[1] = 0.0
+        fp_info[2] = 0.0
+        fp_info[3] = 0.0
+        fp_info[4] = 0.0
+        fp_info[5] = 0.0
+        __fp_ncut = 0
+        __fp_iters = 0
+        __fp_maxsw = 0
+        __fp_maxr = 0.0
+        __fp_unset = 0
+    end)
+    raise_cut = agen_fp_stmts(quote
+        fp_info[4] = __fp_ncut
+        if __fp_ncut > 0
+            fp_info[5] = 2.0
+        end
+        if __fp_ncut > 0
             error($msgcut)
         end
-        if __fp_go == 1
+    end)
+    raise_end = agen_fp_stmts(quote
+        fp_info[1] = __fp_iters
+        fp_info[2] = __fp_maxsw
+        fp_info[3] = __fp_maxr
+        if __fp_unset > 0
+            fp_info[5] = 1.0
+        end
+        if __fp_unset > 0
             error($msg)
         end
     end)
-    out = Any[]
-    for (j, st) in enumerate(stmts)
-        if j == fpos[1]
-            push!(out, :(__fp_last = 0)); push!(out, newf)
-        elseif j == rpos[1]
-            append!(out, new)
-        else
-            push!(out, agen_fp_slot(st, trip, kk, false))
-        end
-    end
-    args2 = Any[a for a in call.args if a !== bstack]
-    adj2 = Expr(:function, Expr(:call, args2..., :fp_info), Expr(:block, out...))
+    (out[end] isa Expr && out[end].head === :return) || error("agen_adjoint_fixedpoint: the generated adjoint does not end in a return")
+    final = Any[start...; out[1:last_fwd]; raise_cut; out[last_fwd+1:end-1]; raise_end; out[end]]
+    adj2 = Expr(:function, Expr(:call, call.args..., :fp_info), Expr(:block, final...))
     ib = Any[s for s in init.args[2].args if !(s isa LineNumberNode)]
     ret = ib[end]
     (ret isa Expr && ret.head === :return) || error("agen_adjoint_fixedpoint: initstacks does not end in a return")
     items = ret.args[1] isa Expr && ret.args[1].head === :tuple ? Any[ret.args[1].args...] : Any[ret.args[1]]
-    body_i = Any[]
-    for st in ib[1:end-1]
-        (st isa Expr && st.head === :(=) && st.args[1] === bstack) && continue
-        push!(body_i, agen_fp_slot(st, trip, kk, false))
-    end
-    init2 = Expr(:function, init.args[1], Expr(:block, body_i..., :(fp_info = Vector{Float64}(undef, 5)), Expr(:return, Expr(:tuple, Any[i for i in items if i !== bstack]..., :fp_info))))
+    body_i = Any[agen_fp_slot(st, trips, :__fp_none, false) for st in ib[1:end-1]]
+    init2 = Expr(:function, init.args[1], Expr(:block, body_i..., :(fp_info = Vector{Float64}(undef, 5)), Expr(:return, Expr(:tuple, items..., :fp_info))))
     return (adjoint = adj2, initstacks = init2)
 end
+
+agen_fp_contains(e, target) = e === target || (e isa Expr && any(a -> agen_fp_contains(a, target), e.args))
 
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
@@ -19475,9 +19738,9 @@ function agen_fp_divides_by!(e, red::Set{Symbol}, hit::Ref{Bool})
     return nothing
 end
 
-# The features of the body of one detected loop (`det` from agen_fp_detect, `body` the top-level statements of the kernel).
-function agen_fp_features(det, body::Vector)
-    th = agen_fp_stmts(body[det.index].args[2])[1].args[2]
+# The features of the body of one detected loop (`det` from agen_fp_detect).
+function agen_fp_features(det)
+    th = agen_fp_stmts(det.loop.args[2])[1].args[2]
     red = Set{Symbol}(); calls = Set{Symbol}(); depth = Ref(0); inner_if = Ref(false)
     for _ in 1:16
         n0 = length(red)
@@ -19489,11 +19752,115 @@ function agen_fp_features(det, body::Vector)
     return (depth = depth[], inner_if = inner_if[], div_by_reduction = hit[], literal_tol = det.tol isa Number, calls = calls, cap_in_body = det.hi isa Symbol && det.hi in used)
 end
 
+# ---- the enclosing nest of a solve loop ----
+# The fixed-point reverse of a solve loop inside other loops runs its sweeps inside the reversed enclosing loops, so the enclosing loops must be ones the GPU stage keeps
+# on the host: a loop that carries a value from one iteration to the next. A loop with independent iterations is offloaded, one thread per index, and a sweep cannot run there.
+
+# the scalar `v` is read in `e` other than as the accumulated operand of `v = v + x` (a commutative accumulation is a reduction, not a carried value)
+function agen_fp_reads_beyond_accum(e, v::Symbol)
+    e isa Symbol && return e === v
+    e isa Expr || return false
+    if e.head === :(=) && e.args[1] === v
+        r = e.args[2]
+        if r isa Expr && r.head === :call && r.args[1] in (:+, :-) && length(r.args) == 3
+            ops = r.args[2:3]
+            k = count(o -> o === v, ops)
+            k == 1 && !any(o -> o !== v && agen_fp_count_sym(o, v) > 0, ops) && return false
+        end
+        return agen_fp_count_sym(r, v) > 0
+    end
+    e.head === :(=) && e.args[1] isa Symbol && return agen_fp_reads_beyond_accum(e.args[2], v)
+    return any(a -> agen_fp_reads_beyond_accum(a, v), e.args)
+end
+
+# the array accesses of a statement: (array, subscripts, is_write, is_accumulation); `A[k] = A[k] + x` is one accumulation
+function agen_fp_accesses!(e, acc::Vector)
+    e isa Expr || return nothing
+    if e.head === :(=) && e.args[1] isa Expr && e.args[1].head === :ref && e.args[1].args[1] isa Symbol
+        lhs = e.args[1]; subs = lhs.args[2:end]; r = e.args[2]
+        accum = r isa Expr && r.head === :call && r.args[1] in (:+, :-) && length(r.args) == 3 &&
+                any(o -> o isa Expr && o.head === :ref && o.args == lhs.args, r.args[2:3]) && agen_fp_count_sym(r, lhs.args[1]) == 1
+        push!(acc, (lhs.args[1], subs, true, accum))
+        foreach(x -> agen_fp_accesses!(x, acc), subs)
+        if accum
+            for o in r.args[2:3]
+                o isa Expr && o.head === :ref && o.args == lhs.args && continue
+                agen_fp_accesses!(o, acc)
+            end
+        else
+            agen_fp_accesses!(r, acc)
+        end
+        return nothing
+    end
+    if e.head === :ref && e.args[1] isa Symbol
+        push!(acc, (e.args[1], e.args[2:end], false, false))
+        foreach(x -> agen_fp_accesses!(x, acc), e.args[2:end])
+        return nothing
+    end
+    foreach(x -> agen_fp_accesses!(x, acc), e.args)
+    return nothing
+end
+
+# Does the counted loop `L` carry a value from one iteration to the next? Only provable evidence counts, so a loop that is not clearly carried is refused:
+# a scalar read before it is assigned and read other than in its own accumulation; an array written (not as an accumulation) at a subscript that leaves out the loop
+# variable (one location for every iteration); an array read and written at subscripts that differ in a dimension that holds the loop variable.
+function agen_fp_carries(L)
+    h = agen_fp_header(L); t = h.var; body = L.args[2]
+    assigned = Set{Symbol}(); agen_fp_assigned_all!(body, assigned)
+    uev = Set{Symbol}(); agen_split_uev!(body, Set{Symbol}(), uev)
+    for v in assigned
+        (v in uev && v !== t && agen_fp_reads_beyond_accum(body, v)) && return true
+    end
+    acc = Any[]; agen_fp_accesses!(body, acc)
+    for (a, subs, wr, accum) in acc
+        wr && !accum && !any(x -> agen_fp_count_sym(x, t) > 0, subs) && return true
+    end
+    for (a, ws, wr, wacc) in acc, (b, rs, rw, racc) in acc
+        (wr && !rw && a === b && length(ws) == length(rs)) || continue
+        any(d -> ws[d] != rs[d] && (agen_fp_count_sym(ws[d], t) > 0 || agen_fp_count_sym(rs[d], t) > 0), eachindex(ws)) && return true
+    end
+    return false
+end
+
+# why the nest around one solve loop does not take the fixed-point reverse: the reasons, empty when it does
+function agen_fp_nest_reasons(det)
+    why = String[]
+    det.inside && push!(why, "the loop is inside another solve loop")
+    det.holds && push!(why, "the loop holds another solve loop")
+    det.cap_elsewhere > 0 && push!(why, "the cap `$(det.hi)` is used outside the headers of solve loops ($(det.cap_elsewhere) times): the one-slot tape replaces every trip count of that cap")
+    fors = Any[e for e in det.enclosing if e.head === :for]
+    counters = Symbol[]
+    for L in fors
+        h = agen_fp_header(L)
+        if h === nothing
+            push!(why, "an enclosing loop is not a plain counted loop")
+            continue
+        end
+        agen_fp_carries(L) || push!(why, "the enclosing loop over `$(h.var)` has independent iterations (the GPU stage offloads such a loop, one thread per index, and a sweep cannot run there)")
+        bsyms = Set{Symbol}(); agen_split_syms!(Expr(:tuple, h.lo, h.hi), bsyms)
+        own = Set{Symbol}(); agen_fp_assigned_all!(L.args[2], own)
+        isempty(intersect(bsyms, own)) || push!(why, "the bound of the enclosing loop over `$(h.var)` is assigned inside it (a ragged trip count has no closed-form tape position)")
+        isempty(intersect(bsyms, Set(counters))) || push!(why, "the bound of the enclosing loop over `$(h.var)` depends on an outer counter (a ragged nest)")
+        for (j, M) in enumerate(fors)
+            M === L && break
+            asg = Set{Symbol}(); agen_fp_assigned_all!(M.args[2], asg)
+            isempty(intersect(bsyms, asg)) || (push!(why, "the bound of the enclosing loop over `$(h.var)` is assigned inside an outer loop (a ragged nest)"); break)
+        end
+        push!(counters, h.var)
+    end
+    capsyms = Symbol[det.hi]; det.tol isa Symbol && push!(capsyms, det.tol)
+    for L in fors, v in capsyms
+        asg = Set{Symbol}(); agen_fp_assigned_all!(L.args[2], asg)
+        v in asg && push!(why, "`$v` is assigned inside an enclosing loop (the sweeps read one value)")
+    end
+    return unique(why)
+end
+
 # Why the fixed-point path does not apply to a detected loop: the reasons, empty when it applies. The path is a whitelist: a loop is accepted only when every
 # feature it shows is one a validated corpus kernel shows (Newton and cosine on a scalar, Jacobi and Gauss-Seidel and tanh sweeps on arrays, a mixed state,
 # a 3-level multigrid). A feature none of them shows is a reason, so a new shape stays on the unrolled adjoint until a corpus kernel validates it.
-function agen_fp_refusal(det, body::Vector)
-    f = agen_fp_features(det, body)
+function agen_fp_refusal(det)
+    f = agen_fp_features(det)
     why = String[]
     f.div_by_reduction && push!(why, "the body divides by a value computed from a reduction (a Krylov or normalised iteration has no validated case)")
     f.depth > 2 && push!(why, "the body nests loops deeper than 2")
@@ -19502,31 +19869,39 @@ function agen_fp_refusal(det, body::Vector)
     f.cap_in_body && push!(why, "the body reads the loop's cap `$(det.hi)` (the one-slot tape sizes every stack by the cap, an inner bound that uses it would be sized wrongly)")
     bad = sort(collect(setdiff(f.calls, agen_fp_validated_calls())))
     isempty(bad) || push!(why, "the body calls " * join(string.(bad), ", ") * ", which have no validated case")
+    isempty(det.stale) || push!(why, "the state " * join(["`$v`" for v in det.stale], ", ") * " is read, in a statement whose adjoint needs the value, before a solve loop overwrites it (the fixed-point reverse keeps the last iteration's value of the state, not the value the loop found on entry)")
+    append!(why, agen_fp_nest_reasons(det))
     return why
 end
 
-# The adjoint of a kernel with one counted-guard loop (see agen_fp_*), the loop's reverse done as a fixed-point iteration. `tape = :one_slot` (the default):
-# the forward loop keeps one slot of tape, the last active iteration's, and the sweeps repeat the reverse of that iteration until the state adjoint, in squared
-# norm, is below `tol` times its first value (`tol` is the loop's own), at most as many sweeps as the loop has iterations. A loop that stopped on its cap
-# raises (there is no fixed point). `tape = :full` keeps the cap-sized tape and the unrolled reverse for a cut-off loop (the reference the one-slot text is tested against).
-# keep_push_pop = false, no fusion. Returns (initstacks, adjoint, primal_pruned, loop); the last stack is `fp_info`, five Float64:
-# [1] iterations that ran (:full: the last active iteration), [2] sweeps run, [3] final over first squared norm, [4] 1 when the forward loop stopped on its cap,
-# [5] status: 0 ok, 1 the sweeps did not settle, 2 the forward loop stopped on its cap (:full: 1 for the sweeps, 0 otherwise).
+# The adjoint of a kernel with solve loops (see agen_fp_detect), each loop's reverse done as a fixed-point iteration, at any depth of loop and branch nest. `tape = :one_slot`
+# (the default): the forward loop keeps one slot of tape per instance of a solve loop (one execution of it), the last active iteration's, and the sweeps of an instance
+# repeat the reverse of that iteration until the state adjoint, in squared norm, is below `tol` times its first value (`tol` is the loop's own), at most as many sweeps
+# as the loop has iterations. An instance that stopped on its cap raises (there is no fixed point). `tape = :full` keeps the cap-sized tape and the unrolled reverse for
+# a cut-off loop; it handles one top-level loop only (the reference the one-slot text is tested against).
+# keep_push_pop = false, no fusion. Returns (initstacks, adjoint, primal_pruned, loop, loops); the last stack is `fp_info`, five Float64:
+# [1] iterations that ran in all instances, [2] most sweeps in one instance, [3] worst final over first squared norm, [4] instances that stopped on their cap,
+# [5] status: 0 ok, 1 the sweeps of an instance did not settle, 2 an instance stopped on its cap (:full: [1] last active iteration, [4] 0 or 1, [5] 1 or 0).
 function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                                    dependents::Union{Vector{Symbol},Nothing}=nothing, tape::Symbol=:one_slot)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
-    found = agen_fp_detect(expr, kernel.sig.kinds)
-    length(found) == 1 || error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops at its top level (`for k = 1:n` holding one `if residual > tol`), it needs exactly one")
+    found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
+    isempty(found) && error("agen_adjoint_fixedpoint: `$(kernel.sig.name)` has $(length(found)) counted-guard loops (`for k = 1:n` holding one `if residual > tol`), it needs at least one")
     r = stade_adjoint_(expr, independents, dependents, false, false, true, false)
-    w = tape === :one_slot ? agen_fp_rewrite_one_slot(r.adjoint, r.initstacks, found[1]) : agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
-    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1])
+    if tape === :one_slot
+        w = agen_fp_rewrite_one_slot(r.adjoint, r.initstacks, found)
+    else
+        (length(found) == 1 && isempty(found[1].enclosing)) || error("agen_adjoint_fixedpoint: tape = :full handles one top-level counted-guard loop only")
+        w = agen_fp_rewrite(r.adjoint, r.initstacks, found[1])
+    end
+    return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1], loops = found)
 end
 
 # The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (status 2, the
 # state is not at a fixed point) or the sweeps did (status 1, the reverse of the iteration does not contract). Returns the sweeps run.
 function agen_adjoint_fixedpoint_check(info::AbstractVector)
     length(info) == 5 || error("agen_adjoint_fixedpoint_check: fp_info has $(length(info)) entries, expected 5")
-    (info[4] == 0 && info[5] != 2) || error("agen_adjoint_fixedpoint_check: the forward loop stopped on its cap of $(Int(info[1])) iterations, the state is not at a fixed point and the fixed-point adjoint does not apply")
+    (info[4] == 0 && info[5] != 2) || error("agen_adjoint_fixedpoint_check: the forward loop stopped on its cap in $(Int(info[4])) instance(s), the state is not at a fixed point and the fixed-point adjoint does not apply")
     info[5] == 0 || error("agen_adjoint_fixedpoint_check: $(Int(info[2])) reverse sweeps did not settle the state adjoint (its squared norm is still $(info[3]) of the first sweep's), the iteration does not contract")
     return Int(info[2])
 end
@@ -19629,8 +20004,8 @@ end
 # A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
 function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
                                     independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
-    kernel = parse_kernel(expr)
-    found = agen_fp_detect(expr, kernel.sig.kinds)
+    kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
+    found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
     isempty(found) && return nothing
     why = nothing
     if keep_push_pop
@@ -19639,10 +20014,8 @@ function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loo
         why = "fuse_ii_loops = true (the fixed-point reverse needs no fusion)"
     elseif !primal_outputs
         why = "primal_outputs = false"
-    elseif length(found) != 1
-        why = "the kernel has $(length(found)) counted-guard loops, the path needs exactly one"
     else
-        r = agen_fp_refusal(found[1], agen_fp_stmts(expr.args[2]))
+        r = unique(vcat([agen_fp_refusal(d) for d in found]...))
         isempty(r) || (why = join(r, "; "))
     end
     if why !== nothing
@@ -19665,7 +20038,7 @@ end
 function agen_fp_validator_note(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool)
     kernel = parse_kernel(expr)
     found = agen_fp_detect(expr, kernel.sig.kinds)
-    (length(found) == 1 && !keep_push_pop && !fuse_ii_loops && isempty(agen_fp_refusal(found[1], agen_fp_stmts(expr.args[2])))) || return nothing
+    (!isempty(found) && !keep_push_pop && !fuse_ii_loops && all(d -> isempty(agen_fp_refusal(d)), found)) || return nothing
     @info "`$(kernel.sig.name)`: stade_adjoint takes the fixed-point reverse for this kernel and flags, and this validator checks the unrolled adjoint (a converged loop's fixed-point adjoint is the derivative of the limit, not of the iterations that ran)"
     return nothing
 end
