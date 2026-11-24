@@ -19403,7 +19403,7 @@ agen_fp_slot(e, trips::Vector, kk::Symbol, kk_on::Bool) = agen_fp_slot_walk(e, t
 # a statement the generator wrote for the tape: an index assignment or a store into a stack
 agen_fp_is_tape_stmt(s) = s isa Expr && s.head === :(=) &&
     ((s.args[1] isa Symbol && (startswith(string(s.args[1]), "__idx_") || startswith(string(s.args[1]), "__icse_"))) ||
-     (s.args[1] isa Expr && s.args[1].head === :ref && s.args[1].args[1] isa Symbol && endswith(string(s.args[1].args[1]), "_stack")))
+     (s.args[1] isa Expr && s.args[1].head === :ref && s.args[1].args[1] isa Symbol && (endswith(string(s.args[1].args[1]), "_stack") || endswith(string(s.args[1].args[1]), "_stack_d"))))
 
 function agen_fp_uses(x, name::Symbol)
     syms = Set{Symbol}(); agen_split_syms!(x, syms)
@@ -19497,7 +19497,7 @@ function agen_fp_cutoff_message(name)
 end
 
 # the sweeps of one instance, in place of its reversed solve loop: a list of statements (see agen_fp_rewrite_one_slot)
-function agen_fp_sweeps(rev::Expr, det, trips::Vector, bstack::Symbol, E, adjargs::Set{Symbol}, adjsyms::Set{Symbol})
+function agen_fp_sweeps(rev::Expr, det, trips::Vector, bstack::Symbol, E, adjargs::Set{Symbol}, adjsyms::Set{Symbol}; hvp::Bool = false)
     kk = det.var; hi = det.hi; tolx = det.tol
     rbody = agen_fp_stmts(rev.args[2])
     lastst = rbody[end]
@@ -19519,6 +19519,8 @@ function agen_fp_sweeps(rev::Expr, det, trips::Vector, bstack::Symbol, E, adjarg
     scalars_b = Symbol[agen_shadow(v) for v in det.scalars if agen_shadow(v) in adjsyms]
     names = Set{Symbol}(vcat(arrays_b, scalars_b))
     isempty(names) && error("agen_adjoint_fixedpoint: no state of the loop over `$kk` is active, there is no state adjoint to iterate")
+    # an HVP iterates the state adjoint and its tangent: the stop rule reads both
+    hvp && union!(names, Symbol[tgen_shadow(n) for n in names if tgen_shadow(n) in adjargs || tgen_shadow(n) in adjsyms])
     (then_i, count) = agen_fp_instrument(Expr(:block, then...), names, :__fp_cn)
     count > 0 || error("agen_adjoint_fixedpoint: the reverse of the loop over `$kk` never consumes a state adjoint (the loop accumulates and does not overwrite), so there is no fixed point to iterate")
     sweep = Any[agen_fp_slot(x, trips, kk, true) for x in Any[pre_rest; agen_fp_stmts(then_i)]]
@@ -19568,7 +19570,7 @@ end
 # function (all host scalars): __fp_ncut instances cut off (the guard still open after the loop, hi >= 1), __fp_iters iterations that ran, __fp_maxsw most sweeps in
 # one instance, __fp_maxr worst final over first norm, __fp_unset instances whose sweeps did not settle. Every raise is a top-level statement: the cut-off one right
 # after the forward statement that holds the last solve loop, the other one before the return.
-function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, dets::Vector)
+function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, dets::Vector; hvp::Bool = false)
     call = adj.args[1]
     stmts = Any[s for s in adj.args[2].args if !(s isa LineNumberNode)]
     trips = Any[agen_fp_trip(hi) for hi in unique(Symbol[d.hi for d in dets])]
@@ -19622,7 +19624,7 @@ function agen_fp_rewrite_one_slot(adj::Expr, init::Expr, dets::Vector)
                 end)
         push!(cuts, cut)
         newbody = agen_fp_splice(newbody, fwd[i], Any[repl..., cut])
-        sw = agen_fp_sweeps(rev[i], d, trips, bstack, E, argset, syms)
+        sw = agen_fp_sweeps(rev[i], d, trips, bstack, E, argset, syms; hvp = hvp)
         newbody = agen_fp_splice(newbody, rev[i], sw)
     end
     # the top-level statement that holds the last forward solve loop; every statement keeps its tape positions with the trip counts replaced
@@ -20104,6 +20106,18 @@ function agen_adjoint_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},
     return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = r.primal_pruned, loop = found[1], loops = found, converged = converged)
 end
 
+# The HVP with the fixed-point reverse: the same loops, site decisions, one-slot tape and sweeps as agen_adjoint_fixedpoint, on the code of stade_hvp_. The sweeps
+# repeat the doubled reverse of the last active iteration until the state adjoint and its tangent settle.
+function agen_hvp_fixedpoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
+    kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
+    found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
+    isempty(found) && error("agen_hvp_fixedpoint: `$(kernel.sig.name)` has no counted-guard loop (`for k = 1:n` holding one `if residual > tol`), it needs at least one")
+    converged = Any[]
+    r = stade_hvp_(expr, independents, dependents, false, false, found, converged)
+    w = agen_fp_rewrite_one_slot(r.hvp, r.initstacks, found; hvp = true)
+    return (initstacks = w.initstacks, hvp = w.adjoint, loop = found[1], loops = found, converged = converged)
+end
+
 # The host-side verdict on the `fp_info` of one run of a agen_adjoint_fixedpoint adjoint: an error when the forward loop stopped on its cap (status 2, the
 # state is not at a fixed point) or the sweeps did (status 1, the reverse of the iteration does not contract). Returns the sweeps run.
 function agen_adjoint_fixedpoint_check(info::AbstractVector)
@@ -20134,11 +20148,25 @@ end
 function stade_hvp(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                     dependents::Union{Vector{Symbol},Nothing}=nothing,
                     keep_push_pop::Bool=true, fuse_ii_loops::Bool=false)
+    fp = agen_fp_adjoint_or_nothing(expr, keep_push_pop, fuse_ii_loops, true, independents, dependents; hvp = true)
+    fp === nothing || return fp
+    return agen_hvp_unrolled(expr; independents = independents, dependents = dependents, keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+end
+
+# The HVP that differentiates every forward iteration, whatever the loops of the kernel: stade_hvp without the choice of the fixed-point reverse.
+function agen_hvp_unrolled(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing,
+                           keep_push_pop::Bool=true, fuse_ii_loops::Bool=false)
+    return stade_hvp_(expr, independents, dependents, keep_push_pop, fuse_ii_loops)
+end
+
+function stade_hvp_(expr::Expr, independents, dependents, keep_push_pop::Bool, fuse_ii_loops::Bool, fp_dets = nothing, fp_report = nothing)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     kernel = norm_insert_dead_entry_resets(kernel)   # see norm_dead_entry_vars
     active_map = act_analyze(kernel)
     ii_plan = fuse_ii_loops ? stade_ii_plan_check(kernel) : nothing
     snap_sites, agen_sites = stade_site_level_tbr_check(kernel; ii_plan = ii_plan)
+    # same site decision as stade_adjoint_: the sweeps read the arrays of a solve loop as the loop left them where that is sound
+    fp_dets === nothing || ((snap_sites, agen_sites) = agen_fp_converged_apply(kernel, active_map, fp_dets, snap_sites, agen_sites, ii_plan, fp_report))
     snapshot_plan = snap_plan(kernel, active_map; site_needed = snap_sites)
     if !keep_push_pop
         # the refusals stade_adjoint reaches inside agen_emit, made here before the layout pass can fail on a stack with no size
@@ -20212,7 +20240,8 @@ end
 # It applies only to a kernel with exactly one such loop, keep_push_pop = false, no fusion, primal_outputs = true and a loop the agen_fp_refusal rule accepts.
 # A deliberate refusal of the generator (a loop that accumulates and consumes no state adjoint) is the same: any other error is raised.
 function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
-                                    independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
+                                    independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing; hvp::Bool = false)
+    who = hvp ? "stade_hvp" : "stade_adjoint"
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
     found = agen_fp_detect(expr, kernel.sig.kinds; kernel = kernel)
     isempty(found) && return nothing
@@ -20228,16 +20257,16 @@ function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loo
         isempty(r) || (why = join(r, "; "))
     end
     if why !== nothing
-        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
+        @info "$who: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $why"
         return nothing
     end
     try
-        fp = agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)
-        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and takes the fixed-point reverse: a loop that converged leaves its arrays at the converged field, a loop that stopped on its cap runs the unrolled reverse"
+        fp = hvp ? agen_hvp_fixedpoint(expr; independents = independents, dependents = dependents) : agen_adjoint_fixedpoint(expr; independents = independents, dependents = dependents)
+        @info "$who: `$(kernel.sig.name)` has a counted-guard loop and takes the fixed-point reverse: a loop that converged leaves its arrays at the converged field, a loop that stopped on its cap runs the unrolled reverse"
         return fp
     catch e
         (e isa ErrorException && startswith(e.msg, "agen_adjoint_fixedpoint:")) || rethrow()
-        @info "stade_adjoint: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
+        @info "$who: `$(kernel.sig.name)` has a counted-guard loop and keeps its unrolled reverse: $(e.msg)"
         return nothing
     end
 end
@@ -20968,7 +20997,7 @@ function stade_validate_from_baseline(mode::Symbol, in_path::String, yaml_path::
     else
         # the HVP differentiates the unrolled adjoint and shares its stacks: the oracle is that adjoint, not the fixed-point one
         adjoint_out = agen_adjoint_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
-        hvp_out = stade_hvp(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
+        hvp_out = agen_hvp_unrolled(primal_expr; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops)
 # NB: Symbol.(...) on an empty Any[] yields Vector{Any}, not Vector{Symbol}, so a kernel
 # whose indexed-mode initstacks_* takes no arguments (no stacks at all) tripped the
 # stack_arg_names::Vector{Symbol} keyword's type assertion. The typed comprehension is what
@@ -21426,7 +21455,7 @@ function stade_validate_gpu_file(in_path::String, out_path::String, backend;
     baseline = io_read_baseline_yaml(yp)
     val_coerce_int_arrays!(kernel, baseline.values)
 
-    gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
+    gen_out = mode == :hvp ? agen_hvp_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
                              agen_adjoint_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
     gpu_init = stade_gpu(gen_out.initstacks, backend; warp_atomics = warp_atomics, sync_free_reduce = sync_free_reduce, reduce_block = reduce_block, hoist_atomics = hoist_atomics, shared_private = shared_private, gather_stencil = gather_stencil, coarsen = coarsen, coarsen_min = coarsen_min, coarsen_fill = coarsen_fill, coarsen_occ = coarsen_occ, inbounds = inbounds, dead_scalars = dead_scalars, merge_accum = merge_accum, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_gather, contraction = contraction, reuse_stored = reuse_stored, dead_stack = dead_stack, fresh_gradient = fresh_gradient, fresh_check, split_coalesce, cublas, skip_empty = skip_empty, row_block = row_block, col_block = col_block, serial_loops = serial_loops, glue_kernels = glue_kernels)
     # reduction_threshold reaches the GPU parity oracle. Without it the choice had
@@ -21503,7 +21532,7 @@ function stade_validate_jacc_file(in_path::String, out_path::String;
     baseline = io_read_baseline_yaml(yp)
     val_coerce_int_arrays!(kernel, baseline.values)
 
-    gen_out = mode == :hvp ? stade_hvp(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
+    gen_out = mode == :hvp ? agen_hvp_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops) :
                              agen_adjoint_unrolled(primal_expr; keep_push_pop = false, fuse_ii_loops = fuse_ii_loops)
     backend = val_jacc_backend()
     jacc_init = stade_jacc(gen_out.initstacks; hoist_atomics = hoist_atomics, gather_stencil = gather_stencil, inbounds = inbounds, dead_scalars = dead_scalars, split_reduce = split_reduce, split_fallback = split_fallback, split_min_inner = split_min_inner, split_max_out = split_max_out, split_coalesce = split_coalesce, warp_atomics = warp_atomics, glue_kernels = glue_kernels, jacc_async = jacc_async, jacc_async_wait = jacc_async_wait, jacc_contraction = jacc_contraction)

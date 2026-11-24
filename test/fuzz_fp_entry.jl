@@ -108,7 +108,7 @@ function fzz_kernel(rng, family::Symbol, id::Int)
         pool = scalar ? fzz_pool_scalar(a, b) : fzz_pool_array(a, b)
         push!(items, (:stmt, rand(rng, pool), a))
     end
-    shuffle!(rng, items)
+    STADE.val_shuffle!(rng, items)
     # a copy of a state taken early and used late: its use needs the copy, not the state
     if rand(rng) < 0.5
         a = rand(rng, states)[1]
@@ -188,7 +188,7 @@ function fzz_directed(family::Symbol)
 end
 
 function fzz_main(count::Int, seed::Int, family_arg::String; verbose::Bool = true, draws = (20261122, 11, 22, 33), stop_on_defect::Bool = false, directed::Bool = false)
-    rng = MersenneTwister(seed)
+    rng = Xoshiro(seed)
     fams = family_arg == "both" ? [:scalar, :array] : [Symbol(family_arg)]
     tally = Dict{Symbol,Int}(); bad = Any[]; stale_needed = 0; stale_spare = 0
     seen = Set{String}()

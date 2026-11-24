@@ -1,6 +1,6 @@
 # Tangent and HVP of kernels with a solve loop (a counted loop with a guard), in the converged regime.
-# The fixed-point adjoint is the only mode that changes for these kernels. The tangent and the HVP differentiate the iterations that ran, so this suite checks
-# that they stay correct and agree with the fixed-point adjoint to the loop tolerance. It runs the six corpus kernels, the counted, host-box and inactive-read kernels
+# The tangent differentiates the iterations that ran, the adjoint and the HVP (stade_hvp, keep_push_pop = false) take the fixed-point path, so this suite checks
+# that each is correct and that the tangent agrees with the fixed-point adjoint to the loop tolerance. It runs the six corpus kernels, the counted, host-box and inactive-read kernels
 # of validate_fixedpoint.jl, and every generated shape of fp_shapes.jl. For each kernel and three random directions d (the tolerance is left alone):
 #   tangent   J d against a central difference of the seeded primal, and <seed, J d> against <fixed-point adjoint gradient, d> (the dot-product identity, which holds
 #             to the loop tolerance and not to rounding, because the tangent differentiates the iterations that ran)

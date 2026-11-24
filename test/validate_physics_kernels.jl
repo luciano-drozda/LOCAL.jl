@@ -246,7 +246,7 @@ function ph_check(spec; verbose = true, kpp = true)
     # (4)-(6) adjoint and HVP, stack mode
     ad = STADE.agen_adjoint_unrolled(expr; keep_push_pop = kpp)
     adf = STADE.val_compile(ad.adjoint); isf = STADE.val_compile(ad.initstacks)
-    hv = STADE.stade_hvp(expr; keep_push_pop = kpp)
+    hv = STADE.agen_hvp_unrolled(expr; keep_push_pop = kpp)   # the checks below are of the unrolled HVP, like the adjoint above
     hvf = STADE.val_compile(hv.hvp); hsf = STADE.val_compile(hv.initstacks)
     # keep_push_pop = false: the stack sizes come from integer arguments, named by the parameters of initstacks
     san = kpp ? Symbol[] : Symbol[a for a in ad.initstacks.args[1].args[2:end]]
