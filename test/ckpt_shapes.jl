@@ -443,6 +443,169 @@ function ck_solve_array(u, w, wn, lam, tol, n, nt, maxit)
     end
     return nothing
 end""", :region),
+    # the cover of an array in a step: writes that cover every read (a scratch array), and the ways a cover can fail (the array then holds a value from one step to the next)
+    # a union of point writes and a loop covers the range that a loop reads; an array that is only written is a scratch array too
+    ("ck_cov_union", """
+function ck_cov_union(u, wn, z, a, out, n, nt)
+    for t = 1:nt
+        wn[1] = u[1]
+        wn[n] = u[n]
+        for i1 = 2:n - 1
+            wn[i1] = u[i1 - 1] * a + sin(u[i1 + 1])
+        end
+        for i2 = 1:n
+            u[i2] = u[i2] + 0.2 * wn[i2]
+        end
+        z[t] = u[1] * u[2]
+    end
+    out[1] = u[1] + z[1]
+    return nothing
+end""", :region),
+    # the cover leaves out the interior: the array carries its interior values from one step to the next
+    ("ck_cov_gap", """
+function ck_cov_gap(u, wn, a, out, n, nt)
+    for t = 1:nt
+        wn[1] = u[1]
+        wn[n] = u[n]
+        for i1 = 1:n
+            u[i1] = sin(wn[i1]) * a + u[i1]
+        end
+        for i2 = 2:n - 1
+            wn[i2] = 0.5 * u[i2]
+        end
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the cover is the range 2:n - 1 and the reads are 1:n
+    ("ck_cov_short", """
+function ck_cov_short(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i1 = 2:n - 1
+            w[i1] = u[i1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2]) + u[i2]
+        end
+        w[1] = u[1]
+        w[n] = u[n]
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the cover is a write under an `if`, the other arm leaves the array as the step before left it
+    ("ck_cov_if", """
+function ck_cov_if(u, w, a, out, n, nt)
+    for t = 1:nt
+        if t > 1
+            for i1 = 1:n
+                w[i1] = u[i1] * a
+            end
+        else
+            w[1] = 0.5
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2]) + u[i2]
+        end
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the cover loop has a runtime bound that need not reach the range that is read
+    ("ck_cov_run", """
+function ck_cov_run(u, w, a, out, n, m, nt)
+    for t = 1:nt
+        for i1 = 1:m
+            w[i1] = u[i1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2]) + u[i2]
+        end
+        for i3 = 1:n
+            w[i3] = w[i3] + 0.3 * u[i3]
+        end
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the reads go one past the range that is covered
+    ("ck_cov_shift", """
+function ck_cov_shift(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i1 = 1:n
+            w[i1] = u[i1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2 + 1]) + u[i2]
+        end
+        w[n + 1] = u[1] * 0.5
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the cover starts at 2 and the reads at 1
+    ("ck_cov_below", """
+function ck_cov_below(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i1 = 2:n
+            w[i1] = u[i1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2]) + u[i2]
+        end
+        w[1] = u[1] * 0.5
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the covering write is in a loop whose bound is zero in the run: the loop covers nothing
+    ("ck_cov_maynot", """
+function ck_cov_maynot(u, w, a, out, n, m, nt)
+    for t = 1:nt
+        for i1 = 1:m
+            w[1] = u[1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[1]) + u[i2]
+        end
+        w[1] = u[2] * 0.5
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # two writes in a loop that runs no time (the literal range is empty): the range they would cover is [1, 0 + 1] = [1, 1]
+    ("ck_cov_window", """
+function ck_cov_window(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i1 = 1:0
+            w[i1] = u[1] * a
+            w[i1 + 1] = u[2] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[1]) + u[i2]
+        end
+        w[1] = u[2] * 0.5
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # the array is written with two subscripts and read with one (the first column)
+    ("ck_cov_linear", """
+function ck_cov_linear(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i1 = 1:n
+            w[i1, 2] = u[i1] * a
+        end
+        for i2 = 1:n
+            u[i2] = sin(w[i2]) + u[i2]
+        end
+        for i3 = 1:n
+            w[i3, 1] = 0.5 * u[i3]
+        end
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
     # a solve loop that the fixed-point reverse refuses (a call outside its whitelist): no region
     ("ck_solve_refused", """
 function ck_solve_refused(a, x0, tol, maxit, u, y, n, nt)
@@ -464,3 +627,9 @@ function ck_solve_refused(a, x0, tol, maxit, u, y, n, nt)
     return nothing
 end""", "does not take the fixed-point reverse"),
 ]
+
+# The arrays of a region that no segment saves (the scratch arrays), per shape; the shapes not listed are not asserted.
+ckp_scratch() = Dict{String,Vector{Symbol}}(
+    "ck_array" => Symbol[], "ck_partial" => Symbol[], "ck_wave" => Symbol[], "ck_scratch" => [:w], "ck_solve_array" => [:w, :wn], "ck_oldscalar" => [:u, :z],
+    "ck_cov_union" => [:wn, :z], "ck_cov_gap" => Symbol[], "ck_cov_short" => Symbol[], "ck_cov_if" => Symbol[], "ck_cov_run" => Symbol[], "ck_cov_shift" => Symbol[], "ck_cov_below" => Symbol[],
+    "ck_cov_maynot" => Symbol[], "ck_cov_window" => Symbol[], "ck_cov_linear" => Symbol[])

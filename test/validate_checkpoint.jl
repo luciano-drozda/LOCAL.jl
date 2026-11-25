@@ -31,7 +31,9 @@ function ckv_call(adj_fn, init_fn, sig, int_args, vals, seed, names)
 end
 
 # the integer pins and the float values a shape needs beyond the common ones (a solve loop needs a cap that is never reached and a tight tolerance)
-ckv_options(name) = name in ("ck_solve", "ck_solve_steps", "ck_solve_array", "ck_solve_refused") ? (pins = Dict(:maxit => 600), floats = Dict(:tol => 1e-26, :a => 0.6, :lam => 0.7)) : (pins = Dict{Symbol,Int}(), floats = Dict{Symbol,Float64}())
+ckv_options(name) = name in ("ck_solve", "ck_solve_steps", "ck_solve_array", "ck_solve_refused") ? (pins = Dict(:maxit => 600), floats = Dict(:tol => 1e-26, :a => 0.6, :lam => 0.7)) :
+                    name == "ck_cov_run" ? (pins = Dict(:m => 3), floats = Dict{Symbol,Float64}()) :
+                    name == "ck_cov_maynot" ? (pins = Dict(:m => 0), floats = Dict{Symbol,Float64}()) : (pins = Dict{Symbol,Int}(), floats = Dict{Symbol,Float64}())
 
 # the `fp_info` of a call (the stack of that name), or nothing
 function ckv_fpinfo(init, stacks)
@@ -134,6 +136,21 @@ function ckv_dispatch(say)
     return nothing
 end
 
+# the arrays that no segment saves are the ones listed in ckp_scratch
+function ckv_sets(say)
+    for (name, src, expect) in ckp_shapes()
+        haskey(ckp_scratch(), name) || continue
+        r = with_logger(NullLogger()) do; STADE.agen_ckpt_adjoint(Meta.parse(src); min_trip = 0) end
+        got = r === nothing ? nothing : sort(vcat([s.scratch for s in r.sets]...); by = string)
+        say(got == sort(ckp_scratch()[name]; by = string), "$name: the arrays no segment saves are $(ckp_scratch()[name]) (got $got)")
+    end
+    # a subscript with a symbol that the body assigns is no form, unless the symbol is the variable of an enclosing loop of the analysis (no kernel shows it: the adjoint without checkpoints refuses an integer that the step assigns twice)
+    say(STADE.agen_ckpt_lin_ok(:(j + 1), Any[], Set([:j])) === nothing, "a subscript with a symbol that the body assigns is no linear form")
+    say(STADE.agen_ckpt_lin_ok(:(j + 1), Any[(var = :j, lo = nothing, hi = nothing)], Set([:j])) !== nothing, "the variable of an enclosing loop is a symbol of the form")
+    say(STADE.agen_ckpt_lin_ok(:(n + 1), Any[], Set([:j])) !== nothing, "an invariant symbol is a symbol of the form")
+    return nothing
+end
+
 # the sizing function refuses a segment length below 1
 function ckv_ckguard(say)
     src = first(s for (n, s, e) in ckp_shapes() if n == "ck_array")
@@ -149,7 +166,7 @@ end
 function validate_checkpoint(; verbose = true, only = String[], sabotage = false)
     checks = 0; bad = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("FAIL ", msg)))
-    (isempty(only) || "dispatch" in only) && (ckv_dispatch(say); ckv_ckguard(say))
+    (isempty(only) || "dispatch" in only) && (ckv_dispatch(say); ckv_ckguard(say); ckv_sets(say))
     for (name, src, expect) in ckp_shapes()
         expect === :region || continue
         isempty(only) || name in only || continue
@@ -177,14 +194,14 @@ function ckv_sabotage(verbose::Bool)
     bad = 0
     text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
     cases = [
-        ("an array of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)\n", "    return (arrays = A[1:max(0, length(A) - 1)], scalars = S, in_arrays = IA, in_scalars = IS)\n", ["ck_array", "ck_wave"]),
-        ("a scalar of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)\n", "    return (arrays = A, scalars = Symbol[], in_arrays = IA, in_scalars = IS)\n", ["ck_scalar"]),
+        ("an array of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS, scratch = scratch)\n", "    return (arrays = A[1:max(0, length(A) - 1)], scalars = S, in_arrays = IA, in_scalars = IS, scratch = scratch)\n", ["ck_array", "ck_wave"]),
+        ("a scalar of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS, scratch = scratch)\n", "    return (arrays = A, scalars = Symbol[], in_arrays = IA, in_scalars = IS, scratch = scratch)\n", ["ck_scalar"]),
         ("the last segment runs past the last step", "guard = Expr(:if, :(\$(c.var) <= \$hi), Expr(:block,", "guard = Expr(:if, true, Expr(:block,", ["ck_array"]),
         ("the restore reads the wrong segment", "slot = :((\$s - 1) * \$n + \$i)", "slot = :((\$s) * \$n + \$i)", ["ck_array"]),
         ("the forward tape keeps the segment counter", "sf = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in fwd]", "sf = fwd", ["ck_array"]),
         ("the reverse tape keeps the segment counter", "sr = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in rev]", "sr = rev", ["ck_array"]),
         ("the tape outside the regions keeps the segment count", "stmts = Any[agen_ckpt_slot_tape(x, defs, trips, :__ck_none) for x in agen_fp_stmts(body)]", "stmts = agen_fp_stmts(body)", ["ck_scalar"]),
-        ("the end state of an accumulator is not put back", "agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...]", "]", ["ck_accum"]),
+        ("the end state of an accumulator is not put back", "agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])", "])", ["ck_accum"]),
         ("a restored array counts as never restored", "        l isa Expr && l.head === :ref && l.args[1] isa Symbol && push!(out, l.args[1])\n", "", ["ck_array"]),
         ("two regions share the names of their stacks", "k == 1 ? \"_ck_stack\" : \"_ck\$(k)_stack\"", "\"_ck_stack\"", ["ck_two"]),
         ("an input that a later statement writes is not saved", "for a in arrs2 if a in used && !(a in arrs)", "for a in Symbol[] if a in used && !(a in arrs)", ["ck_input"]),
@@ -200,6 +217,16 @@ function ckv_sabotage(verbose::Bool)
         ("a solve loop that the fixed-point reverse refuses is checkpointed", "            isempty(why) || error(\"agen_ckpt: the kernel has a solve loop", "            true || error(\"agen_ckpt: the kernel has a solve loop", ["dispatch"]),
         ("a solve loop is a region", "        if any(d -> d.loop === st, solves)\n", "        if false\n", ["ck_solve"]),
         ("the converged field is not read through an if", "    for (blk, i) in c.lchain\n        append!(pre,", "    for (blk, i) in c.lchain[1:1]\n        append!(pre,", ["ck_solve_array"]),
+        ("a gap between two covered ranges is a cover", "agen_ckpt_lin_eq(q.lo, agen_ckpt_lin_add(p.hi, one, 1)) || continue", "true || continue", ["dispatch", "ck_cov_gap"]),
+        ("a read past the end of a cover is covered", "agen_ckpt_le(p.lo, e, ranges) && agen_ckpt_le(e, p.hi, ranges)", "agen_ckpt_le(p.lo, e, ranges)", ["dispatch", "ck_cov_shift"]),
+        ("a read before the start of a cover is covered", "agen_ckpt_le(p.lo, e, ranges) && agen_ckpt_le(e, p.hi, ranges)", "agen_ckpt_le(e, p.hi, ranges)", ["dispatch", "ck_cov_below"]),
+        ("a write under an if covers what follows the if", "agen_ckpt_exposed!(body, Dict{Symbol,Vector{Any}}(k => copy(x) for (k, x) in cov), ranges, bad, exposed)", "agen_ckpt_exposed!(body, cov, ranges, bad, exposed)", ["dispatch", "ck_cov_if"]),
+        ("a write in a loop that may not run covers", "return runs ? piece : nothing", "return piece", ["dispatch", "ck_cov_maynot"]),
+        ("a window of writes in a loop that may not run covers", "(get(width, nothing, 0) == 0 || runs) || return nothing", "nothing", ["dispatch", "ck_cov_window"]),
+        ("a symbol that the body assigns is in a subscript form", "(k in bad && !any(r -> r.var === k, ranges)) && return nothing", "nothing", ["dispatch"]),
+        ("a write with two subscripts covers", "if length(lhs.args) == 2\n", "if true\n", ["dispatch", "ck_cov_linear"]),
+        ("the cover of an array is not widened by adjacent pieces", "while changed && length(pieces) < 24", "while false", ["dispatch", "ck_cov_union"]),
+        ("the entry state of a scratch array is not put back", "return restore && !isempty(out) ? Any[Expr(:if, :(\$s == 1), Expr(:block, out...))] : out", "return restore ? Any[] : out", ["ck_solve_array"]),
         ("a read of a written array at another subscript is no carry", "        all(sb -> sb == subs[1], subs) || return true\n", "", ["ck_sweep"]),
         ("a write without the loop variable is no carry", "        any(x -> agen_fp_count_sym(x, t) > 0, subs[1]) || return true\n", "", ["ck_array"]),
         ("a scalar read before its assignment is no carry", "    any(v -> v in uev && v !== t && !(v in lvars), scal) && return true\n", "", ["ck_scalar"]),

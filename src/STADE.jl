@@ -20370,6 +20370,167 @@ function agen_ckpt_candidates(expr::Expr, kernel; min_trip::Int = 8)
     return (cands, reasons)
 end
 
+# ---- cover analysis: the arrays of a region whose value on entry to a step no read of the step sees ----
+# A linear form is a Dict{Any,Int} (a symbol or `nothing` for the constant to its coefficient), with zero coefficients removed.
+function agen_ckpt_lin_add(a::Dict{Any,Int}, b::Dict{Any,Int}, sgn::Int)
+    out = copy(a)
+    for (k, v) in b
+        out[k] = get(out, k, 0) + sgn * v
+    end
+    for k in collect(keys(out)); out[k] == 0 && delete!(out, k); end
+    return out
+end
+
+# the integer expression `e` as a linear form, or nothing; `div`, `mod`, a product of two symbols and a float are not linear
+function agen_ckpt_lin(e)
+    e isa Integer && return e == 0 ? Dict{Any,Int}() : Dict{Any,Int}(nothing => Int(e))
+    e isa Symbol && return Dict{Any,Int}(e => 1)
+    (e isa Expr && e.head === :call && e.args[1] isa Symbol) || return nothing
+    f = e.args[1]; n = length(e.args)
+    if f === :+ && n >= 3
+        acc = Dict{Any,Int}()
+        for x in e.args[2:end]
+            l = agen_ckpt_lin(x); l === nothing && return nothing
+            acc = agen_ckpt_lin_add(acc, l, 1)
+        end
+        return acc
+    elseif f === :- && n == 3
+        a = agen_ckpt_lin(e.args[2]); b = agen_ckpt_lin(e.args[3])
+        (a === nothing || b === nothing) && return nothing
+        return agen_ckpt_lin_add(a, b, -1)
+    elseif f === :- && n == 2
+        a = agen_ckpt_lin(e.args[2]); a === nothing && return nothing
+        return agen_ckpt_lin_add(Dict{Any,Int}(), a, -1)
+    elseif f === :* && n == 3
+        for (c, x) in ((e.args[2], e.args[3]), (e.args[3], e.args[2]))
+            if c isa Integer
+                l = agen_ckpt_lin(x); l === nothing && return nothing
+                return agen_ckpt_lin_add(Dict{Any,Int}(), l, Int(c))
+            end
+        end
+    end
+    return nothing
+end
+
+# the form of a subscript or bound: a symbol that the body assigns is no invariant, unless it is the variable of an enclosing loop of the analysis
+function agen_ckpt_lin_ok(e, ranges::Vector, bad::Set{Symbol})
+    l = agen_ckpt_lin(e); l === nothing && return nothing
+    for k in keys(l)
+        k === nothing && continue
+        (k in bad && !any(r -> r.var === k, ranges)) && return nothing
+    end
+    return l
+end
+
+# is a <= b for every value of the loop variables in `ranges` (innermost last)? A variable is replaced by the bound that makes b - a smallest.
+function agen_ckpt_le(a::Dict{Any,Int}, b::Dict{Any,Int}, ranges::Vector)
+    d = agen_ckpt_lin_add(b, a, -1)
+    for r in Iterators.reverse(ranges)
+        c = get(d, r.var, 0)
+        c == 0 && continue
+        bound = c > 0 ? r.lo : r.hi
+        bound === nothing && return false
+        delete!(d, r.var)
+        d = agen_ckpt_lin_add(d, bound, c)
+    end
+    return all(kv -> kv[1] === nothing && kv[2] >= 0, d)
+end
+
+agen_ckpt_lin_eq(a::Dict{Any,Int}, b::Dict{Any,Int}) = isempty(agen_ckpt_lin_add(a, b, -1))
+
+# a covered interval, and the cover of an array as a list of them; adjacent intervals are merged (the union of [a,b] and [b+1,c] holds [a,c], empty ones included)
+function agen_ckpt_cov_add!(pieces::Vector{Any}, lo::Dict{Any,Int}, hi::Dict{Any,Int})
+    push!(pieces, (lo = lo, hi = hi))
+    one = Dict{Any,Int}(nothing => 1)
+    changed = true
+    while changed && length(pieces) < 24
+        changed = false
+        for p in copy(pieces), q in copy(pieces)
+            agen_ckpt_lin_eq(q.lo, agen_ckpt_lin_add(p.hi, one, 1)) || continue
+            any(x -> agen_ckpt_lin_eq(x.lo, p.lo) && agen_ckpt_lin_eq(x.hi, q.hi), pieces) && continue
+            push!(pieces, (lo = p.lo, hi = q.hi)); changed = true
+        end
+    end
+    return nothing
+end
+
+# every indexed read of the expression: (array, subscripts)
+function agen_ckpt_reads!(x, out::Vector{Any})
+    x isa Expr || return nothing
+    if x.head === :ref && x.args[1] isa Symbol
+        push!(out, (x.args[1], x.args[2:end]))
+    end
+    foreach(a -> agen_ckpt_reads!(a, out), x.args)
+    return nothing
+end
+
+# the piece list of a loop's body that its iterations as a whole cover: a write at a point that holds the loop variable covers the range of the variable, one without it covers
+# the same point if the loop runs at least once
+function agen_ckpt_cov_expand(piece, v::Symbol, lo, hi, ranges::Vector)
+    (lo === nothing || hi === nothing) && return nothing
+    cl = get(piece.lo, v, 0); ch = get(piece.hi, v, 0)
+    runs = agen_ckpt_le(lo, hi, ranges)
+    if cl == 0 && ch == 0
+        return runs ? piece : nothing
+    end
+    cl == 1 && ch == 1 || return nothing
+    width = agen_ckpt_lin_add(piece.hi, piece.lo, -1)
+    haskey(width, v) && return nothing
+    (all(kv -> kv[1] === nothing, width) && get(width, nothing, 0) >= 0) || return nothing
+    (get(width, nothing, 0) == 0 || runs) || return nothing
+    sub(f, x) = (g = copy(f); delete!(g, v); agen_ckpt_lin_add(g, x, 1))
+    return (lo = sub(piece.lo, lo), hi = sub(piece.hi, hi))
+end
+
+# Walks the statements in order with the cover of each array so far; every read that the cover does not hold puts its array in `exposed`. A write under an `if` or a loop that
+# may not run covers only what follows it inside that construct. A subscript the analysis cannot read, or an array with another count of subscripts than one, is exposed.
+function agen_ckpt_exposed!(stmts, cov::Dict{Symbol,Vector{Any}}, ranges::Vector, bad::Set{Symbol}, exposed::Set{Symbol})
+    covered(a, subs) = begin
+        length(subs) == 1 || return false
+        e = agen_ckpt_lin_ok(subs[1], ranges, bad); e === nothing && return false
+        any(p -> agen_ckpt_le(p.lo, e, ranges) && agen_ckpt_le(e, p.hi, ranges), get(cov, a, Any[]))
+    end
+    check(x) = begin
+        rd = Any[]; agen_ckpt_reads!(x, rd)
+        for (a, subs) in rd; covered(a, subs) || push!(exposed, a); end
+    end
+    for st in stmts
+        if st isa Expr && st.head === :(=) && st.args[1] isa Union{Symbol,Expr}
+            lhs = st.args[1]; check(st.args[2])
+            if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol
+                foreach(check, lhs.args[2:end])
+                if length(lhs.args) == 2
+                    e = agen_ckpt_lin_ok(lhs.args[2], ranges, bad)
+                    e === nothing || agen_ckpt_cov_add!(get!(cov, lhs.args[1], Any[]), e, e)
+                end
+            end
+        elseif st isa Expr && st.head === :for
+            h = agen_fp_header(st)
+            check(st.args[1].args[2])
+            v = h === nothing ? nothing : h.var
+            lo = h !== nothing && h.step === 1 ? agen_ckpt_lin_ok(h.lo, ranges, bad) : nothing
+            hi = h !== nothing && h.step === 1 ? agen_ckpt_lin_ok(h.hi, ranges, bad) : nothing
+            inner = Dict{Symbol,Vector{Any}}(k => copy(x) for (k, x) in cov)
+            before = Dict{Symbol,Int}(k => length(x) for (k, x) in cov)
+            vv = v === nothing ? Symbol("__ck_unknown") : v
+            agen_ckpt_exposed!(agen_fp_stmts(st.args[2]), inner, vcat(ranges, Any[(var = vv, lo = lo, hi = hi)]), bad, exposed)
+            for (a, ps) in inner, p in ps[get(before, a, 0) + 1:end]
+                q = agen_ckpt_cov_expand(p, vv, lo, hi, ranges)
+                q === nothing || agen_ckpt_cov_add!(get!(cov, a, Any[]), q.lo, q.hi)
+            end
+        elseif st isa Expr && st.head in (:if, :elseif)
+            check(st.args[1])
+            for arm in st.args[2:end]
+                body = arm isa Expr && arm.head === :elseif ? Any[arm] : agen_fp_stmts(arm)
+                agen_ckpt_exposed!(body, Dict{Symbol,Vector{Any}}(k => copy(x) for (k, x) in cov), ranges, bad, exposed)
+            end
+        else
+            check(st)
+        end
+    end
+    return exposed
+end
+
 # The state a region must save: every array and every float scalar the body writes, and the integer scalars that hold a value on entry. A float scalar that the body assigns
 # before it reads still carries a value from one step to the next for the tape, which pushes the old value of every scalar before it is overwritten. Larger than needed and safe.
 function agen_ckpt_set(expr::Expr, kernel, c)
@@ -20391,7 +20552,10 @@ function agen_ckpt_set(expr::Expr, kernel, c)
     used = Set{Symbol}(); agen_split_syms!(st.args[2], used)
     IA = sort(Symbol[a for a in arrs2 if a in used && !(a in arrs) && get(kinds, a, :none) in (:array_float, :array_int)]; by = string)
     IS = sort(Symbol[v for v in scal2 if v in used && !(v in scal) && !(v in lvars) && !(v in lvars2) && v !== c.var && get(kinds, v, :none) in (:scalar_float, :scalar_int)]; by = string)
-    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)
+    # an array that every step covers with its own writes before any read keeps no value from one step to the next: its entry value to a segment is not saved
+    exposed = agen_ckpt_exposed!(agen_fp_stmts(st.args[2]), Dict{Symbol,Vector{Any}}(), Any[], union(scal, lvars), Set{Symbol}())
+    scratch = Symbol[a for a in A if !(a in exposed)]
+    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS, scratch = scratch)
 end
 
 # the kernel with the region loops strip-mined; `ck` is its last argument. Returns (expr, regions) with each region's fresh names.
@@ -20464,6 +20628,7 @@ agen_ckpt_len(a::Symbol) = Symbol("__ckn_", a)
 agen_ckpt_stack(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ck_stack" : "_ck$(k)_stack")
 agen_ckpt_in(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_cki_stack" : "_cki$(k)_stack")
 agen_ckpt_fin(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ckf_stack" : "_ckf$(k)_stack")
+agen_ckpt_ent(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_cke_stack" : "_cke$(k)_stack")
 
 # the inputs of a region (arrays it reads and a later statement writes, such scalars): saved once before its forward loop, restored before its reverse loop
 function agen_ckpt_inputs(set, k::Int, restore::Bool)
@@ -20477,6 +20642,17 @@ function agen_ckpt_inputs(set, k::Int, restore::Bool)
         push!(out, restore ? :($v = $f) : :($f = $v))
     end
     return out
+end
+
+# The state on entry to the region of the scratch arrays that the reverse sweep restores from the tape: saved before the forward loop, put back at the start of the first segment, which
+# the reverse sweep runs last. The pops of that segment then leave them where the plain adjoint does; no other segment needs them (a step covers each before it reads it).
+function agen_ckpt_entry(arrays, k::Int, restore::Bool, s::Symbol = :__ck_none)
+    out = Any[]
+    for a in arrays
+        i = Symbol("__icke_", a); n = agen_ckpt_len(a); st = agen_ckpt_ent(a, k)
+        push!(out, Expr(:for, :($i = 1:$n), Expr(:block, restore ? :($a[$i] = $st[$i]) : :($st[$i] = $a[$i]))))
+    end
+    return restore && !isempty(out) ? Any[Expr(:if, :($s == 1), Expr(:block, out...))] : out
 end
 
 # the variables a statement tree restores from the tape (`v = v_stack[..]`, `v[..] = v_stack[..]`)
@@ -20543,7 +20719,8 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         rl = Any[]; agen_fp_find_loops!(adj.args[2], L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step == -1), rl)
         length(rl) == 1 || error("agen_ckpt: the adjoint holds $(length(rl)) reverse loops over the segment counter `$(r.s)`")
         pops = Set{Symbol}(); agen_ckpt_pops!(rl[1].args[2], pops)
-        push!(kept, (arrays = vcat(Symbol[a for a in set.arrays if !(a in pops)], set.in_arrays), scalars = vcat(Symbol[v for v in set.scalars if !(v in pops)], set.in_scalars)))
+        push!(kept, (arrays = vcat(Symbol[a for a in set.arrays if !(a in pops)], set.in_arrays), scalars = vcat(Symbol[v for v in set.scalars if !(v in pops)], set.in_scalars),
+                     entry = Symbol[a for a in set.scratch if a in pops], perseg = Symbol[a for a in set.arrays if !(a in set.scratch)]))
     end
     # the checkpoint stacks: `nseg` segments of the state
     newnames = Symbol[]; lenstmts = Any[]; allocs = Any[]
@@ -20565,12 +20742,20 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
             push!(allocs, :($stk = Vector{$T}(undef, $n)))
             push!(newnames, stk)
         end
-        for a in set.arrays
+        for a in kp_.perseg
             n = agen_ckpt_len(a); stk = agen_ckpt_stack(a, r.number)
             any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
             a in iparams || push!(iparams, a)
             T = kinds[a] === :array_int ? :Int64 : :Float64
             push!(allocs, :($stk = Vector{$T}(undef, max(0, $(r.nseg)) * $n)))
+            push!(newnames, stk)
+        end
+        for a in kp_.entry
+            n = agen_ckpt_len(a); stk = agen_ckpt_ent(a, r.number)
+            any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
+            a in iparams || push!(iparams, a)
+            T = kinds[a] === :array_int ? :Int64 : :Float64
+            push!(allocs, :($stk = Vector{$T}(undef, $n)))
             push!(newnames, stk)
         end
         for v in set.scalars
@@ -20598,10 +20783,12 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         agen_ckpt_has_tape(Expr(:block, notape...)) && error("agen_ckpt: a tape statement of the forward loop was not recognised")
         sf = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in fwd]
         sr = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in rev]
-        newf = Expr(:for, fl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, false, r.number)..., notape...))
-        newr = Expr(:for, rl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, true, r.number)..., sf..., sr...))
-        body = agen_fp_splice(agen_fp_splice(body, fl[1], Any[agen_ckpt_inputs(set, r.number, false)..., newf]), rl[1],
-                              Any[agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, false)..., agen_ckpt_inputs(set, r.number, true)..., newr, agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])
+        cset = merge(set, (arrays = kp_.perseg,))
+        newf = Expr(:for, fl[1].args[1], Expr(:block, agen_ckpt_copy(cset, kinds, r.s, false, r.number)..., notape...))
+        newr = Expr(:for, rl[1].args[1], Expr(:block, agen_ckpt_copy(cset, kinds, r.s, true, r.number)..., agen_ckpt_entry(kp_.entry, r.number, true, r.s)..., sf..., sr...))
+        body = agen_fp_splice(agen_fp_splice(body, fl[1], Any[agen_ckpt_inputs(set, r.number, false)..., agen_ckpt_entry(kp_.entry, r.number, false)..., newf]), rl[1],
+                              Any[agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, false)..., agen_ckpt_inputs(set, r.number, true)..., newr,
+                                  agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])
     end
     lens = Any[]
     for set in sets, a in vcat(set.arrays, set.in_arrays)
