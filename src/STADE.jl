@@ -9884,6 +9884,63 @@ function cgen_array_sliced_by_decoded_loopvar(widxs, ridxs, body::Vector{NamedTu
     return true
 end
 
+# A write index built from the loop variable by `mod`/`rem`, with no `div` beside it (the digits of a fused nest come in pairs), no array read
+# and no dimension that is the loop variable itself: two iterations reach one element once the trip count passes the modulus.
+# Equal read and write indices then do not make the iterations independent, so such an array must be accumulate-only.
+function cgen_writes_collide_by_mod(widxs, defs::Dict{Symbol,Any}, loopvar::Symbol)
+    for w in widxs
+        ex = Any[cgen_expand_scalar_defs(e, defs, 8) for e in w]
+        any(e -> e === loopvar, ex) && continue
+        info = (mod = Ref(false), dv = Ref(false), ref = Ref(false), lv = Ref(false))
+        for e in ex; cgen_mod_scan!(e, loopvar, info); end
+        info.mod[] && info.lv[] && !info.dv[] && !info.ref[] && return true
+    end
+    return false
+end
+
+# The scalars a loop body assigns exactly once, anywhere in it (branches and inner loops included), from a right side with no array read.
+function cgen_nested_scalar_defs(body::Vector{NamedTuple})
+    cnt = Dict{Symbol,Int}(); rhs = Dict{Symbol,Any}()
+    cgen_nested_defs_walk!(body, cnt, rhs)
+    return Dict{Symbol,Any}(k => v for (k, v) in rhs if cnt[k] == 1 && !cgen_expr_has_ref(v) && !cgen_expr_contains(v, k))
+end
+
+function cgen_nested_defs_walk!(body::Vector{NamedTuple}, cnt::Dict{Symbol,Int}, rhs::Dict{Symbol,Any})
+    for st in body
+        if st.kind == :assign && st.lhs isa Symbol
+            cnt[st.lhs] = get(cnt, st.lhs, 0) + 1
+            rhs[st.lhs] = st.rhs
+        elseif st.kind == :if
+            cgen_nested_defs_walk!(st.then, cnt, rhs); cgen_nested_defs_walk!(st.els, cnt, rhs)
+        elseif st.kind == :for
+            cnt[st.var] = get(cnt, st.var, 0) + 2
+            cgen_nested_defs_walk!(st.body, cnt, rhs)
+        elseif st.kind == :while
+            cgen_nested_defs_walk!(st.body, cnt, rhs)
+        end
+    end
+    return nothing
+end
+
+function cgen_expand_scalar_defs(x, defs::Dict{Symbol,Any}, depth::Int)
+    x isa Symbol && return (depth > 0 && haskey(defs, x)) ? cgen_expand_scalar_defs(defs[x], defs, depth - 1) : x
+    x isa Expr || return x
+    return Expr(x.head, Any[cgen_expand_scalar_defs(a, defs, depth) for a in x.args]...)
+end
+
+function cgen_mod_scan!(x, loopvar::Symbol, info)
+    x === loopvar && (info.lv[] = true)
+    x isa Expr || return nothing
+    x.head == :ref && (info.ref[] = true)
+    if x.head == :call && x.args[1] in (:mod, :rem, :%) && length(x.args) >= 2 && cgen_expr_contains(x.args[2], loopvar)
+        info.mod[] = true
+    elseif x.head == :call && x.args[1] in (:div, :fld, :cld, :÷) && any(a -> cgen_expr_contains(a, loopvar), x.args[2:end])
+        info.dv[] = true
+    end
+    for a in x.args; cgen_mod_scan!(a, loopvar, info); end
+    return nothing
+end
+
 # Gate for the GPU split. The strict predicate runs first, so every loop that cgen_reduction_only_loop accepts is accepted here
 # with the same synth. The idiom predicate only relaxes the array check. A refusal names the smallest failing array.
 # `idiom` is true when an accepted loop needed the idiom predicate for at least one array.
@@ -9905,9 +9962,10 @@ function cgen_split_loop_gate(body::Vector{NamedTuple}, loopvar::Symbol, known_c
     idiom = false
     for (arr, widxs) in summary.writes
         ridxs = get(summary.reads, arr, Any[])
-        cgen_array_ok_strict(body, arr, widxs, ridxs, loopvar, summary.defs) && continue
+        collide = cgen_writes_collide_by_mod(widxs, merge(summary.defs, cgen_nested_scalar_defs(body)), loopvar)
+        !collide && cgen_array_ok_strict(body, arr, widxs, ridxs, loopvar, summary.defs) && continue
         cgen_array_sliced_by_decoded_loopvar(widxs, ridxs, body, summary.defs, loopvar, bounds, protect) && continue
-        if arr isa Symbol && cgen_array_ok_idiom(body, arr)
+        if arr isa Symbol && (collide ? cgen_array_accumulate_only(body, arr) : cgen_array_ok_idiom(body, arr))
             idiom = true
             continue
         end

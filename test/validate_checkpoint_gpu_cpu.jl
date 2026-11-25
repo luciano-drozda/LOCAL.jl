@@ -119,8 +119,6 @@ function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps =
         env = mk()
         for (name, src, expect) in ckp_shapes()
             expect === :region || continue
-            # outside the contract of the GPU stage, plain adjoint included: a loop that updates u[mod(3t, n)+1] in place (a derived index that is not one-to-one) is launched in parallel
-            name == "ck_index" && continue
             isempty(only) || name in only || continue
             primal = Meta.parse(src)
             for nt in nsteps
