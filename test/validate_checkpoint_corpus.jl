@@ -2,9 +2,10 @@
 # For each kernel of the directories and each segment length ck in (1, 2, 3, 7): every argument after the call and every returned scalar of the checkpointed adjoint
 # equal, bit for bit, those of stade_adjoint(keep_push_pop = false) (the fixed-point adjoint where a solve loop is) on the same random draw. A kernel the adjoint without checkpoints cannot size is skipped.
 # Every kernel gets one row: no loop that can be a region, no region (the reasons), checked, differs, error (the first line of the message).
-#   julia validate_checkpoint_corpus.jl [dir ...] [-k kernel,kernel] [--zero] [--device]   (--zero draws the integers from 0 to 2: loops that run no step, as validate_zerotrip.jl; --device also runs the CUDA and JACC text on the serial stand-ins against the CPU checkpointed adjoint, 1e-9)
+#   julia validate_checkpoint_corpus.jl [dir ...] [-k kernel,kernel] [--zero] [--device] [--hvp]   (--zero draws the integers from 0 to 2: loops that run no step, as validate_zerotrip.jl; --hvp checks the checkpointed HVP against the plain one instead of the adjoint; --device also runs the CUDA and JACC text on the serial stand-ins against the CPU checkpointed adjoint, 1e-9)
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :ckv_call) || include(joinpath(@__DIR__, "validate_checkpoint.jl"))
+isdefined(@__MODULE__, :ckh_compare) || include(joinpath(@__DIR__, "validate_checkpoint_hvp.jl"))
 using Random, Logging
 
 # The device run of an adjoint (its text planned for the environment) against its CPU run, on every segment length of `cks`: the worst relative error over the arrays, their shadows and the returned scalars.
@@ -41,14 +42,27 @@ function ckc_device(env, bundle, sig, int_args, vals, seedv, cks)
     return bad
 end
 
-function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::Int = 5, envs = ())
+function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::Int = 5, envs = (), hvp::Bool = false)
     name = splitext(basename(path))[1]
     primal = STADE.io_read_corpus_entry(path)
     kernel = STADE.parse_kernel(primal); sig = kernel.sig
     (cands, why) = STADE.agen_ckpt_candidates(primal, kernel; min_trip = 0)
     isempty(cands) && return (name = name, status = :no_candidate, note = isempty(why) ? "" : first(why))
-    ref = try with_logger(NullLogger()) do; STADE.stade_adjoint(primal; keep_push_pop = false) end
+    ref = try with_logger(NullLogger()) do; hvp ? STADE.stade_hvp(primal; keep_push_pop = false) : STADE.stade_adjoint(primal; keep_push_pop = false) end
           catch e; return (name = name, status = :plain_refuses, note = first(split(sprint(showerror, e), "\n"))) end
+    if hvp
+        # the checkpointed HVP against the plain one, three seedings (validate_checkpoint_hvp.jl)
+        ckh = ckv_logged(() -> try STADE.agen_ckpt_adjoint(primal; min_trip = 0, hvp = true) catch e; e end).value
+        ckh isa Exception && return (name = name, status = :error, note = first(split(sprint(showerror, ckh), "\n")))
+        ckh === nothing && return (name = name, status = :no_region, note = "")
+        Random.seed!(STADE.val_stable_seed(name))
+        bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_lo = int_lo, int_hi = int_hi, grow_start = 8, grow_max = 64)
+        STADE.val_coerce_int_arrays!(kernel, bl.values)
+        (st, note) = ckh_compare(primal, bl.int_args, bl.values, cks, STADE.val_stable_seed(name))
+        st === :differs && return (name = name, status = :differs, note = note)
+        st === :error && return (name = name, status = :error, note = note)
+        return (name = name, status = st === :checked ? :checked : :no_region, note = note)
+    end
     lg = ckv_logged(() -> try STADE.agen_ckpt_adjoint(primal; min_trip = 0) catch e; e end)
     ck = lg.value
     ck isa Exception && return (name = name, status = :error, note = first(split(sprint(showerror, ck), "\n")))
@@ -96,13 +110,13 @@ function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::I
     return (name = name, status = :checked, note = join(notes, "; "))
 end
 
-function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} = String[], verbose::Bool = true, int_lo::Int = 3, int_hi::Int = 5, envs = ())
+function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} = String[], verbose::Bool = true, int_lo::Int = 3, int_hi::Int = 5, envs = (), hvp::Bool = false)
     rows = NamedTuple[]
     for d in dirs
         for f in sort(readdir(d))
             (endswith(f, ".jl") && !(endswith(f, "_b.jl") || endswith(f, "_d.jl") || endswith(f, "_hv.jl"))) || continue
             isempty(only) || splitext(f)[1] in only || continue
-            r = try ckc_kernel(joinpath(d, f); int_lo = int_lo, int_hi = int_hi, envs = envs)
+            r = try ckc_kernel(joinpath(d, f); int_lo = int_lo, int_hi = int_hi, envs = envs, hvp = hvp)
                 catch e
                     msg = first(split(sprint(showerror, e), "\n"))
                     # a kernel the parser or the baseline generator refuses is no subject for this test
@@ -121,7 +135,7 @@ function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} =
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    args = [a for a in ARGS if !(a in ("--zero", "--device"))]
+    args = [a for a in ARGS if !(a in ("--zero", "--device", "--hvp"))]
     zero = "--zero" in ARGS
     envs = ()
     if "--device" in ARGS
@@ -133,5 +147,5 @@ if abspath(PROGRAM_FILE) == @__FILE__
     i = findfirst(==("-k"), args)
     i === nothing || (only = String.(split(args[i + 1], ",")); deleteat!(args, i:i + 1))
     dirs = isempty(args) ? [joinpath(@__DIR__, d) for d in ("val-corpus", "counted-corpus", "scalar-acc-corpus", "int-state-corpus", "inactive-read-corpus", "plain-read-corpus", "boxed-reset-corpus", "while-corpus", "split-corpus", "battle-corpus")] : String[abspath(a) for a in args]
-    exit(validate_checkpoint_corpus(dirs; only = only, int_lo = zero ? 0 : 3, int_hi = zero ? 2 : 5, envs = envs) ? 0 : 1)
+    exit(validate_checkpoint_corpus(dirs; only = only, int_lo = zero ? 0 : 3, int_hi = zero ? 2 : 5, envs = envs, hvp = "--hvp" in ARGS) ? 0 : 1)
 end

@@ -7,6 +7,7 @@ isdefined(@__MODULE__, :ckv_call) || include(joinpath(@__DIR__, "validate_checkp
 isdefined(@__MODULE__, :scc_env) || include(joinpath(@__DIR__, "validate_adjoint_split_cuda_cpu.jl"))
 isdefined(@__MODULE__, :spj_env) || include(joinpath(@__DIR__, "validate_adjoint_split_jacc_cpu.jl"))
 # on a device the caller binds scc_env and spj_env to anything and passes the real environments (sg_cuda_env, sg_jacc_env) as `envs`
+isdefined(@__MODULE__, :ckh_call) || include(joinpath(@__DIR__, "validate_checkpoint_hvp.jl"))
 using Random, Logging
 
 # the device run of one shape with nt steps: (worst relative error against the CPU over the segment lengths, the lengths that differ, a message)
@@ -62,7 +63,56 @@ function ckg_run(env, name::String, primal::Expr, nt::Int; cks = (1, 2, 3), seed
     return (:checked, worst, bad, msg)
 end
 
-function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps = (0, 1, 2, 10), envs = (("cuda", scc_env), ("jacc", spj_env)))
+# the device run of the checkpointed HVP of one shape: the same comparison as ckg_run, for the seeding with both the adjoint seed and the tangent seed
+function ckg_run_hvp(env, name::String, primal::Expr, nt::Int; cks = (1, 2, 3), seed::Int = 20261122)
+    kernel = STADE.parse_kernel(primal)
+    r = with_logger(NullLogger()) do; STADE.agen_ckpt_adjoint(primal; min_trip = 0, hvp = true) end
+    r === nothing && return (:no_region, 0.0, Int[], "")
+    opts = ckv_options(name)
+    pins = Dict{Symbol,Int}()
+    for a in kernel.sig.args
+        kernel.sig.kinds[a] == :scalar_int || continue
+        pins[a] = a === :n ? 6 : a === :nt2 ? nt + 2 : nt
+    end
+    merge!(pins, opts.pins)
+    Random.seed!(seed)
+    bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = copy(pins), int_lo = 3, int_hi = 5, grow_start = 4, grow_max = 64)
+    STADE.val_coerce_int_arrays!(kernel, bl.values)
+    vals = bl.values
+    for (k, v) in opts.floats; haskey(vals, k) && (vals[k] = v); end
+    seedv = STADE.val_random_values_like(kernel, vals); dseed = STADE.val_random_values_like(kernel, vals)
+    D = STADE.val_unflatten(kernel, merge(bl.int_args, pins), vals, STADE.val_randn(length(STADE.val_flatten(kernel, vals))))
+    ksig = STADE.parse_kernel(r.primal).sig
+    snames = Symbol[a for a in r.initstacks.args[1].args[2:end]]
+    cpu_init = STADE.val_compile(sg_rename(r.initstacks, :ckg_init_cpu)); cpu_hvp = STADE.val_compile(sg_rename(r.adjoint, :ckg_hvp_cpu))
+    plan_init = env.plan(r.initstacks, nothing)
+    plan_hvp = env.plan(r.adjoint, env.initmap(plan_init, r.initstacks))
+    dev_init = sg_eval_plan!(env.mod, plan_init); dev_hvp = sg_eval_plan!(env.mod, plan_hvp)
+    worst = 0.0; bad = Int[]; msg = ""
+    for c in cks
+        ia = merge(bl.int_args, pins, Dict(:ck => c))
+        c1 = ckh_call(cpu_hvp, cpu_init, ksig, ia, vals, seedv, D, dseed, snames)
+        extra = Any[haskey(ia, n) ? ia[n] : (vals[n] isa AbstractArray ? env.wrap(deepcopy(vals[n])) : vals[n]) for n in snames]
+        stacks = STADE.val_init_stacks(dev_init, extra)
+        args = STADE.val_hvp_call_args(ksig, ia, vals, seedv, D, dseed, stacks)
+        for i in 1:(length(args) - length(stacks)); args[i] isa AbstractArray && (args[i] = env.wrap(args[i])); end
+        ret = try Base.invokelatest(dev_hvp, args...) catch e; msg = first(sprint(showerror, e), 200); nothing end
+        if ret === nothing && !isempty(msg); push!(bad, c); continue; end
+        err = 0.0; signal = 0.0
+        for (x, y) in zip(c1.args, args[1:length(c1.args)])
+            x isa AbstractArray && eltype(x) === Float64 || continue
+            err = max(err, sg_relerr(x, env.tohost(y))); signal = max(signal, maximum(abs, x; init = 0.0))
+        end
+        # a comparison of arrays that are all zero says nothing
+        signal > 0 || (push!(bad, c); msg = "every array is zero"; continue)
+        for (x, y) in zip(c1.ret isa Tuple ? c1.ret : (c1.ret,), ret isa Tuple ? ret : (ret,)); x isa Number && (err = max(err, sg_relerr_scalar(x, y))); end
+        worst = max(worst, err)
+        err <= 1e-12 || push!(bad, c)
+    end
+    return (:checked, worst, bad, msg)
+end
+
+function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps = (0, 1, 2, 10), envs = (("cuda", scc_env), ("jacc", spj_env)), hvp::Bool = false)
     checks = 0; bad = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
     for (ename, mk) in envs
@@ -74,7 +124,7 @@ function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps =
             isempty(only) || name in only || continue
             primal = Meta.parse(src)
             for nt in nsteps
-                res = try ckg_run(env, name, primal, nt)
+                res = try (hvp ? ckg_run_hvp : ckg_run)(env, name, primal, nt)
                       catch e
                           msg = first(split(sprint(showerror, e), "\n"))
                           if ename == "jacc" && occursin("parallel_reduce was reached", msg)
@@ -122,7 +172,7 @@ end
 
 if abspath(PROGRAM_FILE) == @__FILE__
     only = String[a for a in ARGS if !startswith(a, "--")]
-    ok = validate_checkpoint_gpu_cpu(; only)
+    ok = validate_checkpoint_gpu_cpu(; only, hvp = "--hvp" in ARGS)
     if "--sabotage" in ARGS
         ok = validate_checkpoint_gpu_cpu_sabotage() == 0 && ok
     end
