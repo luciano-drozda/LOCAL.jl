@@ -77,4 +77,8 @@ No modules, structs or global consts. Stage-prefixed names. No corpus-specific c
 
 ## Regression result
 
-Pending: RALL55 (113 suites, rome partition) was submitted on 2026-11-25. The result is added in the next commit.
+RALL55 (Slurm 2098635, rome partition, host krakenepyc2, 64 cores, Julia 1.11.9) ran 113 suites of the tree at e3531b7 in 4275 s. 112 passed, 1 failed:
+
+- `validate_seed_stable`: `measure_checkpoint_device.jl` (new in this work) called a bare `randn(`. Fixed in this commit (`STADE.val_randn(n)`). The suite was run again on Julia 1.10.11: 22 of 22 checks pass. The script still runs (smoke run, n = 2000, 12 steps, `ck` = 3).
+
+Not in the sweep (they need a device, or they are skipped by `mk_all3.py`): `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth`, `validate_corpus_flags` and the contraction suites. The V100 runs of the checkpointed adjoint and HVP (248 of 248 each, section 4) cover the device side. `validate_corpus_flags` and the slow contraction suites were not run in this sweep.

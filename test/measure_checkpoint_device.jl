@@ -14,7 +14,7 @@ function ckm_one(env, primal::Expr, n::Int, nsteps::Int, maxit::Int, ck, devmem;
     ints = Dict{Symbol,Int}(:n => n, :nsteps => nsteps, :maxit => maxit, :ck => something(ck, 1))
     Random.seed!(7)
     vals = Dict{Symbol,Any}(:u => [sin(0.37 * i) + 0.5 * cos(0.011 * i) for i in 1:n], :w => zeros(n), :wn => zeros(n), :lam => 0.4, :tol => 1e-20)
-    seedv = Dict{Symbol,Any}(:u => randn(n), :w => zeros(n), :wn => zeros(n), :lam => 0.0, :tol => 0.0)
+    seedv = Dict{Symbol,Any}(:u => STADE.val_randn(n), :w => zeros(n), :wn => zeros(n), :lam => 0.0, :tol => 0.0)
     plan_init = env.plan(r.initstacks, nothing)
     plan_adj = env.plan(r.adjoint, env.initmap(plan_init, r.initstacks))
     dev_init = sg_eval_plan!(env.mod, plan_init); dev_adj = sg_eval_plan!(env.mod, plan_adj)
