@@ -1864,6 +1864,19 @@ elements for plain writes.** Four controls make the trust explicit.
 `verdict` is `:kernel`, `:reduction` or `:host`. `reason` also takes
 `validate_offload.jl` pins the refusals with it.
 
+### A lone `mod` index (v0.5.57)
+
+One shape that breaks the contract by construction is refused as well. An array written through an index built from the loop variable by `mod`
+or `rem` alone (`j = mod(3 * t, n) + 1; u[j] = u[j] * a`) sends two iterations to one element once the trip count passes the modulus. Equal read and
+write indices do not make the iterations independent there. `cgen_writes_collide_by_mod` finds the shape: the index, with its scalar definitions
+substituted (`cgen_nested_scalar_defs` also reads definitions inside branches, as in the guard `if t <= nt` of a checkpointed segment), holds a `mod`
+or `rem` of an expression with the loop variable, and holds no `div`, no array read, and no dimension that is the loop variable itself. The array
+then passes only if it is accumulate-only (an atomic add serves it); consume-only is not enough, because the read-then-overwrite races. A `div`
+beside the `mod` is the digit decomposition of a fused nest and keeps the decoded-digit proof. An index read from an array is the scatter contract
+above and is not touched. The loop stays sequential (the serial track). Known cost: a periodic roll `y[mod(i, n) + 1] = x[i]` over `i = 1:n` is
+one-to-one but is not proven so, and stays sequential. `test/validate_mod_collide.jl` holds the cases and a sabotage run; `ck_index` of
+`ckpt_shapes.jl` is the V100 witness (plain and checkpointed, adjoint and HVP).
+
 ### Two refusals the trust needs
 
 The contract above is trust, and two shapes break it provably. Both live in
