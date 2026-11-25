@@ -241,6 +241,91 @@ function ck_sweep(u, a, out, n, nt)
     out[1] = u[n]
     return nothing
 end""", :region),
+    # an integer input that the region reads and a later loop rewrites (the segment is run again after that loop)
+    ("ck_input", """
+function ck_input(x, flag, a, out, n, nt)
+    for t = 1:nt
+        for i = 1:n
+            if flag[i] > 0
+                x[i] = x[i] * a + sin(x[i])
+            end
+        end
+    end
+    for i = 1:n
+        flag[i] = 1 - flag[i]
+    end
+    s = 0.0
+    for i = 1:n
+        if flag[i] > 0
+            s = s + x[i]
+        end
+    end
+    out[1] = s
+    return nothing
+end""", :region),
+    # a scalar input that only a condition of the region reads and a later statement rewrites (the adjoint tapes the branch, not the scalar)
+    ("ck_input_s", """
+function ck_input_s(x, a, out, n, nt)
+    c = a - 0.5
+    for t = 1:nt
+        if c > 0.0
+            x[1] = x[1] * a + sin(x[1])
+        else
+            x[1] = x[1] * 0.5 + x[1] * x[1]
+        end
+    end
+    c = c * 0.0 - 2.0
+    out[1] = c + x[1]
+    return nothing
+end""", :region),
+    # a float scalar that every step assigns before it reads: its old value is still pushed on the tape
+    ("ck_oldscalar", """
+function ck_oldscalar(x, u, z, loss, n, nt)
+    for t = 1:nt
+        wv = u[t]
+        u[t] = u[t] * 0.5 + x[t]
+        a = wv * wv * x[t]
+        wv = u[t]
+        a = a + wv * wv * x[t + 1]
+        z[t] = a
+    end
+    for t = 1:nt
+        u[1] = x[t] * 0.5 + x[t + 1]
+        wv = u[1]
+        a = wv * wv * x[t]
+        wv = u[1] * 2.0
+        a = a + wv * wv * x[t + 1]
+        z[nt + t] = a
+    end
+    for m = 1:2 * nt
+        loss[1] = loss[1] + z[m] * z[m]
+    end
+    return nothing
+end""", :region),
+    # an array snapshot inside a step (the index `__sbase_` goes with the tape)
+    ("ck_snapshot", """
+function ck_snapshot(x, w, i_cell_to_node, m, i_ncell, i_nnode, i_njac, i_nout)
+    for i_o = 1:i_nout
+        for i_ = 1:i_njac
+            for i_node = 1:i_nnode
+                m[i_node] = 0.0
+            end
+            for i_cell = 1:i_ncell
+                for i_loc = 1:3
+                    i_n = i_cell_to_node[i_loc, i_cell]
+                    m[i_n] = m[i_n] + w[i_cell] * x[i_n] * 0.1
+                end
+            end
+            for i_node = 1:i_nnode
+                x[i_node] = x[i_node] + m[i_node] * 0.5
+            end
+        end
+        for i_node = 1:i_nnode
+            x[i_node] = x[i_node] + m[i_node] * m[i_node] * 0.2
+        end
+    end
+    return nothing
+end""", :region),
     # test 1: the iterations are independent
     ("ck_no_indep", """
 function ck_no_indep(u, a, out, n, nt)

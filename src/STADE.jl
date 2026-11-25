@@ -20285,7 +20285,7 @@ agen_ckpt_stack_name(a) = a isa Symbol && (endswith(string(a), "_stack") || ends
 
 # a statement the generator wrote for the tape: a store into a stack or the index it uses (the shared `__icse_` temporaries stay: the primal may read them)
 agen_ckpt_is_tape_stmt(s) = s isa Expr && s.head === :(=) &&
-    ((s.args[1] isa Symbol && startswith(string(s.args[1]), "__idx_")) ||
+    ((s.args[1] isa Symbol && (startswith(string(s.args[1]), "__idx_") || startswith(string(s.args[1]), "__sbase_"))) ||
      (s.args[1] isa Expr && s.args[1].head === :ref && agen_ckpt_stack_name(s.args[1].args[1])))
 
 # the arrays and scalars written below `x`, and the loop variables (not state)
@@ -20332,7 +20332,7 @@ end
 
 # The top-level loops of the kernel that can be regions (tests 1, 3 and 4 of the plan), and one reason for each loop that cannot: (candidates, reasons).
 # A candidate is (index in the statement list, var, lo, hi). Test 2 (the loop holds tape) is made on the generated adjoint.
-function agen_ckpt_candidates(expr::Expr, kernel)
+function agen_ckpt_candidates(expr::Expr, kernel; min_trip::Int = 8)
     stmts = agen_fp_stmts(expr.args[2])
     kinds = kernel.sig.kinds
     solve = !isempty(agen_fp_detect(expr, kinds; kernel = kernel))
@@ -20354,8 +20354,8 @@ function agen_ckpt_candidates(expr::Expr, kernel)
             why = "its bounds change inside the loop"
         elseif !agen_ckpt_carries(st)
             why = "its iterations are independent (nothing is carried from one step to the next)"
-        elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= 8
-            why = "its literal trip count is $(h.hi - h.lo + 1), at most 8 (no segment length saves memory)"
+        elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= min_trip
+            why = "its literal trip count is $(h.hi - h.lo + 1), at most $min_trip (no segment length saves memory)"
         elseif h.var in union(arrs, scal) || any(v -> v in (:ck,), union(arrs, scal, lvars))
             why = "it assigns its own counter or the name `ck`"
         end
@@ -20364,21 +20364,28 @@ function agen_ckpt_candidates(expr::Expr, kernel)
     return (cands, reasons)
 end
 
-# The state a region must save: every array the body writes and every scalar it writes that holds a value on entry (an argument, assigned at the top level
-# before the loop, or read before it is assigned in the body). Larger than needed and safe (plan 4.4, first version).
+# The state a region must save: every array and every float scalar the body writes, and the integer scalars that hold a value on entry. A float scalar that the body assigns
+# before it reads still carries a value from one step to the next for the tape, which pushes the old value of every scalar before it is overwritten. Larger than needed and safe.
 function agen_ckpt_set(expr::Expr, kernel, c)
     stmts = agen_fp_stmts(expr.args[2]); st = stmts[c.index]
     kinds = kernel.sig.kinds
     arrs = Set{Symbol}(); scal = Set{Symbol}(); lvars = Set{Symbol}()
     agen_ckpt_written!(st.args[2], arrs, scal, lvars)
+    A = sort(Symbol[a for a in arrs if get(kinds, a, :none) in (:array_float, :array_int)]; by = string)
+    # an integer scalar that the body assigns before it reads has no value on entry, and the adjoint does not declare it before the loop
     uev = Set{Symbol}(); agen_split_uev!(st.args[2], Set{Symbol}(), uev)
     before = Set{Symbol}(a for a in kernel.sig.args)
     for p in stmts[1:c.index - 1]
         p isa Expr && p.head === :(=) && p.args[1] isa Symbol && push!(before, p.args[1])
     end
-    A = sort(Symbol[a for a in arrs if get(kinds, a, :none) in (:array_float, :array_int)]; by = string)
-    S = sort(Symbol[v for v in scal if !(v in lvars) && v !== c.var && get(kinds, v, :none) in (:scalar_float, :scalar_int) && (v in before || v in uev)]; by = string)
-    return (arrays = A, scalars = S)
+    S = sort(Symbol[v for v in scal if !(v in lvars) && v !== c.var && (get(kinds, v, :none) === :scalar_float || (get(kinds, v, :none) === :scalar_int && (v in before || v in uev)))]; by = string)
+    # the inputs the region only reads and a later statement writes: the segment is run again after that statement, so they are saved at the start of the region
+    arrs2 = Set{Symbol}(); scal2 = Set{Symbol}(); lvars2 = Set{Symbol}()
+    foreach(x -> agen_ckpt_written!(x, arrs2, scal2, lvars2), stmts[c.index + 1:end])
+    used = Set{Symbol}(); agen_split_syms!(st.args[2], used)
+    IA = sort(Symbol[a for a in arrs2 if a in used && !(a in arrs) && get(kinds, a, :none) in (:array_float, :array_int)]; by = string)
+    IS = sort(Symbol[v for v in scal2 if v in used && !(v in scal) && !(v in lvars) && !(v in lvars2) && v !== c.var && get(kinds, v, :none) in (:scalar_float, :scalar_int)]; by = string)
+    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)
 end
 
 # the kernel with the region loops strip-mined; `ck` is its last argument. Returns (expr, regions) with each region's fresh names.
@@ -20449,7 +20456,22 @@ end
 
 agen_ckpt_len(a::Symbol) = Symbol("__ckn_", a)
 agen_ckpt_stack(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ck_stack" : "_ck$(k)_stack")
+agen_ckpt_in(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_cki_stack" : "_cki$(k)_stack")
 agen_ckpt_fin(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ckf_stack" : "_ckf$(k)_stack")
+
+# the inputs of a region (arrays it reads and a later statement writes, such scalars): saved once before its forward loop, restored before its reverse loop
+function agen_ckpt_inputs(set, k::Int, restore::Bool)
+    out = Any[]
+    for a in set.in_arrays
+        i = Symbol("__ickin_", a); n = agen_ckpt_len(a); st = agen_ckpt_in(a, k)
+        push!(out, Expr(:for, :($i = 1:$n), Expr(:block, restore ? :($a[$i] = $st[$i]) : :($st[$i] = $a[$i]))))
+    end
+    for v in set.in_scalars
+        f = Symbol("__cki", k, "_", v)
+        push!(out, restore ? :($v = $f) : :($f = $v))
+    end
+    return out
+end
 
 # the variables a statement tree restores from the tape (`v = v_stack[..]`, `v[..] = v_stack[..]`)
 function agen_ckpt_pops!(x, out::Set{Symbol})
@@ -20515,7 +20537,7 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         rl = Any[]; agen_fp_find_loops!(adj.args[2], L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step == -1), rl)
         length(rl) == 1 || error("agen_ckpt: the adjoint holds $(length(rl)) reverse loops over the segment counter `$(r.s)`")
         pops = Set{Symbol}(); agen_ckpt_pops!(rl[1].args[2], pops)
-        push!(kept, (arrays = Symbol[a for a in set.arrays if !(a in pops)], scalars = Symbol[v for v in set.scalars if !(v in pops)]))
+        push!(kept, (arrays = vcat(Symbol[a for a in set.arrays if !(a in pops)], set.in_arrays), scalars = vcat(Symbol[v for v in set.scalars if !(v in pops)], set.in_scalars)))
     end
     # the checkpoint stacks: `nseg` segments of the state
     newnames = Symbol[]; lenstmts = Any[]; allocs = Any[]
@@ -20523,6 +20545,14 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         any(st -> st isa Expr && st.head === :(=) && st.args[1] === r.nseg, sized) || error("agen_ckpt: initstacks does not define `$(r.nseg)`")
         for a in kp_.arrays
             n = agen_ckpt_len(a); stk = agen_ckpt_fin(a, r.number)
+            any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
+            a in iparams || push!(iparams, a)
+            T = kinds[a] === :array_int ? :Int64 : :Float64
+            push!(allocs, :($stk = Vector{$T}(undef, $n)))
+            push!(newnames, stk)
+        end
+        for a in set.in_arrays
+            n = agen_ckpt_len(a); stk = agen_ckpt_in(a, r.number)
             any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
             a in iparams || push!(iparams, a)
             T = kinds[a] === :array_int ? :Int64 : :Float64
@@ -20564,10 +20594,11 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         sr = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in rev]
         newf = Expr(:for, fl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, false, r.number)..., notape...))
         newr = Expr(:for, rl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, true, r.number)..., sf..., sr...))
-        body = agen_fp_splice(agen_fp_splice(body, fl[1], Any[newf]), rl[1], Any[agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, false)..., newr, agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])
+        body = agen_fp_splice(agen_fp_splice(body, fl[1], Any[agen_ckpt_inputs(set, r.number, false)..., newf]), rl[1],
+                              Any[agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, false)..., agen_ckpt_inputs(set, r.number, true)..., newr, agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])
     end
     lens = Any[]
-    for set in sets, a in set.arrays
+    for set in sets, a in vcat(set.arrays, set.in_arrays)
         n = agen_ckpt_len(a)
         any(x -> x.args[1] === n, lens) || push!(lens, :($n = length($a)))
     end
@@ -20603,9 +20634,20 @@ function agen_ckpt_is_guard_flag(st)
 end
 
 # The checkpointed adjoint of `expr`: (initstacks, adjoint, primal_pruned, regions, primal) or `nothing`. `primal` is the strip-mined kernel (its `sig` has `ck` last).
-function agen_ckpt_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing, primal_outputs::Bool = true)
+function agen_ckpt_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing, primal_outputs::Bool = true, min_trip::Int = 8)
+    try
+        return agen_ckpt_adjoint_(expr, independents, dependents, primal_outputs, min_trip)
+    catch e
+        # a kernel the analysis cannot read, or whose strip-mined adjoint cannot be sized or rewritten, keeps the adjoint without checkpoints
+        (e isa ErrorException && (startswith(e.msg, "agen_ckpt:") || startswith(e.msg, "agen_split_uev!:") || startswith(e.msg, "stade_adjoint: `keep_push_pop = false`"))) || rethrow()
+        @info "stade_adjoint: checkpoint: no region is built: $(first(split(e.msg, "\n")))"
+        return nothing
+    end
+end
+
+function agen_ckpt_adjoint_(expr::Expr, independents::Union{Vector{Symbol},Nothing}, dependents::Union{Vector{Symbol},Nothing}, primal_outputs::Bool, min_trip::Int)
     kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
-    (cands, reasons) = agen_ckpt_candidates(expr, kernel)
+    (cands, reasons) = agen_ckpt_candidates(expr, kernel; min_trip = min_trip)
     for r in reasons; @info "stade_adjoint: checkpoint: $r"; end
     while !isempty(cands)
         (kp, regions) = agen_ckpt_strip_mine(expr, cands)

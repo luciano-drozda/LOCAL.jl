@@ -143,7 +143,9 @@ function validate_checkpoint(; verbose = true, only = String[], sabotage = false
                 catch e; say(false, "$name nt=$nt: raised ($(first(split(sprint(showerror, e), "\n"))))"); nothing end
             r === nothing && continue
             # the tape of a segment does not depend on the number of steps
+            # a kernel with a loop outside the region (a tape that grows with `nt`, or sizes that all follow `nt`) has no tape of a segment alone
             for (c, t) in r.tapes
+                name in ("ck_oldscalar", "ck_snapshot") && break
                 haskey(seen, c) ? say(seen[c] == t, "$name ck=$c: the tape has $t elements for nt=$nt and $(seen[c]) for another number of steps") : (seen[c] = t)
             end
         end
@@ -158,8 +160,8 @@ function ckv_sabotage(verbose::Bool)
     bad = 0
     text = read(joinpath(dirname(@__DIR__), "src", "STADE.jl"), String)
     cases = [
-        ("an array of the written set is not saved", "    return (arrays = A, scalars = S)\n", "    return (arrays = A[1:max(0, length(A) - 1)], scalars = S)\n", ["ck_array", "ck_wave"]),
-        ("a scalar of the written set is not saved", "    return (arrays = A, scalars = S)\n", "    return (arrays = A, scalars = Symbol[])\n", ["ck_scalar"]),
+        ("an array of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)\n", "    return (arrays = A[1:max(0, length(A) - 1)], scalars = S, in_arrays = IA, in_scalars = IS)\n", ["ck_array", "ck_wave"]),
+        ("a scalar of the written set is not saved", "    return (arrays = A, scalars = S, in_arrays = IA, in_scalars = IS)\n", "    return (arrays = A, scalars = Symbol[], in_arrays = IA, in_scalars = IS)\n", ["ck_scalar"]),
         ("the last segment runs past the last step", "guard = Expr(:if, :(\$(c.var) <= \$hi), Expr(:block,", "guard = Expr(:if, true, Expr(:block,", ["ck_array"]),
         ("the restore reads the wrong segment", "slot = :((\$s - 1) * \$n + \$i)", "slot = :((\$s) * \$n + \$i)", ["ck_array"]),
         ("the forward tape keeps the segment counter", "sf = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in fwd]", "sf = fwd", ["ck_array"]),
@@ -168,10 +170,15 @@ function ckv_sabotage(verbose::Bool)
         ("the end state of an accumulator is not put back", "agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...]", "]", ["ck_accum"]),
         ("a restored array counts as never restored", "        l isa Expr && l.head === :ref && l.args[1] isa Symbol && push!(out, l.args[1])\n", "", ["ck_array"]),
         ("two regions share the names of their stacks", "k == 1 ? \"_ck_stack\" : \"_ck\$(k)_stack\"", "\"_ck_stack\"", ["ck_two"]),
+        ("an input that a later statement writes is not saved", "for a in arrs2 if a in used && !(a in arrs)", "for a in Symbol[] if a in used && !(a in arrs)", ["ck_input"]),
+        ("the inputs are not put back before the reverse loop", "agen_ckpt_inputs(set, r.number, true)..., newr,", "newr,", ["ck_input"]),
+        ("a scalar input that a later statement writes is not saved", "for v in scal2 if v in used && !(v in scal)", "for v in Symbol[] if v in used && !(v in scal)", ["ck_input_s"]),
+        ("a float scalar that every step assigns first is not saved", "(get(kinds, v, :none) === :scalar_float || (get(kinds, v, :none) === :scalar_int && (v in before || v in uev)))", "(get(kinds, v, :none) === :scalar_float && (v in before || v in uev) || (get(kinds, v, :none) === :scalar_int && (v in before || v in uev)))", ["ck_oldscalar"]),
+        ("the index of an array snapshot stays in the forward loop", " || startswith(string(s.args[1]), \"__sbase_\")", "", ["ck_snapshot"]),
         ("a loop with independent iterations is a region", "elseif !agen_ckpt_carries(st)\n", "elseif false\n", ["dispatch"]),
         ("a loop without tape is a region", "(length(fl) == 1 && agen_ckpt_has_tape(fl[1], r.var)) || push!(notape, r.number)", "nothing", ["dispatch"]),
         ("the guard flag counts as a tape", "agen_ckpt_is_guard_flag(st) || agen_ckpt_has_tape(st, v) && return true", "agen_ckpt_has_tape(st, v) && return true", ["dispatch"]),
-        ("a loop with a short literal trip count is a region", "elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= 8", "elseif false", ["dispatch"]),
+        ("a loop with a short literal trip count is a region", "elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= min_trip", "elseif false", ["dispatch"]),
         ("a loop whose bounds change is a region", "elseif !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound", "elseif false", ["dispatch"]),
         ("a kernel with a solve loop is checkpointed", "            why = \"the kernel has a solve loop (a region that holds one is not supported yet)\"", "            why = nothing", ["dispatch"]),
         ("a read of a written array at another subscript is no carry", "        all(sb -> sb == subs[1], subs) || return true\n", "", ["ck_sweep"]),
