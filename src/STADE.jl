@@ -7431,6 +7431,24 @@ function cgen_fp_raise_append(host::Expr, allowscalar)
     return Expr(:function, host.args[1], Expr(:block, out...))
 end
 
+# A guard condition: arithmetic and comparison calls over parameters and numbers only (no array read, no other statement's value).
+cgen_guard_cond_ok(c, params) = c isa Number || (c isa Symbol && c in params) || (c isa Expr && c.head === :call && c.args[1] isa Symbol && all(a -> cgen_guard_cond_ok(a, params), c.args[2:end]))
+
+# The leading argument guards of an input function (`if cond; error("...") end` before any other statement, the condition reading only scalar parameters, e.g. the
+# `ck < 1` guard of a checkpointed initstacks) are dropped by the ingest like the fp raise; the stage puts them back first on the host function.
+function cgen_guard_prepend(host::Expr, expr::Expr)
+    (host.head === :function && expr.head === :function) || return host
+    params = Set{Symbol}(a isa Expr ? a.args[1] : a for a in host.args[1].args[2:end])
+    guards = Any[]
+    for s in expr.args[2].args
+        s isa LineNumberNode && continue
+        (cgen_is_fp_raise(s) && cgen_guard_cond_ok(s.args[1], params)) || break
+        push!(guards, s)
+    end
+    isempty(guards) && return host
+    return Expr(:function, host.args[1], Expr(:block, guards..., Any[s for s in host.args[2].args if !(s isa LineNumberNode)]...))
+end
+
 function cgen_parse_generated_statements(stmts::Vector)
     return NamedTuple[cgen_parse_generated_statement(s) for s in stmts if !cgen_is_sizehint(s) && !cgen_is_fp_raise(s)]
 end
@@ -20766,7 +20784,7 @@ function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector,
         end
     end
     :ck in iparams || push!(iparams, :ck)
-    guard = :(ck < 1 && error($("$(init.args[1].args[1]): the checkpoint length `ck` must be at least 1")))
+    guard = :(if ck < 1; error($("$(init.args[1].args[1]): the checkpoint length `ck` must be at least 1")) end)
     newinit = Expr(:function, Expr(:call, init.args[1].args[1], sort(iparams; by = string)...),
                    Expr(:block, guard, lenstmts..., sized..., allocs..., emit_return_scalars(vcat(retnames, newnames))))
     # the adjoint
@@ -21413,7 +21431,7 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
     fresh_check && (host = cgen_fresh_check(host, fresh))
-    host = cgen_fp_raise_append(host, backend.allowscalar_macro)
+    host = cgen_guard_prepend(cgen_fp_raise_append(host, backend.allowscalar_macro), expr)
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
     return (host = cgen_convert_precision(host, p),
@@ -21491,7 +21509,7 @@ function stade_jacc(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}}
     end
     jacc_async && (host = jgen_async_launches(host))
     jacc_async && jacc_async_wait && (host = jgen_async_exit_wait(host))
-    host = cgen_fp_raise_append(host, jgen_default_allowscalar_macro())
+    host = cgen_guard_prepend(cgen_fp_raise_append(host, jgen_default_allowscalar_macro()), expr)
     warp_atomics && (kernels = Expr[jgen_contraction_tile_kernel(k) ? k : jgen_warp_atomics(k) for k in kernels])
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     helpers = any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) ? cgen_warp_helper_exprs(; jacc = true) : Expr[]

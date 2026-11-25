@@ -230,7 +230,7 @@ function ckv_sabotage(verbose::Bool)
         ("a read of a written array at another subscript is no carry", "        all(sb -> sb == subs[1], subs) || return true\n", "", ["ck_sweep"]),
         ("a write without the loop variable is no carry", "        any(x -> agen_fp_count_sym(x, t) > 0, subs[1]) || return true\n", "", ["ck_array"]),
         ("a scalar read before its assignment is no carry", "    any(v -> v in uev && v !== t && !(v in lvars), scal) && return true\n", "", ["ck_scalar"]),
-        ("a segment length below 1 is accepted", "    guard = :(ck < 1 && error(", "    guard = :(false && error(", ["dispatch"]),
+        ("a segment length below 1 is accepted", "    guard = :(if ck < 1; error(", "    guard = :(if false; error(", ["dispatch"]),
         ("the default is the checkpointed adjoint", "primal_outputs::Bool=true, checkpoint::Bool=false)\n    if checkpoint", "primal_outputs::Bool=true, checkpoint::Bool=true)\n    if checkpoint", ["dispatch"]),
         ("keep_push_pop = true is checkpointed", "    why = keep_push_pop ? \"keep_push_pop = true", "    why = false ? \"keep_push_pop = true", ["dispatch"]),
         ("fuse_ii_loops = true is checkpointed", "          fuse_ii_loops ? \"fuse_ii_loops = true (the checkpointed", "          false ? \"fuse_ii_loops = true (the checkpointed", ["dispatch"]),
