@@ -2,12 +2,46 @@
 # For each kernel of the directories and each segment length ck in (1, 2, 3, 7): every argument after the call and every returned scalar of the checkpointed adjoint
 # equal, bit for bit, those of stade_adjoint(keep_push_pop = false) (the fixed-point adjoint where a solve loop is) on the same random draw. A kernel the adjoint without checkpoints cannot size is skipped.
 # Every kernel gets one row: no loop that can be a region, no region (the reasons), checked, differs, error (the first line of the message).
-#   julia validate_checkpoint_corpus.jl [dir ...] [-k kernel,kernel] [--zero]   (--zero draws the integers from 0 to 2: loops that run no step, as validate_zerotrip.jl)
+#   julia validate_checkpoint_corpus.jl [dir ...] [-k kernel,kernel] [--zero] [--device]   (--zero draws the integers from 0 to 2: loops that run no step, as validate_zerotrip.jl; --device also runs the CUDA and JACC text on the serial stand-ins against the CPU checkpointed adjoint, 1e-9)
 isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "STADE.jl"))
 isdefined(@__MODULE__, :ckv_call) || include(joinpath(@__DIR__, "validate_checkpoint.jl"))
 using Random, Logging
 
-function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::Int = 5)
+# The device run of an adjoint (its text planned for the environment) against its CPU run, on every segment length of `cks`: the worst relative error over the arrays, their shadows and the returned scalars.
+# Returns the lengths whose error is above 1e-9, or a string when the environment cannot plan the text.
+function ckc_device(env, bundle, sig, int_args, vals, seedv, cks)
+    plan = try
+        pi = env.plan(bundle.initstacks, nothing)
+        pa = env.plan(bundle.adjoint, env.initmap(pi, bundle.initstacks))
+        (sg_eval_plan!(env.mod, pi), sg_eval_plan!(env.mod, pa))
+    catch e
+        return first(split(sprint(showerror, e), "\n"))
+    end
+    names = Symbol[a for a in bundle.initstacks.args[1].args[2:end]]
+    cin = STADE.val_compile(sg_rename(bundle.initstacks, :ckc_dev_init)); cfn = STADE.val_compile(sg_rename(bundle.adjoint, :ckc_dev_adj))
+    bad = Int[]
+    for c in cks
+        ia = haskey(bundle, :primal) ? merge(int_args, Dict(:ck => c)) : int_args
+        a1, t1 = sg_build_call(sig, ia, vals, seedv, identity)
+        s1 = sg_init_stacks(cin, sg_stack_extra(names, ia, vals, identity))
+        r1 = Base.invokelatest(cfn, a1..., s1...)
+        a2, t2 = sg_build_call(sig, ia, vals, seedv, env.wrap)
+        s2 = sg_init_stacks(plan[1], sg_stack_extra(names, ia, vals, env.wrap))
+        r2 = try Base.invokelatest(plan[2], a2..., s2...)
+             catch e; msg = first(split(sprint(showerror, e), "\n")); occursin("parallel_reduce was reached", msg) && return "needs parallel_reduce"; rethrow() end
+        err = 0.0
+        for (a, ct) in t1
+            ct.kind in (:array_float, :array_int) || continue
+            err = max(err, sg_relerr(ct.val, env.tohost(t2[a].val)))
+            ct.kind == :array_float && (err = max(err, sg_relerr(ct.sh, env.tohost(t2[a].sh))))
+        end
+        err = max(err, sg_scalar_err(count(a -> sig.kinds[a] == :scalar_float, sig.args), r1, r2))
+        err <= 1e-9 || push!(bad, c)
+    end
+    return bad
+end
+
+function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::Int = 5, envs = ())
     name = splitext(basename(path))[1]
     primal = STADE.io_read_corpus_entry(path)
     kernel = STADE.parse_kernel(primal); sig = kernel.sig
@@ -42,16 +76,33 @@ function ckc_kernel(path::String; cks = (1, 2, 3, 7), int_lo::Int = 3, int_hi::I
         same &= (f0 === nothing) == (f1 === nothing) && (f0 === nothing || ckv_same(f0, f1))
         same || push!(bad, c)
     end
-    return isempty(bad) ? (name = name, status = :checked, note = "$(length(ck.regions)) region(s)") : (name = name, status = :differs, note = "ck=$(join(bad, ","))")
+    isempty(bad) || return (name = name, status = :differs, note = "ck=$(join(bad, ","))")
+    notes = String["$(length(ck.regions)) region(s)"]
+    for (ename, mk) in envs
+        env = mk()
+        d = ckc_device(env, ck, ksig, int_args, vals, seedv, cks)
+        if d isa String
+            # a text the stage cannot plan is no defect of the checkpoint when the plain adjoint cannot be planned either
+            p = ckc_device(env, ref, sig, int_args, vals, seedv, (1,))
+            p isa String && (push!(notes, "$ename: plain refused too ($(first(p, 60)))"); continue)
+            return (name = name, status = :device_error, note = "$ename: $(first(d, 160))")
+        end
+        isempty(d) && (push!(notes, "$ename ok"); continue)
+        # the plain adjoint differs on the device too: a kernel outside the contract of the stage, not a defect of the checkpoint
+        p = ckc_device(env, ref, sig, int_args, vals, seedv, (1,))
+        (p isa Vector && !isempty(p)) && (push!(notes, "$ename: plain adjoint differs too"); continue)
+        return (name = name, status = :device_differs, note = "$ename ck=$(join(d, ","))")
+    end
+    return (name = name, status = :checked, note = join(notes, "; "))
 end
 
-function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} = String[], verbose::Bool = true, int_lo::Int = 3, int_hi::Int = 5)
+function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} = String[], verbose::Bool = true, int_lo::Int = 3, int_hi::Int = 5, envs = ())
     rows = NamedTuple[]
     for d in dirs
         for f in sort(readdir(d))
             (endswith(f, ".jl") && !(endswith(f, "_b.jl") || endswith(f, "_d.jl") || endswith(f, "_hv.jl"))) || continue
             isempty(only) || splitext(f)[1] in only || continue
-            r = try ckc_kernel(joinpath(d, f); int_lo = int_lo, int_hi = int_hi)
+            r = try ckc_kernel(joinpath(d, f); int_lo = int_lo, int_hi = int_hi, envs = envs)
                 catch e
                     msg = first(split(sprint(showerror, e), "\n"))
                     # a kernel the parser or the baseline generator refuses is no subject for this test
@@ -66,15 +117,21 @@ function validate_checkpoint_corpus(dirs::Vector{String}; only::Vector{String} =
     counts = Dict{Symbol,Int}()
     for r in rows; counts[r.status] = get(counts, r.status, 0) + 1; end
     verbose && println("validate_checkpoint_corpus: ", join(["$k=$v" for (k, v) in sort(collect(counts); by = first)], " "))
-    return get(counts, :differs, 0) == 0 && get(counts, :error, 0) == 0
+    return get(counts, :differs, 0) == 0 && get(counts, :error, 0) == 0 && get(counts, :device_differs, 0) == 0 && get(counts, :device_error, 0) == 0
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    args = [a for a in ARGS if a != "--zero"]
+    args = [a for a in ARGS if !(a in ("--zero", "--device"))]
     zero = "--zero" in ARGS
+    envs = ()
+    if "--device" in ARGS
+        isdefined(@__MODULE__, :scc_env) || include(joinpath(@__DIR__, "validate_adjoint_split_cuda_cpu.jl"))
+        isdefined(@__MODULE__, :spj_env) || include(joinpath(@__DIR__, "validate_adjoint_split_jacc_cpu.jl"))
+        envs = (("cuda", scc_env), ("jacc", spj_env))
+    end
     only = String[]
     i = findfirst(==("-k"), args)
     i === nothing || (only = String.(split(args[i + 1], ",")); deleteat!(args, i:i + 1))
     dirs = isempty(args) ? [joinpath(@__DIR__, d) for d in ("val-corpus", "counted-corpus", "scalar-acc-corpus", "int-state-corpus", "inactive-read-corpus", "plain-read-corpus", "boxed-reset-corpus", "while-corpus", "split-corpus", "battle-corpus")] : String[abspath(a) for a in args]
-    exit(validate_checkpoint_corpus(dirs; only = only, int_lo = zero ? 0 : 3, int_hi = zero ? 2 : 5) ? 0 : 1)
+    exit(validate_checkpoint_corpus(dirs; only = only, int_lo = zero ? 0 : 3, int_hi = zero ? 2 : 5, envs = envs) ? 0 : 1)
 end

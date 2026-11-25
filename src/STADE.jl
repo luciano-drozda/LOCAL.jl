@@ -10688,6 +10688,9 @@ function cgen_serial_plan(stmt, owner::Symbol, backend, reduce_vars::Set{Symbol}
     delete!(live_in, stmt.var)
     # a function argument that the loop assigns may be the value the function returns, and the return statement is not in the body: it is live-out
     escapes = union(ii_escapes_nested(root_body, stmt.body, assigned), intersect(assigned, fn_args))
+    # in an enclosing loop the next repetition reads what this one assigned: a scalar the loop reads before it assigns it (live in) is live-out
+    path = ii_find_ancestor_path(root_body, stmt.body, false)
+    (path !== nothing && any(p -> p[3], path)) && union!(escapes, intersect(assigned, live_in))
     outs = sort(collect(intersect(assigned, escapes)); by = string)
     all(v -> cgen_serial_defined_before(root_body, stmt.body, v, fn_args), outs) || return nothing
     args = sort(collect(union(live_in, outs)); by = string)

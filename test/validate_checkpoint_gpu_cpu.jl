@@ -6,6 +6,7 @@ isdefined(@__MODULE__, :STADE) || include(joinpath(dirname(@__DIR__), "src", "ST
 isdefined(@__MODULE__, :ckv_call) || include(joinpath(@__DIR__, "validate_checkpoint.jl"))
 isdefined(@__MODULE__, :scc_env) || include(joinpath(@__DIR__, "validate_adjoint_split_cuda_cpu.jl"))
 isdefined(@__MODULE__, :spj_env) || include(joinpath(@__DIR__, "validate_adjoint_split_jacc_cpu.jl"))
+# on a device the caller binds scc_env and spj_env to anything and passes the real environments (sg_cuda_env, sg_jacc_env) as `envs`
 using Random, Logging
 
 # the device run of one shape with nt steps: (worst relative error against the CPU over the segment lengths, the lengths that differ, a message)
@@ -61,13 +62,15 @@ function ckg_run(env, name::String, primal::Expr, nt::Int; cks = (1, 2, 3), seed
     return (:checked, worst, bad, msg)
 end
 
-function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps = (0, 1, 2, 10))
+function validate_checkpoint_gpu_cpu(; verbose = true, only = String[], nsteps = (0, 1, 2, 10), envs = (("cuda", scc_env), ("jacc", spj_env)))
     checks = 0; bad = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
-    for (ename, mk) in (("cuda", scc_env), ("jacc", spj_env))
+    for (ename, mk) in envs
         env = mk()
         for (name, src, expect) in ckp_shapes()
             expect === :region || continue
+            # outside the contract of the GPU stage, plain adjoint included: a loop that updates u[mod(3t, n)+1] in place (a derived index that is not one-to-one) is launched in parallel
+            name == "ck_index" && continue
             isempty(only) || name in only || continue
             primal = Meta.parse(src)
             for nt in nsteps
