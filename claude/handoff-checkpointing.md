@@ -50,14 +50,16 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 - V100 (Slurm, partition `gpu`): adjoint 248 of 248 on CUDA and JACC; HVP 248 of 248.
 - Memory and time on a V100, `phc_heat_steps`, 10^6 points, 100 steps: stacks 1526 MiB without checkpoints, 244 MiB at `ck` = 10; 1.9 times the time. The cost is one more forward run of every step.
 - Flag off: the generated adjoint and HVP are byte-identical to v0.5.46 for every corpus kernel (`dump_generated_text.jl`).
+- HVP memory on a V100 (v0.5.56, `measure_checkpoint_device.jl`, `phc_heat_steps`, 10^6 points, 100 steps; stack MiB from `initstacks` + MiB allocated inside the HVP for the shadow tape; CUDA and JACC agree): no checkpoints 1526 + 1533 (3.0 GiB), time 2.9 s; `ck` = 5: 412 + 76; `ck` = 10: 336 + 153 (0.5 GiB), time 4.0 s (1.41 times); `ck` = 20: 412 + 305; `ck` = 50: 824 + 763. 2500 steps: `ck` = 50: 1556 + 763 MiB, `ck` = 100: 1938 + 1526 MiB (the plain tape would not fit). Results bit for bit equal to the HVP without checkpoints (err 0.0).
+- v0.5.57: the GPU split gate keeps a loop sequential when it writes through a lone `mod` index (item 5.1 below, now fixed). `ck_index` is back in the V100 validator: adjoint and HVP 8 of 8 on CUDA and JACC (err 1e-16).
 - Full CPU regression on the rome partition (RALL55): see section 6.
 
 ## 5. Known limits and findings
 
-1. **GPU stage and non-injective indices (pre-existing).** The GPU stage offloads a loop whose written index is derived from the loop variable but is not injective. The kernel `ck_index` is one: the plain adjoint races on the device too. The V100 validator excludes `ck_index`. This is not caused by checkpointing. A fix needs an injectivity proof in `cgen_*`/`jgen_*` or a refusal.
+1. **GPU stage and non-injective indices (pre-existing, fixed in v0.5.57 for the `mod` case).** The GPU stage offloaded a loop whose written index is derived from the loop variable by `mod` alone (`ck_index`: `u[mod(3t, n) + 1]`); the plain adjoint raced on the device too. `cgen_writes_collide_by_mod` (with `cgen_nested_scalar_defs`, which reads definitions inside branches such as the segment guard) now keeps such a loop sequential unless its array is accumulate-only. `validate_mod_collide.jl` (20 checks, sabotage) holds it; `validate_offload.jl` is unchanged (998 of 998), so no corpus loop lost its kernel. Cost: a periodic roll `y[mod(i, n) + 1] = x[i]` stays sequential. Still open: an index that is a different non-one-to-one function (for example `div(i, 2)`) is covered only by the existing `div`/`mod` rule for atomic rewrites, and a gather from an array is trusted (the scatter contract).
 2. **Serial-track bug (fixed in v0.5.52).** `cgen_serial_plan` lost the value of an assigned scalar that is live on entry to a loop inside a repeating loop (`gat_reduce_scalar`, `so_inner`). The scalar is now live-out (copied back from its box). `validate_serial_loops.jl` holds the regression (a parallel inner loop is needed, or the outer loop turns serial and the test is vacuous).
 3. **Accumulators.** A variable that the reverse never restores (`loss[1] = loss[1] + ...`) keeps its forward value, as without checkpoints. An array that the reverse restores at some statements and not at others ends at the state after the first segment. The shadows are exact.
-4. **Not covered:** keep_push_pop = true, `fuse_ii_loops = true`, regions that are not at the top level of the kernel, nested time loops, HVP memory measurement on a V100 (the HVP tape is about 2 times the adjoint tape plus the tangent checkpoint stacks, not measured).
+4. **Not covered:** keep_push_pop = true, `fuse_ii_loops = true`, regions that are not at the top level of the kernel, nested time loops.
 5. **Knowns from the GPU run:** the ingest drops `if cond; error("String") end`; the guard is put back only when its condition is arithmetic or comparison over scalar parameters.
 
 ## 6. Regression
@@ -71,9 +73,8 @@ No modules, structs or global consts. Stage-prefixed names. No corpus-specific c
 ## 8. Next steps (suggestions)
 
 1. Ask the owner about a release tag.
-2. Measure the HVP memory on a V100 (`build_ckm.py`).
-3. Decide on the non-injective index limit (item 5.1).
-4. Checkpointing for nested time loops and for regions below the top level.
+2. Prove one-to-one indices of the kind `mod(i, n)` over `1:n` (the periodic roll) so that they offload again.
+3. Checkpointing for nested time loops and for regions below the top level.
 
 ## Regression result
 
