@@ -19885,7 +19885,11 @@ end
 
 function stade_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing,
                         dependents::Union{Vector{Symbol},Nothing}=nothing,
-                        keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
+                        keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true, checkpoint::Bool=false)
+    if checkpoint
+        ck = agen_ckpt_adjoint_or_nothing(expr, keep_push_pop, fuse_ii_loops, primal_outputs, independents, dependents)
+        ck === nothing || return ck
+    end
     fp = agen_fp_adjoint_or_nothing(expr, keep_push_pop, fuse_ii_loops, primal_outputs, independents, dependents)
     fp === nothing || return fp
     return agen_adjoint_unrolled(expr; independents = independents, dependents = dependents, keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
@@ -20271,6 +20275,383 @@ function agen_fp_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loo
     end
 end
 
+# ==== agen_ckpt_*: checkpointed regions ====
+# A region is a sequential loop at the top level of the kernel that holds tape. The forward pass stores the state only at the start of each segment of `ck` steps. The
+# reverse pass restores one checkpoint, runs the segment again with its tape and reverses it, so the tape holds `ck` steps and not all of them. The kernel is
+# strip-mined (`for s = 1:nseg; for tl = 1:ck; t = ...; if t <= hi; body`), the ordinary adjoint of that kernel is generated, and its text is rewritten: the tape
+# leaves the forward loop, the segment index leaves the tape positions and the stack sizes (as the solve counter does in agen_fp_slot).
+
+agen_ckpt_stack_name(a) = a isa Symbol && (endswith(string(a), "_stack") || endswith(string(a), "_stack_d"))
+
+# a statement the generator wrote for the tape: a store into a stack or the index it uses (the shared `__icse_` temporaries stay: the primal may read them)
+agen_ckpt_is_tape_stmt(s) = s isa Expr && s.head === :(=) &&
+    ((s.args[1] isa Symbol && startswith(string(s.args[1]), "__idx_")) ||
+     (s.args[1] isa Expr && s.args[1].head === :ref && agen_ckpt_stack_name(s.args[1].args[1])))
+
+# the arrays and scalars written below `x`, and the loop variables (not state)
+function agen_ckpt_written!(x, arrs::Set{Symbol}, scal::Set{Symbol}, lvars::Set{Symbol})
+    x isa Expr || return nothing
+    if x.head === :(=) || x.head in (:+=, :-=, :*=, :/=)
+        lhs = x.args[1]
+        lhs isa Symbol && push!(scal, lhs)
+        lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && push!(arrs, lhs.args[1])
+        lhs isa Expr && lhs.head === :tuple && foreach(v -> v isa Symbol && push!(scal, v), lhs.args)
+    elseif x.head === :for && x.args[1] isa Expr && x.args[1].args[1] isa Symbol
+        push!(lvars, x.args[1].args[1])
+    end
+    foreach(a -> agen_ckpt_written!(a, arrs, scal, lvars), x.args)
+    return nothing
+end
+
+# `lo:hi` of a loop statement written with a two-part range and no step, else nothing
+function agen_ckpt_range(st)
+    h = agen_fp_header(st)
+    (h !== nothing && h.step === 1) || return nothing
+    rng = st.args[1].args[2]
+    length(rng.args) == 3 || return nothing
+    return h
+end
+
+# Does the loop carry state from one iteration to the next? A scalar that is read before it is assigned, or an array written at a subscript that is not the same for every access
+# and does not hold the loop variable, is carried. Stricter than agen_fp_carries, which takes an accumulation `v[i] = v[i] + ..` for commutative even when the body reads `v` elsewhere.
+function agen_ckpt_carries(L)
+    h = agen_fp_header(L); t = h.var; body = L.args[2]
+    arrs = Set{Symbol}(); scal = Set{Symbol}(); lvars = Set{Symbol}()
+    agen_ckpt_written!(body, arrs, scal, lvars)
+    uev = Set{Symbol}(); agen_split_uev!(body, Set{Symbol}(), uev)
+    any(v -> v in uev && v !== t && !(v in lvars), scal) && return true
+    acc = Any[]; agen_fp_accesses!(body, acc)
+    for a in arrs
+        subs = [x[2] for x in acc if x[1] === a]
+        isempty(subs) && continue
+        all(sb -> sb == subs[1], subs) || return true
+        any(x -> agen_fp_count_sym(x, t) > 0, subs[1]) || return true
+    end
+    return false
+end
+
+# The top-level loops of the kernel that can be regions (tests 1, 3 and 4 of the plan), and one reason for each loop that cannot: (candidates, reasons).
+# A candidate is (index in the statement list, var, lo, hi). Test 2 (the loop holds tape) is made on the generated adjoint.
+function agen_ckpt_candidates(expr::Expr, kernel)
+    stmts = agen_fp_stmts(expr.args[2])
+    kinds = kernel.sig.kinds
+    solve = !isempty(agen_fp_detect(expr, kinds; kernel = kernel))
+    cands = NamedTuple[]; reasons = String[]
+    for (j, st) in enumerate(stmts)
+        (st isa Expr && st.head === :for) || continue
+        h = agen_ckpt_range(st)
+        if h === nothing
+            push!(reasons, "the loop at statement $j is not `for v = lo:hi`")
+            continue
+        end
+        arrs = Set{Symbol}(); scal = Set{Symbol}(); lvars = Set{Symbol}()
+        agen_ckpt_written!(st.args[2], arrs, scal, lvars)
+        bound = Set{Symbol}(); agen_split_syms!(h.lo, bound); agen_split_syms!(h.hi, bound)
+        why = nothing
+        if solve
+            why = "the kernel has a solve loop (a region that holds one is not supported yet)"
+        elseif !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound
+            why = "its bounds change inside the loop"
+        elseif !agen_ckpt_carries(st)
+            why = "its iterations are independent (nothing is carried from one step to the next)"
+        elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= 8
+            why = "its literal trip count is $(h.hi - h.lo + 1), at most 8 (no segment length saves memory)"
+        elseif h.var in union(arrs, scal) || any(v -> v in (:ck,), union(arrs, scal, lvars))
+            why = "it assigns its own counter or the name `ck`"
+        end
+        why === nothing ? push!(cands, (index = j, var = h.var, lo = h.lo, hi = h.hi)) : push!(reasons, "the loop over `$(h.var)` is not a region: $why")
+    end
+    return (cands, reasons)
+end
+
+# The state a region must save: every array the body writes and every scalar it writes that holds a value on entry (an argument, assigned at the top level
+# before the loop, or read before it is assigned in the body). Larger than needed and safe (plan 4.4, first version).
+function agen_ckpt_set(expr::Expr, kernel, c)
+    stmts = agen_fp_stmts(expr.args[2]); st = stmts[c.index]
+    kinds = kernel.sig.kinds
+    arrs = Set{Symbol}(); scal = Set{Symbol}(); lvars = Set{Symbol}()
+    agen_ckpt_written!(st.args[2], arrs, scal, lvars)
+    uev = Set{Symbol}(); agen_split_uev!(st.args[2], Set{Symbol}(), uev)
+    before = Set{Symbol}(a for a in kernel.sig.args)
+    for p in stmts[1:c.index - 1]
+        p isa Expr && p.head === :(=) && p.args[1] isa Symbol && push!(before, p.args[1])
+    end
+    A = sort(Symbol[a for a in arrs if get(kinds, a, :none) in (:array_float, :array_int)]; by = string)
+    S = sort(Symbol[v for v in scal if !(v in lvars) && v !== c.var && get(kinds, v, :none) in (:scalar_float, :scalar_int) && (v in before || v in uev)]; by = string)
+    return (arrays = A, scalars = S)
+end
+
+# the kernel with the region loops strip-mined; `ck` is its last argument. Returns (expr, regions) with each region's fresh names.
+function agen_ckpt_strip_mine(expr::Expr, cands::Vector)
+    stmts = agen_fp_stmts(expr.args[2])
+    regions = NamedTuple[]
+    out = Any[]
+    for (j, st) in enumerate(stmts)
+        k = findfirst(c -> c.index == j, cands)
+        if k === nothing
+            push!(out, st); continue
+        end
+        c = cands[k]
+        s = Symbol("__ck_s", k); tl = Symbol("__ck_tl", k); nseg = Symbol("__ck_nseg", k)
+        lo = c.lo; hi = c.hi
+        span = lo isa Integer ? (hi isa Integer ? hi - lo + 1 : :($hi - $(lo - 1))) : :($hi - $lo + 1)
+        nsegdef = :($nseg = div($span + ck - 1, ck))
+        off = lo === 1 ? :(($s - 1) * ck + $tl) : :(($s - 1) * ck + $tl + ($lo - 1))
+        guard = Expr(:if, :($(c.var) <= $hi), Expr(:block, agen_fp_stmts(st.args[2])...))
+        inner = Expr(:for, :($tl = 1:ck), Expr(:block, :($(c.var) = $off), guard))
+        push!(out, nsegdef)
+        push!(out, Expr(:for, :($s = 1:$nseg), Expr(:block, inner)))
+        push!(regions, merge(c, (s = s, tl = tl, nseg = nseg, number = k)))
+    end
+    sig = expr.args[1]
+    (sig isa Expr && sig.head === :call) || error("agen_ckpt: the kernel signature is not a plain call")
+    any(a -> a === :ck || (a isa Expr && a.head === :(::) && a.args[1] === :ck), sig.args) && error("agen_ckpt: the kernel already has an argument named `ck`")
+    agen_fp_uses(expr.args[2], :ck) && error("agen_ckpt: the kernel uses the name `ck`")
+    newsig = Expr(:call, sig.args..., :ck)
+    return (Expr(expr.head, newsig, Expr(:block, out...)), regions)
+end
+
+# `e` without the statements the generator wrote for the tape; a loop or branch left empty goes too
+function agen_ckpt_strip(stmts::Vector)
+    out = Any[]
+    for st in stmts
+        agen_ckpt_is_tape_stmt(st) && continue
+        if st isa Expr && st.head === :for
+            body = agen_ckpt_strip(agen_fp_stmts(st.args[2]))
+            isempty(body) || push!(out, Expr(:for, st.args[1], Expr(:block, body...)))
+        elseif st isa Expr && (st.head === :if || st.head === :elseif)
+            th = agen_ckpt_strip(agen_fp_stmts(st.args[2]))
+            el = length(st.args) >= 3 ? agen_ckpt_strip(agen_fp_stmts(st.args[3])) : Any[]
+            if isempty(th) && isempty(el)
+                continue
+            end
+            push!(out, isempty(el) ? Expr(st.head, st.args[1], Expr(:block, th...)) : Expr(st.head, st.args[1], Expr(:block, th...), Expr(:block, el...)))
+        else
+            push!(out, st)
+        end
+    end
+    return out
+end
+
+# every tape index of `e` with the segment counter and the segment count taken out: one segment's worth of positions
+function agen_ckpt_slot_tape(e, defs::Dict{Symbol,Any}, trips::Vector, s::Symbol)
+    e isa Expr || return e
+    if e.head === :(=) && e.args[1] isa Symbol
+        nm = string(e.args[1])
+        startswith(nm, "__idx_") && return Expr(:(=), e.args[1], agen_fp_slot(agen_fp_inline(e.args[2], defs), trips, s, true))
+        startswith(nm, "__icse_") && return e
+    end
+    if e.head === :ref && agen_ckpt_stack_name(e.args[1])
+        return Expr(:ref, e.args[1], Any[agen_fp_slot(agen_fp_inline(a, defs), trips, s, true) for a in e.args[2:end]]...)
+    end
+    return Expr(e.head, Any[agen_ckpt_slot_tape(a, defs, trips, s) for a in e.args]...)
+end
+
+agen_ckpt_len(a::Symbol) = Symbol("__ckn_", a)
+agen_ckpt_stack(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ck_stack" : "_ck$(k)_stack")
+agen_ckpt_fin(a::Symbol, k::Int) = Symbol(a, k == 1 ? "_ckf_stack" : "_ckf$(k)_stack")
+
+# the variables a statement tree restores from the tape (`v = v_stack[..]`, `v[..] = v_stack[..]`)
+function agen_ckpt_pops!(x, out::Set{Symbol})
+    x isa Expr || return nothing
+    if x.head === :(=) && x.args[2] isa Expr && x.args[2].head === :ref && agen_ckpt_stack_name(x.args[2].args[1])
+        l = x.args[1]
+        l isa Symbol && push!(out, l)
+        l isa Expr && l.head === :ref && l.args[1] isa Symbol && push!(out, l.args[1])
+    end
+    foreach(a -> agen_ckpt_pops!(a, out), x.args)
+    return nothing
+end
+
+# the state of the variables that the reverse sweep never restores, saved before the reverse loop and put back after it: the plain adjoint leaves them as the forward pass did
+function agen_ckpt_final(arrays, scalars, k::Int, restore::Bool)
+    out = Any[]
+    for a in arrays
+        i = Symbol("__ickf_", a); n = agen_ckpt_len(a); st = agen_ckpt_fin(a, k)
+        push!(out, Expr(:for, :($i = 1:$n), Expr(:block, restore ? :($a[$i] = $st[$i]) : :($st[$i] = $a[$i]))))
+    end
+    for v in scalars
+        f = Symbol("__ckf", k, "_", v)
+        push!(out, restore ? :($v = $f) : :($f = $v))
+    end
+    return out
+end
+
+# the statements that save (or restore) the state of a region at the start of segment `s`
+function agen_ckpt_copy(set, kinds, s::Symbol, restore::Bool, k::Int)
+    out = Any[]
+    for a in set.arrays
+        i = Symbol("__ick_", a); n = agen_ckpt_len(a); st = agen_ckpt_stack(a, k)
+        slot = :(($s - 1) * $n + $i)
+        body = restore ? :($a[$i] = $st[$slot]) : :($st[$slot] = $a[$i])
+        push!(out, Expr(:for, :($i = 1:$n), Expr(:block, body)))
+    end
+    for v in set.scalars
+        st = agen_ckpt_stack(v, k)
+        push!(out, restore ? :($v = $st[$s]) : :($st[$s] = $v))
+    end
+    return out
+end
+
+# the checkpointed adjoint from the adjoint of the strip-mined kernel: (initstacks, adjoint)
+function agen_ckpt_rewrite(adj::Expr, init::Expr, regions::Vector, sets::Vector, kinds::Dict{Symbol,Symbol}, kp::Expr)
+    # sizes: the segment count leaves every stack
+    trips = Any[agen_fp_trip(r.nseg) for r in regions]
+    ibody = agen_fp_stmts(init.args[2])
+    any(st -> st isa Expr && st.head === :for, ibody) && error("agen_ckpt: a loop in initstacks (a ragged tape) is not supported")
+    sized = Any[]
+    for st in ibody
+        (st isa Expr && st.head === :return) && continue
+        push!(sized, agen_fp_slot(st, trips, :__ck_none, false))
+    end
+    retnames = Symbol[]
+    ret = ibody[end]
+    (ret isa Expr && ret.head === :return) || error("agen_ckpt: initstacks does not end with a return")
+    ret.args[1] isa Expr && ret.args[1].head === :tuple ? append!(retnames, ret.args[1].args) : push!(retnames, ret.args[1])
+    iparams = Symbol[a for a in init.args[1].args[2:end]]
+    # the variables of each region that the reverse sweep never restores
+    kept = Any[]
+    for (r, set) in zip(regions, sets)
+        rl = Any[]; agen_fp_find_loops!(adj.args[2], L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step == -1), rl)
+        length(rl) == 1 || error("agen_ckpt: the adjoint holds $(length(rl)) reverse loops over the segment counter `$(r.s)`")
+        pops = Set{Symbol}(); agen_ckpt_pops!(rl[1].args[2], pops)
+        push!(kept, (arrays = Symbol[a for a in set.arrays if !(a in pops)], scalars = Symbol[v for v in set.scalars if !(v in pops)]))
+    end
+    # the checkpoint stacks: `nseg` segments of the state
+    newnames = Symbol[]; lenstmts = Any[]; allocs = Any[]
+    for (r, set, kp_) in zip(regions, sets, kept)
+        any(st -> st isa Expr && st.head === :(=) && st.args[1] === r.nseg, sized) || error("agen_ckpt: initstacks does not define `$(r.nseg)`")
+        for a in kp_.arrays
+            n = agen_ckpt_len(a); stk = agen_ckpt_fin(a, r.number)
+            any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
+            a in iparams || push!(iparams, a)
+            T = kinds[a] === :array_int ? :Int64 : :Float64
+            push!(allocs, :($stk = Vector{$T}(undef, $n)))
+            push!(newnames, stk)
+        end
+        for a in set.arrays
+            n = agen_ckpt_len(a); stk = agen_ckpt_stack(a, r.number)
+            any(st -> st isa Expr && st.head === :(=) && st.args[1] === n, lenstmts) || push!(lenstmts, :($n = length($a)))
+            a in iparams || push!(iparams, a)
+            T = kinds[a] === :array_int ? :Int64 : :Float64
+            push!(allocs, :($stk = Vector{$T}(undef, max(0, $(r.nseg)) * $n)))
+            push!(newnames, stk)
+        end
+        for v in set.scalars
+            stk = agen_ckpt_stack(v, r.number)
+            T = kinds[v] === :scalar_int ? :Int64 : :Float64
+            push!(allocs, :($stk = Vector{$T}(undef, max(0, $(r.nseg)))))
+            push!(newnames, stk)
+        end
+    end
+    :ck in iparams || push!(iparams, :ck)
+    guard = :(ck < 1 && error($("$(init.args[1].args[1]): the checkpoint length `ck` must be at least 1")))
+    newinit = Expr(:function, Expr(:call, init.args[1].args[1], sort(iparams; by = string)...),
+                   Expr(:block, guard, lenstmts..., sized..., allocs..., emit_return_scalars(vcat(retnames, newnames))))
+    # the adjoint
+    abody = adj.args[2]
+    defs = Dict{Symbol,Any}(); agen_fp_collect_defs!(abody, defs)
+    body = abody
+    for (r, set, kp_) in zip(regions, sets, kept)
+        fl = Any[]; agen_fp_find_loops!(body, L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step === 1), fl)
+        rl = Any[]; agen_fp_find_loops!(body, L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step == -1), rl)
+        (length(fl) == 1 && length(rl) == 1) || error("agen_ckpt: the adjoint holds $(length(fl)) forward and $(length(rl)) reverse loops over the segment counter `$(r.s)`")
+        fwd = agen_fp_stmts(fl[1].args[2]); rev = agen_fp_stmts(rl[1].args[2])
+        any(agen_ckpt_has_tape, fwd) || error("agen_ckpt: the forward loop holds no tape")
+        notape = agen_ckpt_strip(fwd)
+        agen_ckpt_has_tape(Expr(:block, notape...)) && error("agen_ckpt: a tape statement of the forward loop was not recognised")
+        sf = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in fwd]
+        sr = Any[agen_ckpt_slot_tape(x, defs, trips, r.s) for x in rev]
+        newf = Expr(:for, fl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, false, r.number)..., notape...))
+        newr = Expr(:for, rl[1].args[1], Expr(:block, agen_ckpt_copy(set, kinds, r.s, true, r.number)..., sf..., sr...))
+        body = agen_fp_splice(agen_fp_splice(body, fl[1], Any[newf]), rl[1], Any[agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, false)..., newr, agen_ckpt_final(kp_.arrays, kp_.scalars, r.number, true)...])
+    end
+    lens = Any[]
+    for set in sets, a in set.arrays
+        n = agen_ckpt_len(a)
+        any(x -> x.args[1] === n, lens) || push!(lens, :($n = length($a)))
+    end
+    # the tape outside the regions keeps its offsets: they hold the segment count too
+    stmts = Any[agen_ckpt_slot_tape(x, defs, trips, :__ck_none) for x in agen_fp_stmts(body)]
+    newargs = Any[a for a in adj.args[1].args]
+    append!(newargs, newnames)
+    newadj = Expr(:function, Expr(:call, newargs...), Expr(:block, lens..., stmts...))
+    return (initstacks = newinit, adjoint = newadj)
+end
+
+# does the statement tree hold a store into a stack or a tape index; the branch flag of the guard `if v <= hi` of a strip-mined loop is not a tape (`v` is that variable)
+function agen_ckpt_has_tape(x, v::Union{Symbol,Nothing} = nothing)
+    x isa Expr || return false
+    if v !== nothing && x.head === :if && x.args[1] isa Expr && x.args[1].head === :call && length(x.args[1].args) == 3 && x.args[1].args[1] === :<= && x.args[1].args[2] === v
+        for arm in x.args[2:end]
+            for st in agen_fp_stmts(arm)
+                agen_ckpt_is_guard_flag(st) || agen_ckpt_has_tape(st, v) && return true
+            end
+        end
+        return false
+    end
+    agen_ckpt_is_tape_stmt(x) && return true
+    return any(a -> agen_ckpt_has_tape(a, v), x.args)
+end
+
+# a branch flag store (`__idx_branch_stack_k = ...` or `branch_stack[...] = 0|1`)
+function agen_ckpt_is_guard_flag(st)
+    st isa Expr && st.head === :(=) || return false
+    l = st.args[1]
+    l isa Symbol && return startswith(string(l), "__idx_branch_stack_")
+    return l isa Expr && l.head === :ref && l.args[1] isa Symbol && startswith(string(l.args[1]), "branch_stack") && (st.args[2] === 0 || st.args[2] === 1)
+end
+
+# The checkpointed adjoint of `expr`: (initstacks, adjoint, primal_pruned, regions, primal) or `nothing`. `primal` is the strip-mined kernel (its `sig` has `ck` last).
+function agen_ckpt_adjoint(expr::Expr; independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing, primal_outputs::Bool = true)
+    kernel = parse_override_indep_dep(parse_kernel(expr), independents, dependents)
+    (cands, reasons) = agen_ckpt_candidates(expr, kernel)
+    for r in reasons; @info "stade_adjoint: checkpoint: $r"; end
+    while !isempty(cands)
+        (kp, regions) = agen_ckpt_strip_mine(expr, cands)
+        kpk = parse_override_indep_dep(parse_kernel(kp), independents, dependents)
+        raw = agen_adjoint_unrolled(kp; independents = independents, dependents = dependents, keep_push_pop = false, fuse_ii_loops = false, primal_outputs = primal_outputs)
+        # a region with no tape in its forward loop saves nothing: it is dropped and the adjoint is generated again
+        notape = Int[]
+        for r in regions
+            fl = Any[]; agen_fp_find_loops!(raw.adjoint, L -> (h = agen_fp_header(L); h !== nothing && h.var === r.s && h.step === 1), fl)
+            (length(fl) == 1 && agen_ckpt_has_tape(fl[1], r.var)) || push!(notape, r.number)
+        end
+        if !isempty(notape)
+            for k in notape; @info "stade_adjoint: checkpoint: the loop over `$(regions[k].var)` holds no tape, it is not a region"; end
+            cands = [c for (k, c) in enumerate(cands) if !(k in notape)]
+            continue
+        end
+        sets = [agen_ckpt_set(expr, kernel, c) for c in cands]
+        w = agen_ckpt_rewrite(raw.adjoint, raw.initstacks, regions, sets, kpk.sig.kinds, kp)
+        return (initstacks = w.initstacks, adjoint = w.adjoint, primal_pruned = raw.primal_pruned, regions = regions, sets = sets, primal = kp)
+    end
+    return nothing
+end
+
+# stade_adjoint with `checkpoint = true`: the checkpointed adjoint when the flags allow it, else `nothing` with one @info line that gives the reason
+function agen_ckpt_adjoint_or_nothing(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool, primal_outputs::Bool,
+                                      independents::Union{Vector{Symbol},Nothing}=nothing, dependents::Union{Vector{Symbol},Nothing}=nothing)
+    why = keep_push_pop ? "keep_push_pop = true (the checkpointed adjoint needs keep_push_pop = false)" :
+          fuse_ii_loops ? "fuse_ii_loops = true (the checkpointed adjoint needs no fusion)" : nothing
+    if why !== nothing
+        @info "stade_adjoint: `$(expr.args[1].args[1])` keeps its adjoint without checkpoints: $why"
+        return nothing
+    end
+    r = try agen_ckpt_adjoint(expr; independents = independents, dependents = dependents, primal_outputs = primal_outputs)
+        catch e
+            (e isa ErrorException && startswith(e.msg, "agen_ckpt:")) || rethrow()
+            @info "stade_adjoint: `$(expr.args[1].args[1])` keeps its adjoint without checkpoints: $(e.msg)"
+            return nothing
+        end
+    if r === nothing
+        @info "stade_adjoint: `$(expr.args[1].args[1])` has no loop that can be a region, the adjoint has no checkpoints"
+        return nothing
+    end
+    @info "stade_adjoint: `$(expr.args[1].args[1])` takes checkpoints: $(length(r.regions)) region(s), the last argument `ck` is the segment length"
+    return r
+end
+
 # The validators check the unrolled adjoint. For a kernel on which stade_adjoint takes the fixed-point reverse they say so once: that adjoint is the derivative of the
 # limit, which a finite difference at the baseline's random tolerance, or the exact identity with the tangent, does not check (test/validate_fixedpoint.jl does, at a tight tolerance).
 function agen_fp_validator_note(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::Bool)
@@ -20281,11 +20662,13 @@ function agen_fp_validator_note(expr::Expr, keep_push_pop::Bool, fuse_ii_loops::
     return nothing
 end
 
-function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true)
+function stade_adjoint_file(in_path::String, out_path::String; keep_push_pop::Bool=true, fuse_ii_loops::Bool=false, primal_outputs::Bool=true, checkpoint::Bool=false)
     kernels = io_read_kernel_corpus(in_path)
     entry_name = io_corpus_entry_name(in_path, kernels)
     inlined = inl_inline_calls(kernels)
-    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs)
+    generated = stade_adjoint(inlined[entry_name]; keep_push_pop = keep_push_pop, fuse_ii_loops = fuse_ii_loops, primal_outputs = primal_outputs, checkpoint = checkpoint)
+    # a checkpointed adjoint takes the segment length `ck` as its last argument: the primal written beside it is the strip-mined kernel, which takes it too
+    hasproperty(generated, :regions) && (inlined[entry_name] = generated.primal)
     primal_outputs || generated.primal_pruned || @info "primal_outputs = false: the backward sweep of $(entry_name) had no primal statement to drop, so it is generated as with primal_outputs = true"
     keep_push_pop || (note = agen_host_stack_note(parse_kernel(inlined[entry_name]), generated.adjoint)) === nothing || @info note
     io_write_kernel_corpus_file(out_path, Dict(entry_name => inlined[entry_name]), Dict(entry_name => Expr[generated.initstacks, generated.adjoint]))
