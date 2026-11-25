@@ -19691,23 +19691,24 @@ function agen_fp_kis_solve(st, d)
     return length(st.body) == 1 && st.body[1].kind == :if && isempty(st.body[1].els)
 end
 
-# the solve loops of the kernel in program order, each with the index of the top-level statement that holds it and, when a loop encloses it, the body of the innermost one
-# and the index in that body of the statement that holds the solve; a solve body is not searched
-function agen_fp_ksolves!(body, top::Int, dets, out::Vector, lb = nothing, li::Int = 0, isfor::Bool = false)
+# the solve loops of the kernel in program order, each with the index of the top-level statement that holds it and, when a loop encloses it, `lchain`: the (block, index)
+# pairs from the body of the innermost enclosing loop down to the block that holds the solve (each `if` between them adds a block); a solve body is not searched
+function agen_fp_ksolves!(body, top::Int, dets, out::Vector, chain = nothing, isfor::Bool = false)
     for (idx, st) in enumerate(body)
         t = top == 0 ? idx : top
-        (lb2, li2) = isfor ? (body, idx) : (lb, li)
+        base = isfor ? Any[] : chain
+        cur = base === nothing ? nothing : vcat(base, Any[(body, idx)])
         if st.kind == :for
             if any(d -> agen_fp_kis_solve(st, d), dets)
-                push!(out, (stmt = st, top = t, lbody = lb2, lidx = li2))
+                push!(out, (stmt = st, top = t, lchain = cur))
             else
-                agen_fp_ksolves!(st.body, t, dets, out, lb2, li2, true)
+                agen_fp_ksolves!(st.body, t, dets, out, Any[], true)
             end
         elseif st.kind == :if
-            agen_fp_ksolves!(st.then, t, dets, out, lb2, li2, false)
-            agen_fp_ksolves!(st.els, t, dets, out, lb2, li2, false)
+            agen_fp_ksolves!(st.then, t, dets, out, cur, false)
+            agen_fp_ksolves!(st.els, t, dets, out, cur, false)
         elseif st.kind == :while
-            agen_fp_ksolves!(st.body, t, dets, out, lb2, li2, false)
+            agen_fp_ksolves!(st.body, t, dets, out, cur, false)
         end
     end
     return out
@@ -19751,7 +19752,7 @@ function agen_fp_converged_cands(kernel, dets, sites)
             agen_fp_iterate_reads_ok(then, A, kinds) || continue
             keys = agen_asnap_write_keys!(then, A, Any[])
             any(k -> get(sites, k, false) === true, keys) || continue
-            push!(cands, (solve = j, array = A, keys = keys, top = s.top, lbody = s.lbody, lidx = s.lidx, then = then))
+            push!(cands, (solve = j, array = A, keys = keys, top = s.top, lchain = s.lchain, then = then))
         end
     end
     return cands
@@ -19837,11 +19838,14 @@ end
 # reverse restores it (agen_fp_converged_later_ok requires it of every write at or after the loop's top-level statement, this one included).
 # A loop that no loop encloses has one instance.
 function agen_fp_converged_rolled_back(c)
-    c.lbody === nothing && return true
+    c.lchain === nothing && return true
     lsites = agen_fp_kwsites!(c.then, eachindex(c.then), c.array, Any[], true, Any[])
     isempty(lsites) && return false
-    assigned = agen_fp_kassigned!(c.lbody, Set{Symbol}())
-    pre = agen_fp_kwsites!(c.lbody, 1:c.lidx-1, c.array, Any[], true, Any[])
+    assigned = agen_fp_kassigned!(c.lchain[1][1], Set{Symbol}())
+    pre = Any[]
+    for (blk, i) in c.lchain
+        append!(pre, agen_fp_kwsites!(blk, 1:i-1, c.array, Any[], true, Any[]))
+    end
     for l in lsites
         any(p -> p.cond && p.form == l.form && isempty(intersect(agen_fp_form_syms(p.form), assigned)), pre) || return false
     end
@@ -20335,10 +20339,14 @@ end
 function agen_ckpt_candidates(expr::Expr, kernel; min_trip::Int = 8)
     stmts = agen_fp_stmts(expr.args[2])
     kinds = kernel.sig.kinds
-    solve = !isempty(agen_fp_detect(expr, kinds; kernel = kernel))
+    solves = agen_fp_detect(expr, kinds; kernel = kernel)
     cands = NamedTuple[]; reasons = String[]
     for (j, st) in enumerate(stmts)
         (st isa Expr && st.head === :for) || continue
+        if any(d -> d.loop === st, solves)
+            push!(reasons, "the loop at statement $j is a solve loop (the fixed-point reverse handles it)")
+            continue
+        end
         h = agen_ckpt_range(st)
         if h === nothing
             push!(reasons, "the loop at statement $j is not `for v = lo:hi`")
@@ -20348,9 +20356,7 @@ function agen_ckpt_candidates(expr::Expr, kernel; min_trip::Int = 8)
         agen_ckpt_written!(st.args[2], arrs, scal, lvars)
         bound = Set{Symbol}(); agen_split_syms!(h.lo, bound); agen_split_syms!(h.hi, bound)
         why = nothing
-        if solve
-            why = "the kernel has a solve loop (a region that holds one is not supported yet)"
-        elseif !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound
+        if !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound
             why = "its bounds change inside the loop"
         elseif !agen_ckpt_carries(st)
             why = "its iterations are independent (nothing is carried from one step to the next)"
@@ -20652,7 +20658,16 @@ function agen_ckpt_adjoint_(expr::Expr, independents::Union{Vector{Symbol},Nothi
     while !isempty(cands)
         (kp, regions) = agen_ckpt_strip_mine(expr, cands)
         kpk = parse_override_indep_dep(parse_kernel(kp), independents, dependents)
-        raw = agen_adjoint_unrolled(kp; independents = independents, dependents = dependents, keep_push_pop = false, fuse_ii_loops = false, primal_outputs = primal_outputs)
+        found = agen_fp_detect(kp, kpk.sig.kinds; kernel = kpk)
+        if isempty(found)
+            raw = agen_adjoint_unrolled(kp; independents = independents, dependents = dependents, keep_push_pop = false, fuse_ii_loops = false, primal_outputs = primal_outputs)
+        else
+            # a solve loop in the kernel: the fixed-point reverse of the strip-mined kernel, with the one-slot tape of each instance
+            why = unique(vcat([agen_fp_refusal(d) for d in found]...))
+            isempty(why) || error("agen_ckpt: the kernel has a solve loop that does not take the fixed-point reverse: $(join(why, "; "))")
+            primal_outputs || error("agen_ckpt: a kernel with a solve loop needs primal_outputs = true")
+            raw = agen_adjoint_fixedpoint(kp; independents = independents, dependents = dependents)
+        end
         # a region with no tape in its forward loop saves nothing: it is dropped and the adjoint is generated again
         notape = Int[]
         for r in regions

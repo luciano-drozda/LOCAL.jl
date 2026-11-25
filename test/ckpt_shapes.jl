@@ -373,7 +373,7 @@ function ck_literal(u, a, out, n, nt)
     out[1] = u[1]
     return nothing
 end""", "literal trip count"),
-    # a kernel with a solve loop is not supported yet
+    # a solve loop before the region: the kernel takes the fixed-point reverse and the region beside it
     ("ck_solve", """
 function ck_solve(a, x0, tol, maxit, u, y, n, nt)
     x = x0
@@ -392,5 +392,75 @@ function ck_solve(a, x0, tol, maxit, u, y, n, nt)
     end
     y[1] = x + u[1]
     return nothing
-end""", "has a solve loop"),
+end""", :region),
+    # a solve at each step of the region (a time loop that solves)
+    ("ck_solve_steps", """
+function ck_solve_steps(u, tol, out, n, nt, maxit)
+    for t = 1:nt
+        c = u[1]
+        x = c
+        rn = 1.0
+        for kk = 1:maxit
+            if rn > tol
+                xn = 0.5 * cos(x) + c
+                rn = (xn - x) * (xn - x)
+                x = xn
+            end
+        end
+        u[1] = x
+        u[2] = u[2] + sin(x)
+    end
+    out[1] = u[1] + u[2]
+    return nothing
+end""", :region),
+    # a solve over an array at each step: the converged field is read by the reverse (the strip-mining puts the body of the step under an `if`)
+    ("ck_solve_array", """
+function ck_solve_array(u, w, wn, lam, tol, n, nt, maxit)
+    for t = 1:nt
+        for i1 = 1:n
+            w[i1] = u[i1]
+        end
+        dd = 1.0
+        for kk = 1:maxit
+            if dd > tol
+                wn[1] = u[1]
+                wn[n] = u[n]
+                for i2 = 2:n - 1
+                    wn[i2] = (u[i2] + lam * (w[i2 - 1] + w[i2 + 1])) / (1.0 + 2.0 * lam)
+                end
+                dd = 0.0
+                for i3 = 1:n
+                    dd = dd + (wn[i3] - w[i3]) * (wn[i3] - w[i3])
+                end
+                for i5 = 1:n
+                    w[i5] = wn[i5]
+                end
+            end
+        end
+        for i4 = 1:n
+            u[i4] = w[i4]
+        end
+    end
+    return nothing
+end""", :region),
+    # a solve loop that the fixed-point reverse refuses (a call outside its whitelist): no region
+    ("ck_solve_refused", """
+function ck_solve_refused(a, x0, tol, maxit, u, y, n, nt)
+    x = x0
+    rn = 1.0
+    for kk = 1:maxit
+        if rn > tol
+            xn = a * exp(-x)
+            rn = (xn - x) * (xn - x)
+            x = xn
+        end
+    end
+    for t = 1:nt
+        for i = 1:n
+            u[i] = u[i] * x + sin(u[i])
+        end
+    end
+    y[1] = x + u[1]
+    return nothing
+end""", "does not take the fixed-point reverse"),
 ]

@@ -402,12 +402,13 @@ fpv_shape_cases() = Any[(:scalar, :none), (:scalar, :loop1), (:scalar, :loop2), 
 fpv_shape_cases_host_only() = Any[(:buf, :cover_nn)]
 
 # Whether the sweeps of a generated shape read an array as the solve left it (agen_fp_converged_apply): a solve that no loop encloses, or one that a write with a save covering
+# (a write under an `if` that also holds the solve counts, one under an `if` that the solve is outside of does not)
 # everything it writes precedes in its iteration, and that nothing after it or in another solve disturbs. The shapes not listed are not asserted.
 fpv_expect_converged() = Dict{String,Bool}(
     "fps_array_none" => true, "fps_array_read_top" => true, "fps_array_loop1" => false, "fps_array_tdep_first" => false,
     "fps_buf_none" => true, "fps_buf_read_top" => true, "fps_buf_loop1" => false, "fps_buf_tdep_first" => false, "fps_buf_read_before" => false, "fps_buf_two_loops" => false,
     "fps_buf_cover" => true, "fps_buf_cover_acc" => true, "fps_buf_cover_post" => true, "fps_buf_cover_postacc" => true, "fps_buf_cover_if" => true, "fps_buf_cover_loop2_inner" => true,
-    "fps_buf_cover_partial" => false, "fps_buf_cover_two" => false, "fps_buf_cover_ifpre" => false, "fps_buf_cover_cond" => false, "fps_buf_cover_loop2_outer" => false, "fps_buf_cover_nn" => false,
+    "fps_buf_cover_partial" => false, "fps_buf_cover_two" => false, "fps_buf_cover_ifpre" => true, "fps_buf_cover_cond" => false, "fps_buf_cover_loop2_outer" => false, "fps_buf_cover_nn" => false,
     "fps_mid_none" => false, "fps_mid_cover" => false, "fps_mid_cover_post" => true)
 
 # (pins, floats, array start size, preparation or nothing) of a generated shape

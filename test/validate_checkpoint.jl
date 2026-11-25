@@ -30,6 +30,17 @@ function ckv_call(adj_fn, init_fn, sig, int_args, vals, seed, names)
     return (ret = ret, args = args[1:length(args) - length(stacks)], stacks = stacks)
 end
 
+# the integer pins and the float values a shape needs beyond the common ones (a solve loop needs a cap that is never reached and a tight tolerance)
+ckv_options(name) = name in ("ck_solve", "ck_solve_steps", "ck_solve_array", "ck_solve_refused") ? (pins = Dict(:maxit => 600), floats = Dict(:tol => 1e-26, :a => 0.6, :lam => 0.7)) : (pins = Dict{Symbol,Int}(), floats = Dict{Symbol,Float64}())
+
+# the `fp_info` of a call (the stack of that name), or nothing
+function ckv_fpinfo(init, stacks)
+    ret = STADE.agen_fp_stmts(init.args[2])[end].args[1]
+    names = ret isa Expr && ret.head === :tuple ? ret.args : Any[ret]
+    k = findfirst(==(:fp_info), names)
+    return k === nothing ? nothing : copy(stacks[k])
+end
+
 ckv_ints(nt) = sort(unique(filter(c -> c >= 1, [1, 2, nt - 1, nt, nt + 1, 3])))
 ckv_nsteps() = (0, 1, 2, 10)
 
@@ -41,6 +52,8 @@ function ckv_kernel(say, name::String, primal::Expr; nt::Int, seed::Int = 202611
         sig.kinds[a] == :scalar_int || continue
         pins[a] = a === :n ? 6 : a === :nt2 ? nt + 2 : nt
     end
+    opts = ckv_options(name)
+    merge!(pins, opts.pins)
     Random.seed!(seed)
     bl = STADE.val_generate_baseline(kernel, primal; self_check = false, int_pin = copy(pins), int_lo = 2, int_hi = 4, grow_start = 8, grow_max = 64)
     STADE.val_coerce_int_arrays!(kernel, bl.values)
@@ -49,8 +62,9 @@ function ckv_kernel(say, name::String, primal::Expr; nt::Int, seed::Int = 202611
         v isa AbstractVector{Float64} && (vals[k] = 0.3 .* v)
     end
     vals[:a] = 0.9
+    for (k, v) in opts.floats; haskey(vals, k) && (vals[k] = v); end
     seedv = STADE.val_random_values_like(kernel, vals)
-    ref = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)
+    ref = with_logger(NullLogger()) do; STADE.stade_adjoint(primal; keep_push_pop = false) end
     rn = Symbol[a for a in ref.initstacks.args[1].args[2:end]]
     rfn = STADE.val_compile(sg_rename(ref.adjoint, :ckv_ref)); rin = STADE.val_compile(sg_rename(ref.initstacks, :ckv_ref_init))
     r0 = ckv_call(rfn, rin, sig, int_args, vals, seedv, rn)
@@ -76,6 +90,9 @@ function ckv_kernel(say, name::String, primal::Expr; nt::Int, seed::Int = 202611
         retn = ret isa Expr && ret.head === :tuple ? ret.args : Any[ret]
         for (nm, st) in zip(retn, r.stacks); occursin(r"_ck[f0-9]*_stack$", string(nm)) || (tape += length(st)); end
         same = ckv_same(r0.ret, r.ret) && length(r.args) == length(r0.args) + 1 && all(ckv_same(x, y) for (x, y) in zip(r0.args, r.args[1:end - 1]))
+        # a solve loop reports the same iterations, sweeps, residual ratio and status
+        f0 = ckv_fpinfo(ref.initstacks, r0.stacks); f1 = ckv_fpinfo(ck.initstacks, r.stacks)
+        same &= (f0 === nothing) == (f1 === nothing) && (f0 === nothing || ckv_same(f0, f1))
         say(same, "$name nt=$nt ck=$c: the checkpointed adjoint differs from the adjoint without checkpoints")
         tapes[c] = tape
         worst += same ? 0 : 1
@@ -107,10 +124,10 @@ function ckv_dispatch(say)
         expect === :region || continue
         primal = Meta.parse(src)
         a = STADE.stade_adjoint(primal; keep_push_pop = false)
-        b = STADE.agen_adjoint_unrolled(primal; keep_push_pop = false)
+        b = STADE.stade_adjoint(primal; keep_push_pop = false, checkpoint = false)
         say(string(a.adjoint) == string(b.adjoint) && string(a.initstacks) == string(b.initstacks), "$name: checkpoint = false (the default) is the adjoint without checkpoints")
         r1 = ckv_logged(() -> STADE.stade_adjoint(primal; keep_push_pop = true, checkpoint = true))
-        say(string(r1.value.adjoint) == string(STADE.agen_adjoint_unrolled(primal; keep_push_pop = true).adjoint) && occursin("keep_push_pop = true", r1.log), "$name: checkpoint with keep_push_pop = true keeps the adjoint and says why")
+        say(string(r1.value.adjoint) == string(STADE.stade_adjoint(primal; keep_push_pop = true, checkpoint = false).adjoint) && occursin("keep_push_pop = true", r1.log), "$name: checkpoint with keep_push_pop = true keeps the adjoint and says why")
         r2 = ckv_logged(() -> STADE.stade_adjoint(primal; keep_push_pop = false, fuse_ii_loops = true, checkpoint = true))
         say(occursin("fuse_ii_loops = true", r2.log), "$name: checkpoint with fuse_ii_loops = true says why")
     end
@@ -179,8 +196,10 @@ function ckv_sabotage(verbose::Bool)
         ("a loop without tape is a region", "(length(fl) == 1 && agen_ckpt_has_tape(fl[1], r.var)) || push!(notape, r.number)", "nothing", ["dispatch"]),
         ("the guard flag counts as a tape", "agen_ckpt_is_guard_flag(st) || agen_ckpt_has_tape(st, v) && return true", "agen_ckpt_has_tape(st, v) && return true", ["dispatch"]),
         ("a loop with a short literal trip count is a region", "elseif h.lo isa Integer && h.hi isa Integer && h.hi - h.lo + 1 <= min_trip", "elseif false", ["dispatch"]),
-        ("a loop whose bounds change is a region", "elseif !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound", "elseif false", ["dispatch"]),
-        ("a kernel with a solve loop is checkpointed", "            why = \"the kernel has a solve loop (a region that holds one is not supported yet)\"", "            why = nothing", ["dispatch"]),
+        ("a loop whose bounds change is a region", "if !isempty(intersect(bound, union(arrs, scal, lvars))) || h.var in bound", "if false", ["dispatch"]),
+        ("a solve loop that the fixed-point reverse refuses is checkpointed", "            isempty(why) || error(\"agen_ckpt: the kernel has a solve loop", "            true || error(\"agen_ckpt: the kernel has a solve loop", ["dispatch"]),
+        ("a solve loop is a region", "        if any(d -> d.loop === st, solves)\n", "        if false\n", ["ck_solve"]),
+        ("the converged field is not read through an if", "    for (blk, i) in c.lchain\n        append!(pre,", "    for (blk, i) in c.lchain[1:1]\n        append!(pre,", ["ck_solve_array"]),
         ("a read of a written array at another subscript is no carry", "        all(sb -> sb == subs[1], subs) || return true\n", "", ["ck_sweep"]),
         ("a write without the loop variable is no carry", "        any(x -> agen_fp_count_sym(x, t) > 0, subs[1]) || return true\n", "", ["ck_array"]),
         ("a scalar read before its assignment is no carry", "    any(v -> v in uev && v !== t && !(v in lvars), scal) && return true\n", "", ["ck_scalar"]),
