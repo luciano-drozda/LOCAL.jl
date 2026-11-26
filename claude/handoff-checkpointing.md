@@ -64,7 +64,7 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 
 ## 6. Regression
 
-Run on the rome partition with `tools/cluster/mk_all3.py` (113 suites, one process each). The result and the failures are in the section "Regression result" below.
+Run on the rome partition with `tools/cluster/mk_all3.py` (114 suites, one process each, 64 at a time). The results and the failures are in the section "Regression result" below.
 
 ## 7. House rules to keep
 
@@ -78,8 +78,10 @@ No modules, structs or global consts. Stage-prefixed names. No corpus-specific c
 
 ## Regression result
 
-RALL55 (Slurm 2098635, rome partition, host krakenepyc2, 64 cores, Julia 1.11.9) ran 113 suites of the tree at e3531b7 in 4275 s. 112 passed, 1 failed:
+Two full sweeps of the CPU suites on the rome partition, each one process per suite, 64 at a time.
 
-- `validate_seed_stable`: `measure_checkpoint_device.jl` (new in this work) called a bare `randn(`. Fixed in this commit (`STADE.val_randn(n)`). The suite was run again on Julia 1.10.11: 22 of 22 checks pass. The script still runs (smoke run, n = 2000, 12 steps, `ck` = 3).
+- RALL55 (tree e3531b7, Slurm 2098635, 4275 s): 112 of 113 passed. The failure was `validate_seed_stable` (a bare `randn(` in the new `measure_checkpoint_device.jl`), fixed in v0.5.55 (22 of 22).
+- RALL58 (tree 6c2ee0b = v0.5.57, Slurm 2099068, krakenepyc1, Julia 1.11.9, 3515 s, `--mem=100G`): 113 of 114 passed. The failure was `validate_colblock`, sabotage "the accumulated array may be used elsewhere": NOT CAUGHT. Cause: the unit input of that case reads the accumulated array beside its accumulation (`g[idx] = z[j]; z[j] = z[j] + ...`), a kernel that races on a device. The v0.5.57 gate (lone `mod` index, array not accumulate-only) now refuses that loop, so the column-block guard was no longer reached by any source. This is the new guard working, not a defect. Fixed in v0.5.58: `cb_mutants` holds a hand-edited kernel with that read, so the guard is tested directly; the sabotage is caught again (and the source case stays, wanting 0 twins).
+- The rome template `run_job_cpu_parallel_rome.sbatch` now asks for 100 GB instead of 240 GB (backup `.bak-20261126` beside it). Measured peak memory of eight heavy suites on a single process: 0.8 to 1.2 GiB each, so 64 at once need about 65 to 80 GiB. Slurm confirmed ReqMem 100G; no suite was killed for memory in RALL58.
 
-Not in the sweep (they need a device, or they are skipped by `mk_all3.py`): `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth`, `validate_corpus_flags` and the contraction suites. The V100 runs of the checkpointed adjoint and HVP (248 of 248 each, section 4) cover the device side. `validate_corpus_flags` and the slow contraction suites were not run in this sweep.
+Not in the sweeps (they need a device or are skipped by `mk_all3.py`): `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth`, `validate_corpus_flags`, `validate_own_kit`, `validate_dead_stack_real`, `validate_contraction_real`, `validate_split_real`, `validate_battle_random`, and the contraction slices (`mk_slices.py`). The V100 runs cover the device side (adjoint and HVP 248 of 248, `ck_index` 8 of 8 each). The skipped CPU suites are the open item: they were submitted once on the pre-guard tree and cancelled while queued.

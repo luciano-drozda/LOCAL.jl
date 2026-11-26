@@ -194,6 +194,12 @@ function cb_mutants()
         insert!(blk, pos, stmt)
         push!(out, (label, k))
     end
+    # the accumulated array read beside its accumulation: the GPU gate refuses such a loop since v0.5.57, so no source reaches this guard
+    k = deepcopy(base)
+    blk = k.args[2].args
+    pos = findfirst(s -> s isa Expr && STADE.cgen_atomic_site(s) !== nothing, blk)
+    insert!(blk, pos, :(g[idx] = z[j]))
+    push!(out, ("the accumulated array is read in the body", k))
     k = deepcopy(base)
     blk = k.args[2].args
     pos = findfirst(s -> s isa Expr && STADE.cgen_atomic_site(s) !== nothing, blk)
