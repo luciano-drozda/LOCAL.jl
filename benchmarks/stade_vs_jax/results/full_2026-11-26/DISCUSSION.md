@@ -19,7 +19,7 @@ A statement marked **Hypothesis** was not tested. The data fit the statement, an
 - **Headline timer.** The runtime tables use the host clock with a device synchronization around one call. The event timer gives the same conclusions: the gap is 0.49 for the primal, 0.79 for the adjoint with C and 0.61 for the best of C and A.
 - **Adjoint definition.** JAX measures `jit(vjp)`, which includes the forward pass. STADE C measures the generated adjoint with its default options. STADE A drops the primal outputs and starts from a fresh gradient (`primal_outputs = false`, `fresh_gradient = true`). "Best" means the lower time of C and A for each case.
 - **Memory definition.** The exact reading is the memory that arrays and calls need, with no allocator rounding. For STADE it is the live arrays plus the bytes that one call allocates. For JAX it is the XLA peak of live bytes. The driver reading is what `nvidia-smi` shows. Allocators round it up, and it holds one-time library memory. The driver gap exists only for cases where both readings are at least 34 MB (23 primal cases, 27 adjoint cases). The exact gap is the headline (decision D7 in `PROCEDURE.md`).
-- **Noise.** One job gives one run per case. The ablation job ABL1 ran config C again on 28 cases. Its adjoint times differ from FULLT1 by a median of 0.07 % and at most 3.8 % (wave2d_step 1e5, a 0.03 ms case). Config A differs by a median of 0.15 % and at most 7.4 % (heat3d_multi 1e5, a 0.08 ms case). So the STADE noise is below 1 % for cases above 0.1 ms. The JAX noise was not measured again. The earlier smoke jobs showed up to 11 % on one 1e5 JAX adjoint case. Treat a difference below 5 % as a tie for JAX and for the small STADE cases.
+- **Noise.** One job gives one run per case. A second run of the whole job (FULLT2, Slurm 2100137, same node, same plan) agrees with FULLT1. The median change of one case is 0.11 % for the STADE adjoint (C), 0.13 % for the STADE adjoint (A), 0.49 % for the STADE primal and 0.2 % for the JAX primal and adjoint. The largest change is 3.0 % for the JAX adjoint, 2.1 % for the STADE adjoint and 6.3 % for the STADE primal (transformer_block d512_T512). The headline gaps are the same: 0.533 and 0.533 (primal), 0.836 and 0.835 (adjoint C), 0.643 and 0.642 (best). No case changes class in the adjoint gap C. Both jobs ran on the same node, so a difference between nodes is not covered. A difference below 5 % stays a tie, as a conservative rule.
 - **Averages.** A geometric mean over cases treats each case equally. The case list holds 3 sizes for most kernels, so the mean depends on the case list. Use the per-case tables for any claim about one kernel.
 
 ## 3. Runtime of the primal
@@ -148,7 +148,7 @@ The driver gap is 0.42 for the primal (23 cases) and 0.45 for the adjoint with C
   - JAX appears only as `jit`. No hand-tuned JAX version exists, and no custom call.
   - STADE has the checkpoint option off. It can cut memory at a cost in time.
   - The two timers differ. The caches are not flushed, and STADE copies its inputs between calls.
-  - Each case ran once per job. No confidence interval exists.
+  - Each case ran once per job. Two jobs on the same node agree (section 2). No confidence interval exists, and no other node was tested.
   - Cases under 0.1 ms are mostly launch cost (section 10, item 9 of `PROCEDURE.md`).
   - The kernels are written in the STADE house style, and the JAX versions were written to match. A reviewer can find a faster JAX version for a case.
 
@@ -160,10 +160,10 @@ The driver gap is 0.42 for the primal (23 cases) and 0.45 for the adjoint with C
 | 2 | Which option makes C slower than A? | Done (job ABL1, section 4.3). `primal_outputs = false` gives most of the gain. `fresh_gradient` gives the rest for mlp3, mlp3_push and wave2d_step. | Done |
 | 3 | Do atomic adds limit mpnn_gather? | Profile the adjoint kernels with `nsys` or `ncu` (kernel time, atomic throughput). | One profiling job |
 | 4 | Why is the transformer adjoint 17 to 28 % slower? (The range covers A and C.) | Profile both adjoints and compare the time per kernel. Test the checkpoint option. | One profiling job |
-| 5 | Is the JAX swe2d_step 1e6 adjoint an outlier? | Repeat the case five times in separate jobs. | One short job |
-| 6 | How large is the noise? | Repeat the time job FULLT1 once. Compare each case. | One job (45 min) |
+| 5 | Why is the JAX swe2d_step 1e6 adjoint slow relative to its primal? | The repeat FULLT2 reproduced it (5.517 and 5.516 ms), so it is not noise. Profile the XLA kernels of this case. | One profiling job |
+| 6 | How large is the noise? | Done (job FULLT2, section 2). | Done |
 
-Test 6 is now the most useful. ABL1 already measured the STADE noise on 28 cases (median 0.07 %), so a repeat of the time job would mainly measure the JAX noise and the cases ABL1 did not cover. A decision about the default options of STADE belongs to the owner (section 8, item 7).
+Tests 2 and 6 are done. The remaining tests (1, 3, 4 and 5) look for causes. A decision about the default options of STADE belongs to the owner (section 8, item 7). A run on a second node or a second GPU would test the limit that FULLT2 leaves open.
 
 ## 8. Conclusions
 
@@ -174,4 +174,5 @@ Test 6 is now the most useful. ABL1 already measured the STADE noise on 28 cases
 5. The ratio of adjoint time to primal time is worse for STADE (3.27 against 2.09). The reason is mpnn_gather and the MLP cases. These are the first places to improve.
 6. The ablation (section 4.3) shows that `primal_outputs = false` gives most of the gain of config A. The gap to JAX on the 9 ablated kernels is 1.01 with the defaults and 0.81 with this option alone. `fresh_gradient` adds a gain for mlp3, mlp3_push and wave2d_step. Neither option changes unet2. The options change the transformer by at most 8 % and ufv_gather_step at 1e6 and 4e6 by at most 13 %.
 7. The options change the contract of the adjoint call (section 4.3). Whether they should be the default is a decision for the owner. The data show a gain of 24 % on average (geometric mean over 28 cases) if both are on.
-8. The text claims no cause for the losses that remain after A. Section 7 lists the tests that would give one.
+8. The repeat FULLT2 gives the same results as FULLT1 (section 2), so none of the conclusions above depends on noise in this node.
+9. The text claims no cause for the losses that remain after A. Section 7 lists the tests that would give one.
