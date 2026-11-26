@@ -123,7 +123,7 @@ The runs do not flush the GPU caches. STADE copies the inputs back between calls
 1. Report the median and the IQR for every cell.
 2. Compute the gap per case from the medians.
 3. Summarize the gaps with the geometric mean. Also report the count of cases where STADE is slower than JAX (gap above 1).
-4. Treat a change below 5 % between two runs of the same code as noise. This limit is a working value. To check it, repeat one phase and compare the medians.
+4. Treat a change below 5 % between two runs of the same code as noise. This limit is a working value. To check it, run the smoke job twice and compare the medians. The limit holds for STADE. For JAX calls near 100 µs, expect larger differences between jobs.
 5. Report the ratio adjoint time over primal time for each case and each framework.
 
 ### 3.4 Run isolation
@@ -302,20 +302,20 @@ Handle an invalid case as follows.
 
 ## 8. Time budget
 
-The owner reported that the V100 template allows 2 hours. All values below are estimates. A STADE run costs about 40 s for the process start and the compile, before any timing. A JAX run costs 1 to 20 s. The first value dominates the memory phases.
+The owner reported that the V100 template allows 2 hours. All values below are estimates. A STADE run costs 40 to 80 s for the process start and the compile, before any timing. A JAX run costs 1 to 20 s for most kernels. For kernels with loops over many elements, the JAX compile grows with the size and can take more than 2 min. Each JAX phase compiles again, because each phase is a new process.
 
 | Block | Estimate | Basis |
 |---|---|---|
-| STADE `time` phase | About 50 min | 28 runs of about 40 s start and compile, plus the timed calls of both timers. |
+| STADE `time` phase | About 50 min | 28 runs of 40 to 80 s start and compile, plus the timed calls of both timers. |
 | JAX `time` phase | About 11 min | 42 cases. |
-| STADE memory phases | About 30 min | 42 runs of about 40 s start and compile. The calls are short. |
-| JAX memory phases | About 8 min | 84 runs, no timing loop. |
+| STADE memory phases | About 35 min | 42 runs of 40 to 60 s. The calls are short. |
+| JAX memory phases | About 20 min | 84 runs, no timing loop. Two compiles for each case. |
 | Input dumps for JAX | About 4 min for each job | |
-| Total, one job | About 105 min | Equal to the budget of the job (limit 120 min minus 15 min). No margin. |
+| Total, one job | About 125 min | Above the budget of one job (limit 120 min minus 15 min). |
 | Time job | About 65 min | |
-| Memory job | About 40 min | |
+| Memory job | About 60 min | |
 
-One job has no margin. Use two jobs (D2). The job also protects itself: it starts no new run during its last 15 min, and it prints its result before the Slurm limit. If the real values are larger than these estimates, split a job by kernel with the option `--kernels`.
+One job does not fit. Use two jobs (D2). The job also protects itself: it starts no new run during its last 15 min, and it prints its result before the Slurm limit. If the real values are larger than these estimates, split a job by kernel with the option `--kernels`.
 
 ## 9. Outputs
 
@@ -377,7 +377,7 @@ Each decision has a recommendation. The owner decides.
 | Id | Decision | Recommendation | Reason |
 |---|---|---|---|
 | D1 | Headline timer | Use the host clock with a device synchronization for both frameworks. Report the STADE CUDA-event time as a second column. | The host clock measures the same thing in both frameworks. The JAX timer includes the host launch time. The STADE event timer does not. The second column shows how much of a small case is launch time. This needs change H3. |
-| D2 | One job or two | Use two jobs. Run the `time` phases first (about 65 min). Run the memory phases second (about 40 min). | The estimate for one job is about 105 min, and the budget of a job is 105 min. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
+| D2 | One job or two | Use two jobs. Run the `time` phases first (about 65 min). Run the memory phases second (about 60 min). | The estimate for one job is about 125 min, and the budget of a job is 105 min. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
 | D3 | Phase split | Accept it. | The primal memory reading is not valid without it (section 4.3). The cost is about 45 min of job time. |
 | D4 | STADE config `A` for the adjoint memory | Measure `A` and `C`. Measure the primal memory with `C` only. | Config `A` is the setting that targets memory. The comparison with JAX is incomplete without it. The cost is 14 more STADE runs. Config `A` does not change the primal code. |
 | D5 | Scope of JAX styles | Keep `jit` only in this benchmark. | STADE runs with `checkpoint = false`. A `jax.checkpoint` or `lax.scan` variant is fair only against STADE with `checkpoint = true`. That is a separate study with its own cases. Do it as a follow-up if a reviewer asks. |
