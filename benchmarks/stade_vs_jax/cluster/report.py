@@ -1,100 +1,216 @@
-"""Builds the report of one benchmark from the result files of the STADE job and of the JAX job.
-Usage: python3 report.py --stade STADE_RESULT.json --jax JAX_RESULT.json [--jax MORE.json ...] --out OUTDIR [--tag TEXT]
+"""Builds the report of one benchmark from the result files of one or more jobs (the output of build_job.py payloads).
+Usage: python3 report.py --results FILE [--results FILE ...] --out OUTDIR [--tag TEXT] [--headline wall|events]
 Writes OUTDIR/REPORT.md and OUTDIR/rows.json. Gap = STADE / JAX. Below 1 means STADE is smaller or faster.
+Headline STADE timer: wall = host clock with a device synchronization (like the JAX timer, default), events = CUDA events.
 Best = the smaller adjoint time of the two STADE configs (C = defaults, A = best opt-in).
-Primal memory is not in this report. The harness gives a valid primal memory reading only in its own phase (see PROCEDURE.md, section 5)."""
-import argparse, json, math, os, re, sys
+The acceptance checks G1 to G9 of PROCEDURE.md section 7 are evaluated here. A FAIL is listed in the report; the owner decides on the case."""
+import argparse, json, math, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "..", "gpu"))
 from specs import SZ
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--stade", required=True); ap.add_argument("--jax", action="append", required=True)
-ap.add_argument("--out", required=True); ap.add_argument("--tag", default="")
-o = ap.parse_args()
+POOL_MIN_MB = 34.0     # the CUDA.jl pool minimum chunk: STADE readings below it do not show the true use
+G1_LIMIT = 1e-10
 
-def last_json(path):
-    return json.loads(open(path).read().strip().splitlines()[-1])
 
-jax, jax_nodes = {}, set()
-for p in o.jax:
-    d = last_json(p); d = d.get("result") or d
-    for l in d["log"].split("\n"):
-        if l.startswith("{"):
-            try: r = json.loads(l)
-            except Exception: continue
-            jax[(r["kernel"], r["size"])] = r
-        elif l.startswith("node:"): jax_nodes.add(l.split()[1])
-d = last_json(o.stade); stade_host = d.get("host")
-A, C, bad, secs = {}, {}, [], 0.0
-for r in d["runs"]:
-    secs += r["seconds"]
-    if r["exit"] != 0 or not r.get("result"):
-        bad.append((r["name"], r["exit"], r["stderr_tail"][-200:])); continue
-    cfg = A if r["name"].endswith("_A") else C
-    for x in r["result"]["results"]:
-        if isinstance(x.get("adjoint"), dict) and str(x["size"]).startswith("bench_"):
-            cfg[(r["result"]["kernel"], x["size"])] = x
+def load(path):
+    d = json.loads(open(path).read().strip().splitlines()[-1])
+    d = d.get("result") or d
+    return json.loads(d) if isinstance(d, str) else d
 
-keys = [(k, s) for k in SZ for s in SZ[k]]
-g = lambda x, nd=3: "-" if x is None else f"{x:.{nd}f}"
+
 def geo(v):
     v = [x for x in v if x]
     return math.exp(sum(map(math.log, v)) / len(v)) if v else None
-ratio = lambda a, b: (a / b) if a and b else None
-ms = lambda st, f: None if not st or not isinstance(st.get(f), dict) else st[f]["median"] * 1e3
-rows = []
-for (k, s) in keys:
-    j, a, c = jax.get((k, s)), A.get((k, s)), C.get((k, s))
-    r = dict(k=k, s=s[6:])
-    if j and j.get("ok"):
-        r.update(jp=ms(j, "primal"), ja=ms(j, "adjoint"), jpk=j.get("mem_peak_adjoint_mb"), jown=j.get("peak_mb"))
-    elif j: r["jerr"] = j.get("error")
-    if a: r.update(ab=ms(a, "adjoint"), ea=a.get("elements_changed"), spk_b=a.get("mem_peak_adjoint_mb"))
-    if c: r.update(ad=ms(c, "adjoint"), pd=ms(c, "primal"), ec=c.get("elements_changed"), spk_d=c.get("mem_peak_adjoint_mb"),
-                   sstack=c.get("stack_mb"), pre=c.get("primal_relerr"), gre=c.get("grad_relerr"))
-    if r.get("ad") and r.get("ab"): r["best"] = min(r["ab"], r["ad"])
-    rows.append(r)
-os.makedirs(o.out, exist_ok=True)
-json.dump(rows, open(os.path.join(o.out, "rows.json"), "w"), indent=1)
 
-out = []; P = out.append
-P(f"# STADE against JAX on a V100 {o.tag}\n")
-P(f"STADE job node: {stade_host}. JAX job node: {', '.join(sorted(jax_nodes)) or '-'}. STADE config C = defaults. Config A = primal_outputs = false with fresh_gradient. JAX = jit. Gap = STADE / JAX.\n")
-tp = [r for r in rows if r.get("jp") and r.get("pd")]
-P("## 1. Runtime of the primal\n")
-P("| kernel | size | STADE ms | JAX ms | gap |\n|---|---|---:|---:|---:|")
-for r in sorted(tp, key=lambda r: -(r["pd"] / r["jp"])):
-    P(f"| {r['k']} | {r['s']} | {r['pd']:.4f} | {r['jp']:.4f} | {r['pd']/r['jp']:.2f} |")
-gp = [r["pd"] / r["jp"] for r in tp]
-P(f"\n{len(tp)} cases. Geometric-mean gap **{g(geo(gp))}**. STADE slower than JAX in {sum(x > 1 for x in gp)} cases.\n")
-ta = [r for r in rows if r.get("ja") and r.get("ad") and r.get("best")]
-P("## 2. Runtime of the adjoint\n")
-P("| kernel | size | STADE C ms | STADE best ms | JAX ms | gap C | gap best |\n|---|---|---:|---:|---:|---:|---:|")
-for r in sorted(ta, key=lambda r: -(r["best"] / r["ja"])):
-    P(f"| {r['k']} | {r['s']} | {r['ad']:.3f} | {r['ab']:.3f} | {r['ja']:.3f} | {r['ad']/r['ja']:.2f} | {r['best']/r['ja']:.2f} |")
-gd = [r["ad"] / r["ja"] for r in ta]; gb = [r["best"] / r["ja"] for r in ta]
-P(f"\n{len(ta)} cases. Geometric-mean gap: C **{g(geo(gd))}**, best **{g(geo(gb))}**. STADE slower than JAX: C {sum(x > 1 for x in gd)}, best {sum(x > 1 for x in gb)}.\n")
-P("## 3. Ratio adjoint time over primal time\n")
-P("| kernel | size | STADE C | JAX |\n|---|---|---:|---:|")
-for r in rows:
-    if r.get("ad") and r.get("pd") and r.get("ja") and r.get("jp"):
-        P(f"| {r['k']} | {r['s']} | {r['ad']/r['pd']:.2f} | {r['ja']/r['jp']:.2f} |")
-P("\n## 4. Memory of the adjoint\n")
-P("Readings come from the driver, above the baseline of the same process. STADE values below about 34 MB show the pool minimum chunk. `JAX own` is the XLA live-bytes peak.\n")
-P("| kernel | size | STADE stacks MB | STADE C MB | STADE A MB | JAX MB | JAX own MB | gap C | gap C / own |\n|---|---|---:|---:|---:|---:|---:|---:|---:|")
-mrows = [r for r in rows if r.get("spk_d") is not None or r.get("jpk") is not None]
-for r in mrows:
-    sp = r.get("spk_d")
-    P(f"| {r['k']} | {r['s']} | {g(r.get('sstack'),0)} | {g(sp,0)} | {g(r.get('spk_b'),0)} | {g(r.get('jpk'),0)} | {g(r.get('jown'),0)} | {g(ratio(sp, r.get('jpk')),2)} | {g(ratio(sp, r.get('jown')),2)} |")
-sig = [r for r in mrows if r.get("spk_d") and r.get("jpk") and r["spk_d"] > 40]
-P(f"\nGeometric-mean memory gap (driver reading) over the {len(sig)} cases with a STADE peak above 40 MB: **{g(geo([ratio(r['spk_d'], r['jpk']) for r in sig]),2)}**. Against the XLA live-bytes peak: **{g(geo([ratio(r['spk_d'], r['jown']) for r in sig]),2)}**.")
-worse = [(r['k'], r['s'], r['spk_d'], r['jpk']) for r in sig if r['spk_d'] > r['jpk']]
-P("STADE peak above the JAX driver reading: " + (", ".join(f"{k} {s} ({a:.0f} against {b:.0f} MB)" for k, s, a, b in worse) or "no case") + ".\n")
-P("## 5. Checks\n")
-diff = [(r['k'], r['s'], r.get('ea'), r.get('ec')) for r in rows if r.get('ea') != r.get('ec')]
-P("- Elements changed, config A against config C (must be equal): " + (str(diff) if diff else "equal in all cases") + ".")
-P("- Elements changed, smallest value over all cases (must be above 0): " + str(min([x for r in rows for x in (r.get('ea'), r.get('ec')) if x is not None] or [None])) + ".")
-P("- STADE failed runs: " + (str(bad) if bad else "none") + f". STADE process time {secs/60:.1f} min.")
-P("- JAX cases without a result: " + (str([(r['k'], r['s'], r.get('jerr')) for r in rows if not r.get('ja')]) or "none") + ".")
-open(os.path.join(o.out, "REPORT.md"), "w").write("\n".join(out) + "\n")
-print(f"{len(ta)} adjoint cases, {len(tp)} primal cases, geomean gap C {geo(gd):.3f} best {geo(gb):.3f}")
+
+def ratio(a, b):
+    return (a / b) if a and b else None
+
+
+def g(x, nd=3):
+    return "-" if x is None else f"{x:.{nd}f}"
+
+
+def med_ms(r, f):
+    st = (r or {}).get(f)
+    return st["median"] * 1e3 if isinstance(st, dict) else None
+
+
+def collect(paths):
+    """Returns (runs, jobs). A run is the record of one process, with fw, config, kernel, size, phase, status, exit, gpu_before, gpu, result."""
+    runs, jobs = [], []
+    for p in paths:
+        d = load(p); jobs.append({k: d.get(k) for k in ("host", "slurm_job", "seconds", "versions")})
+        runs += d["runs"]
+    return runs, jobs
+
+
+def index(runs):
+    """stade[(config, kernel, phase)] = {size: result of one size}. jax[(kernel, size, phase)] = result."""
+    stade, jax = {}, {}
+    for r in runs:
+        res = r.get("result")
+        if not res: continue
+        if r["fw"] == "stade":
+            stade[(r["config"], r["kernel"], r["phase"])] = {x["size"]: x for x in res.get("results", [])}
+        else:
+            jax[(r["kernel"], r["size"], r["phase"])] = res
+    return stade, jax
+
+
+def checks(runs, stade, jax):
+    """Returns a list of (id, status, text). status is FAIL or NOTE. An empty list means every check passed."""
+    out = []
+    add = lambda i, st, t: out.append((i, st, t))
+    for (cfg, k, ph), sizes in stade.items():
+        for s, x in sizes.items():
+            tag = f"STADE {cfg} {k} {s} {ph}"
+            if "error" in x: add("RUN", "FAIL", f"{tag}: {x['error'][:120]}"); continue
+            if s in ("tiny", "small") and ph == "time":                                            # G1
+                for f in ("primal_relerr", "grad_relerr"):
+                    if x.get(f) is not None and x[f] > G1_LIMIT: add("G1", "FAIL", f"{tag}: {f} = {x[f]:.2e}")
+            if x.get("elements_changed") is not None and x["elements_changed"] <= 0: add("G2", "FAIL", f"{tag}: elements_changed = 0")
+            if ph == "time" and str(s).startswith("bench_"):                                         # G5
+                for f in ("primal", "adjoint"):
+                    n = (x.get(f) or {}).get("n")
+                    if n not in (30, 10, 5): add("G5", "NOTE", f"{tag}: {f} n = {n}")
+            if ph != "time" and x.get("mem_inputs_mb") is not None and x.get("input_mb") is not None and x["mem_inputs_mb"] < x["input_mb"] - 1.0:   # G6
+                add("G6", "FAIL", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
+            if ph == "mem_adjoint" and x.get("mem_setup_mb") is not None and x.get("device_mb_estimate") is not None:                           # G7
+                est = x["device_mb_estimate"]
+                if abs(x["mem_setup_mb"] - est) > max(0.05 * est, POOL_MIN_MB): add("G7", "FAIL", f"{tag}: setup {x['mem_setup_mb']:.1f} MB, parts {est:.1f} MB")
+    for (k, s, ph), x in jax.items():
+        tag = f"JAX {k} {s} {ph}"
+        if not x.get("ok"): add("RUN", "FAIL" if "RESOURCE_EXHAUSTED" not in str(x.get("error")) else "NOTE", f"{tag}: {str(x.get('error'))[:120]}"); continue
+        if x.get("grad_finite") is False: add("G3", "FAIL", f"{tag}: gradients not finite")                                                      # G3
+        if ph == "time" and (x.get("primal") or {}).get("n") != 30: add("G5", "NOTE", f"{tag}: n = {(x.get('primal') or {}).get('n')}")
+        if ph != "time" and x.get("mem_inputs_mb") is not None and x.get("input_mb") is not None and x["mem_inputs_mb"] < x["input_mb"] - 1.0:
+            add("G6", "FAIL", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
+        if ph == "mem_adjoint":                                                                                                                  # G8
+            p = jax.get((k, s, "mem_primal"))
+            if p and p.get("ok") and x.get("mem_peak_adjoint_mb") is not None and p.get("mem_peak_primal_mb") is not None \
+                    and x["mem_peak_adjoint_mb"] < p["mem_peak_primal_mb"] - 1.0:
+                add("G8", "FAIL", f"{tag}: adjoint peak {x['mem_peak_adjoint_mb']:.1f} MB below primal peak {p['mem_peak_primal_mb']:.1f} MB")
+    ea = {(k, s): x.get("elements_changed") for (cfg, k, ph), sz in stade.items() if cfg == "C" and ph == "time" for s, x in sz.items()}
+    for (cfg, k, ph), sz in stade.items():
+        if cfg == "A" and ph == "time":
+            for s, x in sz.items():
+                if (k, s) in ea and ea[(k, s)] != x.get("elements_changed"): add("G2", "FAIL", f"STADE {k} {s}: elements_changed differ between C and A")
+    for r in runs:
+        tag = f"{r['fw']} {r['config']} {r['kernel']} {r.get('size') or ''} {r['phase']}".replace("  ", " ")
+        if r.get("status"): add("RUN", "FAIL", f"{tag}: status {r['status']}")
+        elif r.get("exit") not in (0, None) or not r.get("result"): add("RUN", "FAIL", f"{tag}: exit {r.get('exit')}, no result. {str(r.get('stderr_tail'))[-150:]}")
+        gb = r.get("gpu_before") or {}
+        if gb.get("busy") is True: add("G4", "FAIL", f"{tag}: GPU busy before the run ({gb.get('apps') or gb.get('mem_used_mib')})")                       # G4
+        if (r.get("gpu") or {}).get("throttle_bad"): add("G9", "FAIL", f"{tag}: throttle reasons {r['gpu'].get('throttle_or')}")                       # G9
+    return out
+
+
+def build_rows(stade, jax, head):
+    rows = []
+    pf = "primal_wall" if head == "wall" else "primal"; af = "adjoint_wall" if head == "wall" else "adjoint"
+    for k in SZ:
+        for s in SZ[k]:
+            sl = s
+            r = dict(k=k, s=s[6:])
+            sc = (stade.get(("C", k, "time")) or {}).get(sl); sa = (stade.get(("A", k, "time")) or {}).get(sl)
+            r["pd"] = med_ms(sc, pf); r["ad"] = med_ms(sc, af); r["pd_ev"] = med_ms(sc, "primal"); r["ad_ev"] = med_ms(sc, "adjoint")
+            r["ab"] = med_ms(sa, af); r["ab_ev"] = med_ms(sa, "adjoint")
+            jt = jax.get((k, s, "time"))
+            if jt and jt.get("ok"): r["jp"] = med_ms(jt, "primal"); r["ja"] = med_ms(jt, "adjoint")
+            mp = (stade.get(("C", k, "mem_primal")) or {}).get(sl); ma = (stade.get(("C", k, "mem_adjoint")) or {}).get(sl); mb = (stade.get(("A", k, "mem_adjoint")) or {}).get(sl)
+            r["spk_p"] = (mp or {}).get("mem_peak_primal_mb"); r["spk_d"] = (ma or {}).get("mem_peak_adjoint_mb"); r["spk_b"] = (mb or {}).get("mem_peak_adjoint_mb")
+            r["sstack"] = (ma or {}).get("stack_mb"); r["sgrad"] = (ma or {}).get("grad_mb"); r["sin"] = (ma or mp or {}).get("input_mb")
+            jmp = jax.get((k, s, "mem_primal")); jma = jax.get((k, s, "mem_adjoint"))
+            if jmp and jmp.get("ok"): r["jpk_p"] = jmp.get("mem_peak_primal_mb"); r["jown_p"] = jmp.get("peak_mb")
+            elif jmp: r["jerr_p"] = jmp.get("error")
+            if jma and jma.get("ok"): r["jpk_a"] = jma.get("mem_peak_adjoint_mb"); r["jown_a"] = jma.get("peak_mb")
+            elif jma: r["jerr_a"] = jma.get("error")
+            if jt and not jt.get("ok"): r["jerr"] = jt.get("error")
+            if r["ad"] and r["ab"]: r["best"] = min(r["ab"], r["ad"])
+            rows.append(r)
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results", action="append", required=True); ap.add_argument("--out", required=True)
+    ap.add_argument("--tag", default=""); ap.add_argument("--headline", default="wall", choices=["wall", "events"])
+    o = ap.parse_args()
+    runs, jobs = collect(o.results); stade, jax = index(runs)
+    rows = build_rows(stade, jax, o.headline); chk = checks(runs, stade, jax)
+    os.makedirs(o.out, exist_ok=True)
+    json.dump(rows, open(os.path.join(o.out, "rows.json"), "w"), indent=1)
+    out = []; P = out.append
+    hl = "host clock with device synchronization" if o.headline == "wall" else "CUDA events"
+    P(f"# STADE against JAX on a V100 {o.tag}\n")
+    for j in jobs:
+        v = j.get("versions") or {}
+        P(f"- Job on {j.get('host')} (Slurm {j.get('slurm_job') or '-'}), {g((j.get('seconds') or 0) / 60, 1)} min. STADE commit {v.get('stade_commit', '-')[:9]}{' (dirty)' if v.get('stade_dirty') else ''}, kit {v.get('kit_hash', '-')}.")
+    vs = {}
+    for r in runs:
+        x = r.get("result") or {}
+        for k2, v2 in (x.get("versions") or {}).items():
+            if v2: vs.setdefault(r["fw"], {})[k2] = v2
+    for fw, d in vs.items():
+        P(f"- {fw}: " + ", ".join(f"{a} {b}" for a, b in sorted(d.items()) if a not in ("stade_commit", "kit_hash")))
+    P(f"\nSTADE config C = defaults. Config A = primal_outputs = false with fresh_gradient. JAX = jit. Gap = STADE / JAX. Headline STADE timer: {hl}. Failed checks are listed in section 7.\n")
+    tp = [r for r in rows if r.get("jp") and r.get("pd")]
+    P("## 1. Runtime of the primal\n")
+    P("| kernel | size | STADE ms | STADE events ms | JAX ms | gap |\n|---|---|---:|---:|---:|---:|")
+    for r in sorted(tp, key=lambda r: -(r["pd"] / r["jp"])):
+        P(f"| {r['k']} | {r['s']} | {r['pd']:.4f} | {g(r.get('pd_ev'), 4)} | {r['jp']:.4f} | {r['pd']/r['jp']:.2f} |")
+    gp = [r["pd"] / r["jp"] for r in tp]
+    P(f"\n{len(tp)} cases. Geometric-mean gap **{g(geo(gp))}**. STADE slower than JAX in {sum(x > 1 for x in gp)} cases.\n")
+    ta = [r for r in rows if r.get("ja") and r.get("ad") and r.get("best")]
+    P("## 2. Runtime of the adjoint\n")
+    P("| kernel | size | STADE C ms | STADE C events ms | STADE best ms | JAX ms | gap C | gap best |\n|---|---|---:|---:|---:|---:|---:|---:|")
+    for r in sorted(ta, key=lambda r: -(r["best"] / r["ja"])):
+        P(f"| {r['k']} | {r['s']} | {r['ad']:.3f} | {g(r.get('ad_ev'))} | {r['best']:.3f} | {r['ja']:.3f} | {r['ad']/r['ja']:.2f} | {r['best']/r['ja']:.2f} |")
+    gd = [r["ad"] / r["ja"] for r in ta]; gb = [r["best"] / r["ja"] for r in ta]
+    P(f"\n{len(ta)} cases. Geometric-mean gap: C **{g(geo(gd))}**, best **{g(geo(gb))}**. STADE slower than JAX: C {sum(x > 1 for x in gd)}, best {sum(x > 1 for x in gb)}.\n")
+    P("## 3. Ratio adjoint time over primal time\n")
+    P("| kernel | size | STADE C | JAX |\n|---|---|---:|---:|")
+    for r in rows:
+        if r.get("ad") and r.get("pd") and r.get("ja") and r.get("jp"):
+            P(f"| {r['k']} | {r['s']} | {r['ad']/r['pd']:.2f} | {r['ja']/r['jp']:.2f} |")
+    P("\n## 4. Memory of the primal\n")
+    P("Readings come from the driver, above the baseline of the same process. Only the inputs are on the device. A STADE value below about 34 MB shows the pool minimum chunk: no gap is computed. `JAX own` is the XLA live-bytes peak.\n")
+    P("| kernel | size | inputs MB | STADE C MB | JAX MB | JAX own MB | gap |\n|---|---|---:|---:|---:|---:|---:|")
+    mp = [r for r in rows if r.get("spk_p") is not None or r.get("jpk_p") is not None]
+    sigp = []
+    for r in mp:
+        small = r.get("spk_p") is not None and r["spk_p"] < POOL_MIN_MB
+        gap = None if small else ratio(r.get("spk_p"), r.get("jpk_p"))
+        if gap: sigp.append(gap)
+        P(f"| {r['k']} | {r['s']} | {g(r.get('sin'), 1)} | {g(r.get('spk_p'), 0)}{' (pool min)' if small else ''} | {g(r.get('jpk_p'), 0)} | {g(r.get('jown_p'), 0)} | {g(gap, 2)} |")
+    P(f"\nGeometric-mean primal memory gap over {len(sigp)} cases above the pool minimum: **{g(geo(sigp), 2)}**.\n" if sigp else "\nNo primal memory result.\n")
+    P("## 5. Memory of the adjoint\n")
+    P("Only the inputs, the gradient buffers and the stacks (STADE) or the cotangents (JAX) are on the device.\n")
+    P("| kernel | size | STADE stacks MB | STADE C MB | STADE A MB | JAX MB | JAX own MB | gap C | gap A |\n|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    ma = [r for r in rows if r.get("spk_d") is not None or r.get("jpk_a") is not None]
+    sig = [r for r in ma if r.get("spk_d") and r.get("jpk_a") and r["spk_d"] >= POOL_MIN_MB]
+    for r in ma:
+        P(f"| {r['k']} | {r['s']} | {g(r.get('sstack'), 0)} | {g(r.get('spk_d'), 0)} | {g(r.get('spk_b'), 0)} | {g(r.get('jpk_a'), 0)} | {g(r.get('jown_a'), 0)} | {g(ratio(r.get('spk_d'), r.get('jpk_a')), 2)} | {g(ratio(r.get('spk_b'), r.get('jpk_a')), 2)} |")
+    P(f"\nGeometric-mean adjoint memory gap over the {len(sig)} cases with a STADE C peak at or above 34 MB: C **{g(geo([ratio(r['spk_d'], r['jpk_a']) for r in sig]), 2)}**, A **{g(geo([ratio(r['spk_b'], r['jpk_a']) for r in sig if r.get('spk_b')]), 2)}**.\n")
+    P("## 6. Summary\n")
+    P(f"- Primal runtime: gap {g(geo(gp))}, STADE slower in {sum(x > 1 for x in gp)} of {len(gp)} cases.")
+    P(f"- Adjoint runtime: gap C {g(geo(gd))}, best {g(geo(gb))}; STADE C slower in {sum(x > 1 for x in gd)} of {len(gd)} cases.")
+    P(f"- Primal memory: gap {g(geo(sigp), 2)} over {len(sigp)} cases. Adjoint memory: gap C {g(geo([ratio(r['spk_d'], r['jpk_a']) for r in sig]), 2)} over {len(sig)} cases.\n")
+    P("## 7. Checks and invalid cases\n")
+    fails = [c for c in chk if c[1] == "FAIL"]; notes = [c for c in chk if c[1] == "NOTE"]
+    P(f"{len(fails)} failed checks, {len(notes)} notes.\n")
+    for i, st, t in sorted(chk): P(f"- {st} {i}: {t}")
+    if not chk: P("- All checks passed (G1 to G9).")
+    P("\n## 8. Limits\n")
+    for t in ("One GPU model (V100, 16 GB), float64, batch size one. JAX appears as jit only.",
+              "The two runtime timers differ. The caches are not flushed, and STADE copies its inputs between calls.",
+              "JAX memory comes from nvidia-smi and the JAX pool never shrinks. STADE readings below about 34 MB show the pool minimum.",
+              "One job gives one run. The noise limit of 5 % is a working value. The STADE checkpoint option is off."):
+        P(f"- {t}")
+    open(os.path.join(o.out, "REPORT.md"), "w").write("\n".join(out) + "\n")
+    print(f"{len(runs)} runs, {len(ta)} adjoint, {len(tp)} primal, {len(mp)} primal-memory, {len(ma)} adjoint-memory rows; {len(fails)} failed checks, {len(notes)} notes")
+
+
+if __name__ == "__main__":
+    main()

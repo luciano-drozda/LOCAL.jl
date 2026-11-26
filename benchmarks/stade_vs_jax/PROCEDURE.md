@@ -83,7 +83,7 @@ Apply every condition to every run.
 
 1. Use one node of the `gpu` partition with one Tesla V100-PCIE-16GB. The node has no other job.
 2. Use the driver and CUDA libraries of the node. Record the driver version.
-3. Use JAX from the virtualenv `$WORK/stade_fw_venv`. Build it with `cluster/setup_jax_venv.sh`. The script installs `jax[cuda12]`. Pin the version that the owner names, and record it (change H6). Set `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1`. Unset `LD_LIBRARY_PATH` for Python. The script `cluster/fw_run.sh` does this.
+3. Use JAX from the virtualenv `$WORK/stade_fw_venv`. Build it with `cluster/setup_jax_venv.sh`. The script installs `jax[cuda12]`. Pin the version that the owner names, and record it (change H6). Set `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1`. Unset `LD_LIBRARY_PATH` for Python. The script `cluster/job_run.sh` does this.
 4. Enable float64 in JAX (`jax_enable_x64`). The file `reference/jax_ref.py` does this. Do not use TF32.
 5. Use the STADE source file of the repository that holds this folder. Record the commit.
 6. Use the same input bytes in both frameworks. The file `tools/dump_inputs.jl` writes the inputs. JAX reads them. STADE builds the same inputs with `bench_inputs`.
@@ -100,9 +100,9 @@ Apply every condition to every run.
 | STADE | CUDA events (`CUDA.@elapsed`) around one call | GPU time from the first event to the last event. Gaps between launches inside the call count. The wait before the call does not count. |
 | JAX | Host clock (`time.perf_counter`) around one call and `jax.block_until_ready` | The host launch time and the GPU time. |
 
-The two timers are not equal. The JAX timer includes the host launch time of the call. The STADE timer does not include the wait before the first launch. For small cases the difference can be large. The harness of this folder uses these two timers.
+The two timers are not equal. The JAX timer includes the host launch time of the call. The STADE event timer does not include the wait before the first launch. For small cases the difference can be large.
 
-This procedure adds a second STADE timer (change H3 in section 5). It uses the host clock and a device synchronization, like the JAX timer. The report shows both STADE readings. The like-for-like gap uses the host clock for both frameworks. The decision about the headline timer is in section 11.
+The STADE runner therefore measures a second timer (change H3, section 5). It uses the host clock and a device synchronization, like the JAX timer. The two STADE timers alternate: one call with the event timer, then one call with the host-clock timer. Both see the same machine state. The report shows both STADE readings. The headline gap uses the host clock for both frameworks (`report.py --headline wall`, the default). The option `--headline events` uses the event timer. The decision is D1 in section 11.
 
 ### 3.2 Steps of one timing
 
@@ -112,8 +112,8 @@ Do these steps for the primal and then for the adjoint. Use one case in one run.
 2. Synchronize the device. This ends the reset before the timer starts.
 3. Make the first call. Record its duration as `first_call_s`. This call includes the compile time. Do not use it in the statistics.
 4. Make the warm-up calls. STADE makes 4 calls if the first call took less than 1 s, 2 calls if it took 1 to 5 s, and 1 call if it took more than 5 s. JAX always makes 5 calls.
-5. Make the timed calls. STADE makes 30, 10 or 5 calls, in the same three classes as step 4. JAX always makes 30 calls. Reset and synchronize before each STADE call.
-6. Stop the STADE timed loop after 90 s of wall time if it has not finished. Record the number of calls made (`n`).
+5. Make the timed calls. STADE makes 30, 10 or 5 calls with each timer, in the same three classes as step 4. JAX always makes 30 calls. Reset and synchronize before each STADE call.
+6. Stop the STADE timed loop after 180 s of wall time (90 s for each of the two timers) if it has not finished. Record the number of calls made (`n`).
 7. Compute the median, q1, q3, minimum and maximum of the timed calls. The median is the result.
 
 The runs do not flush the GPU caches. STADE copies the inputs back between calls. This copy changes the cache state. JAX does not copy. The report states this limit (section 10).
@@ -128,10 +128,11 @@ The runs do not flush the GPU caches. STADE copies the inputs back between calls
 
 ### 3.4 Run isolation
 
-1. Run STADE with one process for each kernel and each config. The process measures every size of that kernel in order of size.
-2. Run JAX with one process for each case.
-3. Before each run, ask `nvidia-smi` for the compute processes on the GPU. The list must be empty. If it is not empty, stop and report.
-4. Before and after each run, record the SM clock, the memory clock, the temperature and the clock throttle reasons (change H4).
+1. Run STADE with one process for each kernel, each config and each phase. The process measures every size of that kernel in order of size.
+2. Run JAX with one process for each case and each phase.
+3. Before each run, `cluster/gpu_state.sh snap` asks `nvidia-smi` for the compute processes and the memory in use. The GPU is busy if a process is listed or if more than 64 MiB are in use. The job waits up to 60 s for a busy GPU. If it is still busy, the job does not start the run. It records the status `gpu_busy` and goes on (check G4).
+4. During each run, `cluster/gpu_state.sh start` and `stop` sample the SM clock, the memory clock, the temperature, the power and the clock throttle reasons once each second (change H4). The result of each run holds the summary (check G9).
+5. No new run starts after the time budget of the job. The remaining runs get the status `skipped_budget`. This makes the job print its result before the Slurm limit ends it.
 
 ## 4. Memory protocol
 
@@ -198,108 +199,116 @@ Settle the memory between the sizes of a STADE run. A STADE run in a memory phas
 4. Both readings include small fixed amounts, such as loaded GPU modules. The baseline `mem0` does not include them for the kernels of the case.
 5. The two instruments read the same driver quantity.
 
-## 5. Changes that the harness of this folder still needs
+## 5. Harness changes H1 to H6
 
-The folder holds the harness without these changes. It runs and gives runtime and adjoint memory. It does not give a valid primal memory, a STADE host-clock timer or a GPU state record. Make the changes before the launch. Each change is small. Do not launch before the owner has seen the result of changes H1 to H6 on a local test.
+The changes H1 to H6 are implemented in this folder. They were tested on the CPU, with a stand-in for the GPU and a fake `nvidia-smi` (section 6.2). They were not run on a GPU. The smoke job (D6) is the first GPU run.
 
 | Id | File | Change | Reason |
 |---|---|---|---|
-| H1 | `gpu/runner_body.jl` | Add the environment variable `PHASE` with the values `time`, `mem_primal`, `mem_adjoint`. The `time` phase does not make the memory pass. The two memory phases follow section 4.3 and 4.4. | The primal memory reading holds the adjoint buffers (section 4.3). |
-| H2 | `reference/time_fw.py` | Add the option `--phase time|mem_primal|mem_adjoint`, with the same meaning as H1. The `time` phase does not read the memory. | The cotangents are on the device during the primal calls. |
-| H3 | `gpu/runner_body.jl` | Add a second timer for each call. It uses `time_ns` and a device synchronization. Store it as `primal_wall` and `adjoint_wall`. | The timers differ (section 3.1). |
-| H4 | New script | Before and after each run, record the GPU compute processes, the clocks, the temperature and the throttle reasons. Use `nvidia-smi`. | Check that the GPU is free and not throttled. |
-| H5 | New script in `cluster/` | Pack the runs of all phases and both frameworks into one payload. Each run has its own process and its own time limit. | One job submission (section 8). |
-| H6 | Both runners | Add to each result: the Julia, CUDA.jl, JAX, `jaxlib` and Python versions, the driver version, the STADE commit and the hash of the files of this folder. | Make the results reproducible. |
-
-Until H5 exists, the folder builds two payloads: one for STADE and one for JAX. The steps of section 6 then use two submissions. The script `cluster/report.py` builds the report parts 1, 2, 3, 4 (adjoint memory), 5 and 6 of section 9. The report part for the primal memory needs the result of H1 and H2.
+| H1 | `gpu/runner_body.jl` | The environment variable `STADE_PHASE` selects `time`, `mem_primal` or `mem_adjoint`. The `time` phase makes no memory reading. The memory phases follow sections 4.3 and 4.4 and skip the verify sizes. | The primal memory reading held the adjoint buffers (section 4.3). |
+| H2 | `reference/time_fw.py` | The option `--phase time|mem_primal|mem_adjoint`, with the same meaning as H1. The `time` phase reads no memory. The cotangents are not on the device in `mem_primal`. | The cotangents were on the device during the primal calls. |
+| H3 | `gpu/runner_body.jl` | A second timer for each call: `time_ns` with a device synchronization. The results are `primal_wall` and `adjoint_wall`. | The two frameworks used different timers (section 3.1). |
+| H4 | `cluster/gpu_state.sh` | Records the compute processes, the memory in use, the clocks, the temperature, the power and the throttle reasons. It is called by `cluster/job_run.sh` for every run. | Check that the GPU is free and not throttled. |
+| H5 | `cluster/build_job.py`, `cluster/job_run.sh`, `cluster/job_driver.jl` | One packer for both frameworks and any set of phases. One payload holds the STADE scripts, the JAX files and the plan. Each run has its own process and its own time limit. | One job submission for each job. |
+| H6 | Both runners, `cluster/build_job.py` | Each run records the Julia, CUDA.jl, driver and runtime versions (STADE) or the JAX, `jaxlib`, Python, NumPy and driver versions (JAX). The job records the STADE commit, a dirty flag and a hash of the kit files. | Make the results reproducible. |
 
 ## 6. Procedure
 
-All paths are relative to this folder. Julia 1.10 or later, Python 3 and the repository source file `src/STADE.jl` are needed on the sandbox. The cluster needs the JAX virtualenv and the relay of the cluster skill.
+All paths are relative to this folder. The sandbox needs Julia 1.10 or later, Python 3 and the repository source file `src/STADE.jl`. The cluster needs the JAX virtualenv and the relay of the cluster skill.
 
 ### 6.1 Preparation (on the sandbox, no GPU)
 
-1. Freeze the STADE tree. Record `git log -1` and check that `git status` shows no change.
-2. Make the changes H1 to H6 (section 5).
-3. Set the path of the STADE source file: `export STADE_SRC=$(git rev-parse --show-toplevel)/src/STADE.jl`.
-4. Make the role files: `bash cluster/make_roles.sh work`. The script runs `tools/dump_case.jl` at the size `small` for each kernel.
-5. Build the JAX job: `python3 cluster/build_jax_job.py work work/jax 3600`. It writes `work/jax/jax_job.json`. The bundle holds `tools/inputs.jl`, `tools/dump_inputs.jl`, `kernels/`, `reference/` and the role files.
-6. Build the STADE job: `bash cluster/build_stade_job.sh work/stade 1800`. It generates the CUDA runner scripts for the configs `C` and `A`, with `gpu/make_scripts.jl`. Config `A` uses `STADE_PO=0` and `STADE_FRESHKW=1`. The size `tiny!` of each kernel is the verify size. The script writes `work/stade/stade_job.json`.
-7. The kernel `kernels/nn/mpnn_gather.jl` uses the variable name `sdst`. The current STADE refuses the name `sd`. Keep this name.
+1. Freeze the STADE tree. Record `git log -1`. Check that `git status` shows no change. The job records a dirty flag.
+2. Set the path of the STADE source file: `export STADE_SRC=$(git rev-parse --show-toplevel)/src/STADE.jl`.
+3. Make the role files: `bash cluster/make_roles.sh work`. The script runs `tools/dump_case.jl` at the size `small` for each kernel.
+4. Generate the STADE runner scripts: `bash cluster/gen_stade_scripts.sh work/stade`. It writes `work/stade/all/KERNEL_C.jl` and `KERNEL_A.jl` for config `C` and config `A`. Config `A` uses `STADE_PO=0` and `STADE_FRESHKW=1`. The size `tiny!` of each kernel is the verify size.
+5. Build the jobs with `cluster/build_job.py`:
+   - Smoke job (D6): `MAX_SIZES=2 bash cluster/gen_stade_scripts.sh work/stade_smoke heat3d_step`, then `python3 cluster/build_job.py work/smoke --stade-dir work/stade_smoke --roles work --kernels heat3d_step --max-sizes 2`. It runs all three phases.
+   - Time job: `python3 cluster/build_job.py work/job_time --stade-dir work/stade --roles work --phases time`.
+   - Memory job: `python3 cluster/build_job.py work/job_mem --stade-dir work/stade --roles work --phases mem_primal,mem_adjoint`.
+   - The packer writes `job.json` (the payload), `plan.tsv` and `versions.json`. The option `--limit-min` sets the time limit of the V100 template (default 120). The job starts no new run during the last 15 min.
+6. The kernel `kernels/nn/mpnn_gather.jl` uses the variable name `sdst`. The current STADE refuses the name `sd`. Keep this name.
 
-### 6.2 Local gates (before the job)
+### 6.2 Local gates (before any job)
 
 1. Run the STADE test suites that the owner names for the commit. At least run `test/validate_offload.jl`, `test/validate_mod_collide.jl` and `test/validate_checkpoint_gpu_cpu.jl`.
 2. Check the JAX kernels against the STADE kernels on the CPU: `bash tools/parity_all.sh`. It needs Python with JAX. Every kernel must agree.
-3. Run each phase on the sizes `tiny` and `small` on the CPU stand-ins, where this is possible. Check that every result field of section 9 is present.
+3. Test the phase split of the STADE runner on the CPU:
+   - `MAX_SIZES=1 bash cluster/gen_stade_scripts.sh work/local heat3d_multi`
+   - `python3 tools/cpu_standin.py work/local/all/heat3d_multi_C.jl work/local/standin.jl`
+   - `bash tools/test_runner_phases.sh work/local/standin.jl`
+   The test runs the three phases on a stand-in for the GPU. It checks that the primal memory phase holds only the inputs and that the adjoint phase holds the inputs, the gradient buffers and the stacks. Then it breaks the runner on purpose. The check must fail. If it passes, the guard is wrong.
+4. Test the whole job chain on the CPU: `bash tools/test_job_chain.sh work/chain`. It takes about 10 min. The script builds a job from stand-in scripts and runs the driver of the payload with a fake `nvidia-smi` and the JAX of the sandbox. It builds the report. Then it runs four failure tests: GPU busy, time budget, run time-out and throttle reason. Each test must give its check or status. In the main report, G6 must fail for the JAX memory runs. The fake `nvidia-smi` reports a constant memory, and G6 must catch that.
 
-### 6.3 The job
+### 6.3 The jobs
 
 1. Check the time limit of the V100 `sbatch` template. The owner reported 2 hours. Check the file.
 2. Check that the `gpu` partition has a free node. Use `sinfo -p gpu`.
-3. Submit each payload with `RELAY_ENV=FILE RES_DIR=work/results bash cluster/go.sh NAME payload.json TIMEOUT`. `FILE` defines the relay variables (see the header of `cluster/go.sh`). Set `TIMEOUT` to the template limit plus a margin.
-4. If the wait in `go.sh` ends before the job ends, fetch the result with `poll_result.sh NAME 30 3` from the relay folder. Do not submit the job again.
-5. Tell the owner the job name and the Slurm job id.
+3. Run the smoke job first. Submit it with `RELAY_ENV=FILE RES_DIR=work/results bash cluster/go.sh smoke work/smoke/job.json TIMEOUT`. `FILE` defines the relay variables (see the header of `cluster/go.sh`). Set `TIMEOUT` to the template limit plus a margin.
+4. Read the smoke report (section 6.4). Check G1 to G9. Check the duration of each phase. Repeat the `time` phase once to check the 5 % noise limit. Then ask the owner to approve the full launch.
+5. Submit the time job and the memory job one after the other. Wait for the first to end.
+6. If the wait in `go.sh` ends before the job ends, fetch the result with `poll_result.sh NAME 30 3` from the relay folder. Do not submit the job again.
+7. Tell the owner the job name and the Slurm job id.
 
-The job runs the phases in this order:
+Order of the runs inside a job: every STADE kernel (config `C`, then config `A`, with the phases in the order given), then every JAX case (the phases in the order given). Config `A` skips `mem_primal`.
 
-| Order | Phase | Framework | Runs |
+| Job | Phases | STADE runs | JAX runs |
 |---|---|---|---|
-| 1 | `time` | STADE, configs `C` and `A` | 28 (14 kernels, 2 configs) |
-| 2 | `time` | JAX | 42 (one per case) |
-| 3 | `mem_primal` | STADE, config `C` | 14 |
-| 4 | `mem_primal` | JAX | 42 |
-| 5 | `mem_adjoint` | STADE, configs `C` and `A` | 28 |
-| 6 | `mem_adjoint` | JAX | 42 |
+| Time job | `time` | 28 | 42 |
+| Memory job | `mem_primal`, `mem_adjoint` | 42 (14 + 28) | 84 |
+| One job for all | all three | 70 | 126 |
 
-Before the JAX runs, the job writes the inputs of each case once with `dump_inputs.jl` and keeps them for the three JAX phases. It removes them at the end of the job.
+The job writes the inputs of one JAX case with `dump_inputs.jl`, runs the phases of that case, and removes the inputs.
 
 ### 6.4 After the job
 
 1. Fetch the result files. Copy them to the archive folder (section 9).
-2. Check every acceptance rule of section 7.
-3. Build the report: `python3 cluster/report.py --stade work/results/NAME.json --jax work/results/NAME2.json --out OUTDIR`.
-4. If the owner gives an earlier report, compare the medians with it. Report every change above 5 %.
-5. Give the report to the owner. State every case that failed a check.
+2. Build the report: `python3 cluster/report.py --results work/results/time.json --results work/results/mem.json --out OUTDIR`. The report evaluates the checks of section 7.
+3. If the owner gives an earlier report, compare the medians with it. Report every change above 5 %.
+4. Give the report to the owner. State every case that failed a check.
 
 ## 7. Acceptance checks
 
-A case is valid only if it passes every check that applies to it.
+`cluster/report.py` evaluates every check. A check has the status FAIL or NOTE. The report lists each one in section 7 of the report.
 
-| Id | Check | Limit |
-|---|---|---|
-| G1 | STADE device result against the CPU result, on `tiny!` and `small!`, for the primal and for the gradients | Relative error at most 1e-10. |
-| G2 | Elements changed by the STADE run (`elements_changed`) | Greater than 0. Equal for configs `A` and `C`. |
-| G3 | JAX gradients are finite (`grad_finite`) | True. |
-| G4 | No other compute process on the GPU before the run | The list is empty. |
-| G5 | Number of timed calls (`n`) | 30, 10 or 5 as in section 3.2, or fewer if the 90 s limit stopped the loop. Record the reason. |
-| G6 | `mem_inputs_mb` against the size of the inputs | Not below the input size minus 1 MB. |
-| G7 | STADE adjoint setup memory against its parts | Inputs plus gradient buffers plus stacks, within 5 % or 34 MB. |
-| G8 | JAX primal peak against JAX adjoint peak, same case | The adjoint peak is not below the primal peak minus 1 MB. |
-| G9 | Clock throttle reasons during the run | None, except the idle reason. If one occurs, mark the case. |
+| Id | Check | Limit | Status if not met |
+|---|---|---|---|
+| G1 | STADE device result against the CPU result on the size `tiny`, for the primal and for the gradients | Relative error at most 1e-10. | FAIL |
+| G2 | Elements changed by the STADE run (`elements_changed`) | Greater than 0. Equal for config `A` and config `C`. | FAIL |
+| G3 | JAX gradients are finite (`grad_finite`) | True. | FAIL |
+| G4 | The GPU is free before each run | No compute process, and at most 64 MiB in use. | FAIL |
+| G5 | Number of timed calls (`n`) | 30, 10 or 5 for STADE, 30 for JAX. A smaller value means that the time limit of the loop stopped it. | NOTE |
+| G6 | `mem_inputs_mb` against the size of the inputs | Not below the input size minus 1 MB. | FAIL |
+| G7 | STADE adjoint setup memory (`mem_setup_mb`) against its parts | Inputs plus gradient buffers plus stacks, within the larger of 5 % and 34 MB. | FAIL |
+| G8 | JAX adjoint peak against JAX primal peak, same case | The adjoint peak is not below the primal peak minus 1 MB. | FAIL |
+| G9 | Clock throttle reasons during the run | No power cap, slowdown, thermal reason or power brake (bits 0x4, 0x8, 0x20, 0x40, 0x80). The idle bit and the application-clocks bit do not count. | FAIL |
+
+A run that has a status other than `ok` (`gpu_busy`, `skipped_budget`, `dump_failed`), a non-zero exit or no result is a FAIL of the kind `RUN`. A JAX out-of-memory error is a NOTE.
+
+Each check was tested by breaking its input on purpose. Each broken input made the check fail. A fake `nvidia-smi` that reports a constant memory made G6 fail, as it must.
 
 Handle an invalid case as follows.
 
-1. Mark the case in the report. Do not delete it.
+1. Keep the case in the report. Do not delete it.
 2. Run the case again once, only if the cause is outside the code. Examples are a node fault and a killed process.
 3. If the case fails again, report it as failed with the reason.
 
 ## 8. Time budget
 
-The owner reported that the V100 template allows 2 hours. The benchmark fits in one job only if the total stays below the limit. The values below are estimates.
+The owner reported that the V100 template allows 2 hours. All values below are estimates. The smoke job (D6) gives the real values.
 
 | Block | Estimate | Basis |
 |---|---|---|
-| STADE `time` phase | About 41 min | 28 runs. Estimate. |
-| JAX `time` phase | About 11 min | 42 cases. Estimate. |
+| STADE `time` phase | About 60 min | 28 runs. The second timer adds up to 50 % to the timed part. |
+| JAX `time` phase | About 11 min | 42 cases. |
 | STADE memory phases | About 30 min | 42 runs of about 45 s (start, compile, 3 calls per size). Not measured. |
-| JAX memory phases | About 15 min | 84 runs, no timing loop. The inputs come from the saved dump. Not measured. |
-| Total | About 97 min | |
+| JAX memory phases | About 15 min | 84 runs, no timing loop. Not measured. |
+| Input dumps for JAX | About 5 min for each job | Not measured. |
+| Total, one job | About 125 min | Above the limit of 120 min. |
+| Time job | About 75 min | |
+| Memory job | About 50 min | |
 
-The estimate is below 120 min. The margin is small. A job cannot change its own plan after it starts. Use this rule before the launch.
-
-1. Measure the time of one STADE memory run and one JAX memory run on the V100 first. A short job of one kernel is enough.
-2. If the new estimate is above 105 min, split the benchmark in two jobs: the `time` phases, then the memory phases.
+One job does not fit the limit. Use two jobs (D2). The job also protects itself: it starts no new run during its last 15 min, and it prints its result before the Slurm limit. If the real values from the smoke job are larger than these estimates, split the memory job by kernel with the option `--kernels`.
 
 ## 9. Outputs
 
@@ -308,34 +317,35 @@ Keep every output in one archive folder, for example `results/full_YYYY-MM-DD/` 
 | Item | Content |
 |---|---|
 | `raw/` | The raw result file of each job. |
-| `scripts/` | The generator scripts, the packers and the report script, as used. |
-| `versions.json` | The commit, the file hash and all versions of section 5, H6. |
+| `scripts/` | The generated STADE scripts, `plan.tsv` and the scripts of this folder, as used. |
+| `versions.json` | The commit, the dirty flag and the kit hash (H6). The raw results hold the framework versions. |
 | `rows.json` | One record per case, with every quantity of sections 3 and 4. |
 | `REPORT.md` | The report. |
 
-Each result record holds these fields.
+Each job returns one JSON line. It holds the host, the Slurm job id, the versions and one record for each run. A run record holds `fw`, `config`, `kernel`, `size`, `phase`, `status`, `exit`, `seconds`, `gpu_before` (check G4), `gpu` (check G9), `result` and `stderr_tail`. The `result` of a STADE run holds one record for each size. The `result` of a JAX run is one record. The fields are:
 
 | Field | Meaning |
 |---|---|
-| `kernel`, `size`, `config` | The case and the config. |
-| `primal`, `adjoint` | Median, q1, q3, min, max, n and `first_call_s`. For STADE, also `primal_wall` and `adjoint_wall` (change H3). |
-| `mem_context_mb`, `mem_inputs_mb` | Section 4.2. |
-| `mem_peak_primal_mb`, `mem_peak_adjoint_mb` | Section 4.2. |
-| `stack_mb`, `grad_mb`, `alloc_primal_call_mb`, `alloc_adjoint_call_mb` | STADE only. |
-| `peak_mb`, `pool_mb` | JAX only. |
+| `primal`, `adjoint` | Median, q1, q3, min, max, n and `first_call_s`. For STADE: the CUDA-event timer. For JAX: the host clock. |
+| `primal_wall`, `adjoint_wall` | STADE only: the host-clock timer (change H3). |
+| `mem_context_mb`, `mem_inputs_mb`, `mem_setup_mb` | Section 4.2. Memory phases only. |
+| `mem_peak_primal_mb`, `mem_peak_adjoint_mb` | Section 4.2. Each one comes from its own phase. |
+| `input_mb`, `stack_mb`, `grad_mb`, `device_mb_estimate` | The sizes of the arrays. |
+| `alloc_primal_call_mb`, `alloc_adjoint_call_mb` | STADE only. Bytes that one call allocates. |
+| `peak_mb`, `pool_mb` | JAX only. The XLA live-bytes peak and the pool. Memory phases only. |
 | `primal_relerr`, `grad_relerr`, `elements_changed` | STADE checks G1 and G2. |
 | `grad_finite` | JAX check G3. |
-| `ok`, `error` | The status. An out-of-memory error has `ok` equal to false and a short error text. |
+| `ok`, `error` | JAX only. An out-of-memory error has `ok` equal to false and a short error text. |
 
 The report has these parts.
 
-1. Runtime of the primal: one table, STADE `C`, JAX, gap.
-2. Runtime of the adjoint: one table, STADE `C`, STADE `A`, JAX, both gaps.
+1. Runtime of the primal: STADE (headline timer and event timer), JAX, gap.
+2. Runtime of the adjoint: STADE `C` (both timers), STADE best, JAX, both gaps.
 3. The ratio adjoint over primal, for each framework.
-4. Memory of the primal: STADE `C`, JAX, gap. This part needs the phases `mem_primal` (changes H1 and H2).
-5. Memory of the adjoint: STADE `C`, STADE `A`, JAX, gap. Include the stacks and the working memory.
-6. A summary: the geometric mean of each gap, and the count of cases where STADE is slower or larger.
-7. The list of failed checks and invalid cases.
+4. Memory of the primal: inputs, STADE `C`, JAX, JAX own peak, gap.
+5. Memory of the adjoint: stacks, STADE `C`, STADE `A`, JAX, JAX own peak, both gaps.
+6. A summary: the geometric mean of each gap, and the count of cases where STADE is slower.
+7. The list of failed checks and notes.
 8. The limits of section 10.
 
 ## 10. Known limits
@@ -358,7 +368,7 @@ Each decision has a recommendation. The owner decides.
 | Id | Decision | Recommendation | Reason |
 |---|---|---|---|
 | D1 | Headline timer | Use the host clock with a device synchronization for both frameworks. Report the STADE CUDA-event time as a second column. | The host clock measures the same thing in both frameworks. The JAX timer includes the host launch time. The STADE event timer does not. The second column shows how much of a small case is launch time. This needs change H3. |
-| D2 | One job or two | Use two jobs. Run the `time` phases first (about 52 min). Run the memory phases second (about 45 min). | The memory phases are not measured. The estimate for one job is 97 min, and the limit is 120 min. A time-out in one job loses the timing data too. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
+| D2 | One job or two | Use two jobs. Run the `time` phases first (about 75 min). Run the memory phases second (about 50 min). | The estimate for one job is about 125 min, and the limit is 120 min. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
 | D3 | Phase split | Accept it. | The primal memory reading is not valid without it (section 4.3). The cost is about 45 min of job time. |
 | D4 | STADE config `A` for the adjoint memory | Measure `A` and `C`. Measure the primal memory with `C` only. | Config `A` is the setting that targets memory. The comparison with JAX is incomplete without it. The cost is 14 more STADE runs. Config `A` does not change the primal code. |
 | D5 | Scope of JAX styles | Keep `jit` only in this benchmark. | STADE runs with `checkpoint = false`. A `jax.checkpoint` or `lax.scan` variant is fair only against STADE with `checkpoint = true`. That is a separate study with its own cases. Do it as a follow-up if a reviewer asks. |
@@ -376,14 +386,17 @@ Do not launch the full benchmark until the owner approves it.
 | Role files and parity cases | `tools/dump_case.jl`, `tools/check_kernel.jl` |
 | Parity check, STADE against JAX | `tools/parity_all.sh`, `reference/parity_jax.py`, `reference/parity_common.py` |
 | Kernels (STADE source form) | `kernels/solvers/*.jl`, `kernels/nn/*.jl` |
-| STADE runner (timing and memory) | `gpu/runner_body.jl` |
-| STADE script generator | `gpu/make_scripts.jl` |
-| STADE job packer | `gpu/pack_job.py` |
+| STADE runner (phases, timers, memory) | `gpu/runner_body.jl` |
+| STADE script generator | `gpu/make_scripts.jl`, `cluster/gen_stade_scripts.sh` |
 | JAX kernels | `reference/jax_ref.py` |
 | JAX timing and memory | `reference/time_fw.py` |
-| JAX run script and packer | `cluster/fw_run.sh`, `cluster/pack_py.py` |
 | JAX virtualenv | `cluster/setup_jax_venv.sh` |
-| Role files, jobs, submission, report | `cluster/make_roles.sh`, `cluster/build_stade_job.sh`, `cluster/build_jax_job.py`, `cluster/go.sh`, `cluster/report.py` |
+| Role files | `cluster/make_roles.sh` |
+| Job packer, driver and run script | `cluster/build_job.py`, `cluster/job_driver.jl`, `cluster/job_run.sh` |
+| GPU state record | `cluster/gpu_state.sh` |
+| Submission | `cluster/go.sh` |
+| Report and checks | `cluster/report.py` |
+| CPU tests of the runner and of the job chain | `tools/cpu_standin.jl`, `tools/cpu_standin.py`, `tools/check_phase_results.py`, `tools/test_runner_phases.sh`, `tools/test_job_chain.sh`, `tools/fake_nvidia_smi` |
 | The STADE source | `../../src/STADE.jl` |
 
 The relay variables file (`RELAY_ENV`) is not in this folder. It holds secrets. Never commit it.

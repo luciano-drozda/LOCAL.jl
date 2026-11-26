@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# fake nvidia-smi for local tests. FAKE_APPS, FAKE_USED, FAKE_THR control the output.
+a="$*"
+case "$a" in
+  *--help-query-gpu*) echo '"clocks_throttle_reasons.active"';;
+  *query-compute-apps*) [ -n "${FAKE_APPS:-}" ] && echo "$FAKE_APPS";;
+  *-lms*) for i in 1 2 3; do echo "1380, 877, 45, 120.5, ${FAKE_USED:-300}, ${FAKE_THR:-0x0000000000000000}"; sleep 0.3; done;;
+  *driver_version,name*) echo "550.90.12, Tesla V100-PCIE-16GB, ${FAKE_USED:-0}, 1380, 877, 40, ${FAKE_THR:-0x0000000000000001}";;
+  *memory.used*) echo "${FAKE_USED:-0}";;
+  *driver_version*) echo "550.90.12";;
+esac
