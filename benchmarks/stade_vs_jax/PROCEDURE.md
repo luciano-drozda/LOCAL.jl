@@ -138,7 +138,9 @@ The runs do not flush the GPU caches. STADE copies the inputs back between calls
 
 ### 4.1 What the reading is
 
-The reading is the device memory in use for the whole GPU. The driver reports it. The reading minus the baseline is the memory that the case uses.
+The protocol takes two readings of each peak. The **driver reading** is the device memory in use for the whole GPU. The **exact reading** counts the bytes of the live arrays. Section 4.2 defines both. The allocators of both frameworks round the driver reading up, so the exact reading is the one to use for small cases (section 4.5).
+
+The driver reading is the device memory in use for the whole GPU. The driver reports it. The reading minus the baseline is the memory that the case uses.
 
 | Framework | Instrument |
 |---|---|
@@ -158,7 +160,9 @@ The reading counts all device memory of the process. It includes the memory that
 | `mem_peak_primal_mb` | The reading after the primal calls, minus `mem0`. The process holds the inputs of the primal only. |
 | `mem_peak_adjoint_mb` | The reading after the adjoint calls, minus `mem0`. The process holds the data of the adjoint (see 4.3). |
 | `stack_mb`, `grad_mb` | STADE only. The size of the stacks and of the gradient buffers. |
-| `peak_mb` | JAX only. The XLA live-bytes peak (`peak_bytes_in_use`). It has no region rounding. |
+| `peak_mb` | JAX only. The XLA live-bytes peak (`peak_bytes_in_use`). It is an exact reading. It has no region rounding. It counts the XLA buffers only. |
+| `live_inputs_mb`, `live_setup_mb` | STADE only. Bytes of the arrays alive in the CUDA.jl pool (`CUDA.used_memory()`), after the inputs, and after the inputs, gradient buffers and stacks. These are exact. |
+| `peak_exact_primal_mb`, `peak_exact_adjoint_mb` | STADE only. The live bytes plus the bytes that one call allocates (`CUDA.@allocated`). This is an upper bound of the exact peak. It is the STADE counterpart of the JAX `peak_mb`. |
 
 Also compute the working memory: the peak minus `mem_inputs_mb`. It shows what the call adds to the inputs.
 
@@ -191,13 +195,16 @@ Use one phase and one case in one run. Do not time anything in this run.
 
 Settle the memory between the sizes of a STADE run. A STADE run in a memory phase may measure all sizes of a kernel.
 
+Before the first measured size, a STADE memory run makes one throwaway pass on the first size, and settles. This loads the code modules and the libraries, so their one-time memory is in the baseline `mem0` of every size. Without this pass, the first size alone carries that memory. A JAX run measures one case. It cannot make such a pass. Its driver reading holds the one-time library memory. Its exact reading does not.
+
 ### 4.5 Limits of the reading
 
-1. The CUDA.jl pool has a minimum chunk of about 34 MB. A STADE reading below about 34 MB does not show the true use. Do not compute gaps from these readings. The report marks them.
-2. `nvidia-smi` reports whole MiB. The resolution is 1 MiB.
-3. A JAX pool never shrinks. Step 5 has no JAX equivalent. The JAX reading can include transient memory of the first call.
-4. Both readings include small fixed amounts, such as loaded GPU modules. The baseline `mem0` does not include them for the kernels of the case.
+1. The CUDA.jl pool grows in chunks of 32 MiB (33.6 MB). A STADE driver reading is a multiple of this chunk. A driver reading below about 34 MB does not show the true use.
+2. The XLA pool grows in regions. A JAX driver reading is rounded up in the same way, and a small input can be invisible in it. `nvidia-smi` reports whole MiB.
+3. A JAX pool never shrinks. Step 5 has no JAX equivalent. The JAX driver reading can include transient memory of the first call.
+4. The driver readings include one-time memory, such as loaded GPU modules and libraries (see the throwaway pass in section 4.4).
 5. The two instruments read the same driver quantity.
+6. For these reasons the report computes a driver gap only if both driver readings are at least 34 MB. It computes the exact gap (STADE `peak_exact_*` against JAX `peak_mb`) for every case. The two exact readings are not identical in scope: the STADE reading counts CUDA.jl pool arrays, and the JAX reading counts XLA buffers. Decision D7 chooses the headline.
 
 ## 5. Harness changes H1 to H6
 
@@ -238,7 +245,7 @@ All paths are relative to this folder. The sandbox needs Julia 1.10 or later, Py
    - `python3 tools/cpu_standin.py work/local/all/heat3d_multi_C.jl work/local/standin.jl`
    - `bash tools/test_runner_phases.sh work/local/standin.jl`
    The test runs the three phases on a stand-in for the GPU. It checks that the primal memory phase holds only the inputs and that the adjoint phase holds the inputs, the gradient buffers and the stacks. Then it breaks the runner on purpose. The check must fail. If it passes, the guard is wrong.
-4. Test the whole job chain on the CPU: `bash tools/test_job_chain.sh work/chain`. It takes about 10 min. The script builds a job from stand-in scripts and runs the driver of the payload with a fake `nvidia-smi` and the JAX of the sandbox. It builds the report. Then it runs four failure tests: GPU busy, time budget, run time-out and throttle reason. Each test must give its check or status. In the main report, G6 must fail for the JAX memory runs. The fake `nvidia-smi` reports a constant memory, and G6 must catch that.
+4. Test the whole job chain on the CPU: `bash tools/test_job_chain.sh work/chain`. It takes about 10 min. The script builds a job from stand-in scripts and runs the driver of the payload with a fake `nvidia-smi` and the JAX of the sandbox. It builds the report. Then it runs four failure tests: GPU busy, time budget, run time-out and throttle reason. Each test must give its check or status. In the main report, G6 must fail for the JAX memory runs with inputs of 34 MB or more. The fake `nvidia-smi` reports a constant memory, and G6 must catch that.
 
 ### 6.3 The jobs
 
@@ -278,14 +285,14 @@ The job writes the inputs of one JAX case with `dump_inputs.jl`, runs the phases
 | G3 | JAX gradients are finite (`grad_finite`) | True. | FAIL |
 | G4 | The GPU is free before each run | No compute process, and at most 64 MiB in use. | FAIL |
 | G5 | Number of timed calls (`n`) | 30, 10 or 5 for STADE, 30 for JAX. A smaller value means that the time limit of the loop stopped it. | NOTE |
-| G6 | `mem_inputs_mb` against the size of the inputs | Not below the input size minus 1 MB. | FAIL |
-| G7 | STADE adjoint setup memory (`mem_setup_mb`) against its parts | Inputs plus gradient buffers plus stacks, within the larger of 5 % and 34 MB. | FAIL |
+| G6 | `mem_inputs_mb` against the size of the inputs | Not below the input size minus 1 MB. If the input size is below 34 MB, the allocator chunk can hide the inputs, and the status is NOTE. STADE `live_inputs_mb` must equal the input size within 1 MB. | FAIL (NOTE below 34 MB) |
+| G7 | STADE adjoint setup memory (`mem_setup_mb`) against its parts | Inputs plus gradient buffers plus stacks, within the larger of 5 % and 34 MB. `live_setup_mb` must match the parts within the larger of 1 % and 1 MB. | FAIL |
 | G8 | JAX adjoint peak against JAX primal peak, same case | The adjoint peak is not below the primal peak minus 1 MB. | FAIL |
 | G9 | Clock throttle reasons during the run | No power cap, slowdown, thermal reason or power brake (bits 0x4, 0x8, 0x20, 0x40, 0x80). The idle bit and the application-clocks bit do not count. | FAIL |
 
 A run that has a status other than `ok` (`gpu_busy`, `skipped_budget`, `dump_failed`), a non-zero exit or no result is a FAIL of the kind `RUN`. A JAX out-of-memory error is a NOTE.
 
-Each check was tested by breaking its input on purpose. Each broken input made the check fail. A fake `nvidia-smi` that reports a constant memory made G6 fail, as it must.
+Each check was tested by breaking its input on purpose. Each broken input made the check fail.
 
 Handle an invalid case as follows.
 
@@ -295,20 +302,20 @@ Handle an invalid case as follows.
 
 ## 8. Time budget
 
-The owner reported that the V100 template allows 2 hours. All values below are estimates. The smoke job (D6) gives the real values.
+The owner reported that the V100 template allows 2 hours. All values below are estimates. A STADE run costs about 40 s for the process start and the compile, before any timing. A JAX run costs 1 to 20 s. The first value dominates the memory phases.
 
 | Block | Estimate | Basis |
 |---|---|---|
-| STADE `time` phase | About 60 min | 28 runs. The second timer adds up to 50 % to the timed part. |
+| STADE `time` phase | About 50 min | 28 runs of about 40 s start and compile, plus the timed calls of both timers. |
 | JAX `time` phase | About 11 min | 42 cases. |
-| STADE memory phases | About 30 min | 42 runs of about 45 s (start, compile, 3 calls per size). Not measured. |
-| JAX memory phases | About 15 min | 84 runs, no timing loop. Not measured. |
-| Input dumps for JAX | About 5 min for each job | Not measured. |
-| Total, one job | About 125 min | Above the limit of 120 min. |
-| Time job | About 75 min | |
-| Memory job | About 50 min | |
+| STADE memory phases | About 30 min | 42 runs of about 40 s start and compile. The calls are short. |
+| JAX memory phases | About 8 min | 84 runs, no timing loop. |
+| Input dumps for JAX | About 4 min for each job | |
+| Total, one job | About 105 min | Equal to the budget of the job (limit 120 min minus 15 min). No margin. |
+| Time job | About 65 min | |
+| Memory job | About 40 min | |
 
-One job does not fit the limit. Use two jobs (D2). The job also protects itself: it starts no new run during its last 15 min, and it prints its result before the Slurm limit. If the real values from the smoke job are larger than these estimates, split the memory job by kernel with the option `--kernels`.
+One job has no margin. Use two jobs (D2). The job also protects itself: it starts no new run during its last 15 min, and it prints its result before the Slurm limit. If the real values are larger than these estimates, split a job by kernel with the option `--kernels`.
 
 ## 9. Outputs
 
@@ -329,6 +336,7 @@ Each job returns one JSON line. It holds the host, the Slurm job id, the version
 | `primal`, `adjoint` | Median, q1, q3, min, max, n and `first_call_s`. For STADE: the CUDA-event timer. For JAX: the host clock. |
 | `primal_wall`, `adjoint_wall` | STADE only: the host-clock timer (change H3). |
 | `mem_context_mb`, `mem_inputs_mb`, `mem_setup_mb` | Section 4.2. Memory phases only. |
+| `live_inputs_mb`, `live_setup_mb`, `peak_exact_primal_mb`, `peak_exact_adjoint_mb` | STADE only. The exact readings of section 4.2. |
 | `mem_peak_primal_mb`, `mem_peak_adjoint_mb` | Section 4.2. Each one comes from its own phase. |
 | `input_mb`, `stack_mb`, `grad_mb`, `device_mb_estimate` | The sizes of the arrays. |
 | `alloc_primal_call_mb`, `alloc_adjoint_call_mb` | STADE only. Bytes that one call allocates. |
@@ -342,8 +350,8 @@ The report has these parts.
 1. Runtime of the primal: STADE (headline timer and event timer), JAX, gap.
 2. Runtime of the adjoint: STADE `C` (both timers), STADE best, JAX, both gaps.
 3. The ratio adjoint over primal, for each framework.
-4. Memory of the primal: inputs, STADE `C`, JAX, JAX own peak, gap.
-5. Memory of the adjoint: stacks, STADE `C`, STADE `A`, JAX, JAX own peak, both gaps.
+4. Memory of the primal: inputs, exact readings and gap, driver readings and gap.
+5. Memory of the adjoint: stacks, exact readings and gaps for `C` and `A`, driver readings and gap.
 6. A summary: the geometric mean of each gap, and the count of cases where STADE is slower.
 7. The list of failed checks and notes.
 8. The limits of section 10.
@@ -368,11 +376,12 @@ Each decision has a recommendation. The owner decides.
 | Id | Decision | Recommendation | Reason |
 |---|---|---|---|
 | D1 | Headline timer | Use the host clock with a device synchronization for both frameworks. Report the STADE CUDA-event time as a second column. | The host clock measures the same thing in both frameworks. The JAX timer includes the host launch time. The STADE event timer does not. The second column shows how much of a small case is launch time. This needs change H3. |
-| D2 | One job or two | Use two jobs. Run the `time` phases first (about 75 min). Run the memory phases second (about 50 min). | The estimate for one job is about 125 min, and the limit is 120 min. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
+| D2 | One job or two | Use two jobs. Run the `time` phases first (about 65 min). Run the memory phases second (about 40 min). | The estimate for one job is about 105 min, and the budget of a job is 105 min. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
 | D3 | Phase split | Accept it. | The primal memory reading is not valid without it (section 4.3). The cost is about 45 min of job time. |
 | D4 | STADE config `A` for the adjoint memory | Measure `A` and `C`. Measure the primal memory with `C` only. | Config `A` is the setting that targets memory. The comparison with JAX is incomplete without it. The cost is 14 more STADE runs. Config `A` does not change the primal code. |
 | D5 | Scope of JAX styles | Keep `jit` only in this benchmark. | STADE runs with `checkpoint = false`. A `jax.checkpoint` or `lax.scan` variant is fair only against STADE with `checkpoint = true`. That is a separate study with its own cases. Do it as a follow-up if a reviewer asks. |
 | D6 | Launch approval | Approve in two steps. First, run a smoke job on the V100: one kernel (for example `heat3d_step`), all phases, both frameworks, and one repeated `time` phase. Then approve the full launch. | The smoke job checks G1 to G9. It measures the real duration of a memory run. It confirms the primal-memory fix. The repeated phase checks the 5 % noise limit, which is a working value. |
+| D7 | Headline for memory | Use the exact gap (STADE `peak_exact_*` against JAX `peak_mb`) as the headline. Report the driver gap as the second reading. | The driver readings are rounded up by the allocators and hold one-time library memory, so they cannot resolve small cases. The driver reading shows what `nvidia-smi` shows to a user, and it is the right reading for large cases. The exact readings differ in scope (CUDA.jl pool arrays against XLA buffers). |
 
 Do not launch the full benchmark until the owner approves it.
 

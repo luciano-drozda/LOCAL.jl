@@ -2,7 +2,7 @@
 Usage: python3 check_phase_results.py TIME.json MEM_PRIMAL.json MEM_ADJOINT.json
 On the stand-in the device memory is the exact sum of the registered arrays, so the checks are exact:
   time         both timers, no memory field, tiny agrees with the CPU
-  mem_primal   the peak equals the inputs: no gradient buffer and no stack is on the device
+  mem_primal   the live memory equals the inputs, and the peak equals the inputs: no gradient buffer and no stack is on the device
   mem_adjoint  the setup equals inputs + gradient buffers + stacks, the peak is not below the setup, no timing field
 Exit code 0 if all pass, 1 otherwise."""
 import json, sys
@@ -24,11 +24,14 @@ for x in MP["results"]:
     if any(k in x for k in timing): fails.append(f"mem_primal {x['size']}: has a timing field")
     if x["size"] == "tiny": fails.append("mem_primal: a verify size ran")
     if abs(x["mem_inputs_mb"] - x["input_mb"]) > 1e-9: fails.append(f"mem_primal {x['size']}: inputs {x['mem_inputs_mb']} against {x['input_mb']}")
+    if abs(x["live_inputs_mb"] - x["input_mb"]) > 1e-9: fails.append(f"mem_primal {x['size']}: live {x['live_inputs_mb']} against inputs {x['input_mb']}")
     if x["mem_peak_primal_mb"] - x["mem_inputs_mb"] > 1e-9: fails.append(f"mem_primal {x['size']}: peak {x['mem_peak_primal_mb']} is above the inputs {x['mem_inputs_mb']} (adjoint data on the device)")
 for x in MA["results"]:
     if "error" in x: continue
     if any(k in x for k in timing): fails.append(f"mem_adjoint {x['size']}: has a timing field")
     if abs(x["mem_setup_mb"] - x["device_mb_estimate"]) > 1e-9: fails.append(f"mem_adjoint {x['size']}: setup {x['mem_setup_mb']} against parts {x['device_mb_estimate']}")
+    if abs(x["live_setup_mb"] - x["device_mb_estimate"]) > 1e-9: fails.append(f"mem_adjoint {x['size']}: live {x['live_setup_mb']} against parts {x['device_mb_estimate']}")
+    if x["peak_exact_adjoint_mb"] < x["live_setup_mb"] - 1e-9: fails.append(f"mem_adjoint {x['size']}: exact peak below the live setup")
     if x["mem_peak_adjoint_mb"] < x["mem_setup_mb"] - 1e-9: fails.append(f"mem_adjoint {x['size']}: peak below the setup")
 print("FAIL: " + "; ".join(fails) if fails else "PASS")
 sys.exit(1 if fails else 0)

@@ -80,6 +80,12 @@ _nbytes(args) = sum(sizeof(v) for (_, v) in args if v isa AbstractArray; init = 
 # device memory in use, from the driver (cuMemGetInfo): total - free, the same quantity nvidia-smi reports for the whole device
 _used_dev() = ON_DEVICE ? (CUDA.total_memory() - CUDA.free_memory()) / 1e6 : nothing
 _rd(a, b) = (a === nothing || b === nothing) ? nothing : a - b
+_add(a, b) = (a === nothing || b === nothing) ? nothing : a + b
+# bytes of the arrays that are alive in the CUDA.jl pool (exact, no pool chunk rounding)
+function _live_mb()
+    ON_DEVICE || return nothing
+    try return CUDA.used_memory() / 1e6 catch; return nothing end
+end
 function _settle()
     GC.gc(); ON_DEVICE && CUDA.reclaim(); GC.gc(); ON_DEVICE && CUDA.reclaim()
     nothing
@@ -97,7 +103,7 @@ function run_size(label, verify)
     orig = Dict{Symbol,Any}(n => copy(v) for (n, v) in args if v isa AbstractArray)
     dev = Dict{Symbol,Any}(n => (v isa AbstractArray ? _arr(v) : v) for (n, v) in args)
     res["input_mb"] = _nbytes(args) / 1e6
-    if PHASE != "time"; _settle(); res["mem_inputs_mb"] = _rd(_used_dev(), mem0); end
+    if PHASE != "time"; _settle(); res["mem_inputs_mb"] = _rd(_used_dev(), mem0); res["live_inputs_mb"] = _live_mb(); end
     fp = getfield(@__MODULE__, Symbol(NAME * "_" * SUFFIX))
     fb = getfield(@__MODULE__, Symbol(NAME * "_b_" * SUFFIX))
     fi = getfield(@__MODULE__, Symbol("initstacks_" * NAME * "_b_" * SUFFIX))
@@ -112,6 +118,7 @@ function run_size(label, verify)
         for _ in 1:3; reset_p!(); fp(pargs...); end
         _sync(); res["mem_peak_primal_mb"] = _rd(_used_dev(), mem0)
         reset_p!(); _sync(); res["alloc_primal_call_mb"] = _alloc_mb(() -> fp(pargs...))
+        res["peak_exact_primal_mb"] = _add(res["live_inputs_mb"], res["alloc_primal_call_mb"])   # arrays alive + bytes one call allocates
         return res
     end
 
@@ -129,12 +136,14 @@ function run_size(label, verify)
 
     if PHASE == "mem_adjoint"
         _settle(); res["mem_setup_mb"] = _rd(_used_dev(), mem0)   # inputs + gradient buffers + stacks, nothing else live
+        res["live_setup_mb"] = _live_mb()
         reset_a!(); res["first_adjoint_call_s"] = @elapsed (fb(vals...); _sync())
         res["grad_nonzero"] = sum(count(!=(0.0), Array(buf)) for (_, buf) in g)
         _settle()
         for _ in 1:3; reset_a!(); fb(vals...); end
         _sync(); res["mem_peak_adjoint_mb"] = _rd(_used_dev(), mem0)
         reset_a!(); _sync(); res["alloc_adjoint_call_mb"] = _alloc_mb(() -> fb(vals...))
+        res["peak_exact_adjoint_mb"] = _add(res["live_setup_mb"], res["alloc_adjoint_call_mb"])
         return res
     end
 
@@ -210,6 +219,11 @@ _json(x::AbstractVector) = "[" * join((_json(v) for v in x), ",") * "]"
 _json(x::AbstractDict) = "{" * join((_jstr(string(k)) * ":" * _json(v) for (k, v) in x), ",") * "}"
 
 results = Any[]
+# memory phases: one throwaway pass on the first size, so the one-time memory of code modules and libraries is not in the readings
+if PHASE != "time"
+    wl = filter(x -> !x[2], SIZES)
+    isempty(wl) || (try; run_size(first(wl)[1], false); catch; end; _settle())
+end
 # the memory phases skip the verify sizes (the time phase checks them)
 for (label, verify) in (PHASE == "time" ? SIZES : filter(x -> !x[2], SIZES))
     r = try

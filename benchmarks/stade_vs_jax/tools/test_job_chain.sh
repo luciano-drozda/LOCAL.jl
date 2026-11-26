@@ -4,7 +4,7 @@
 # It generates the STADE scripts (first benchmark size only), turns them into CPU stand-in scripts, builds a job, runs the driver of the
 # payload with a fake nvidia-smi and the JAX of this machine, and builds the report. Then it runs four failure tests:
 # GPU busy, time budget, run time-out, throttle reason. Each must produce its check or status.
-# Expected in the report: G6 fails for every JAX memory run, because the fake nvidia-smi reports a constant memory. That proves G6 works.
+# Expected in the report: G6 fails for every JAX memory run with inputs of 34 MB or more, because the fake nvidia-smi reports a constant memory. That proves G6 works.
 # Needs Julia, Python 3 with JAX and NumPy, and `python3 -m venv`. It takes about 10 min.
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; PKG="$(cd "$HERE/.." && pwd)"

@@ -75,17 +75,20 @@ def checks(runs, stade, jax):
                     n = (x.get(f) or {}).get("n")
                     if n not in (30, 10, 5): add("G5", "NOTE", f"{tag}: {f} n = {n}")
             if ph != "time" and x.get("mem_inputs_mb") is not None and x.get("input_mb") is not None and x["mem_inputs_mb"] < x["input_mb"] - 1.0:   # G6
-                add("G6", "FAIL", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
+                add("G6", "FAIL" if x["input_mb"] >= POOL_MIN_MB else "NOTE", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
+            if ph != "time" and x.get("live_inputs_mb") is not None and x.get("input_mb") is not None and abs(x["live_inputs_mb"] - x["input_mb"]) > 1.0:
+                add("G6", "FAIL", f"{tag}: live inputs {x['live_inputs_mb']:.1f} MB against input {x['input_mb']:.1f} MB")
             if ph == "mem_adjoint" and x.get("mem_setup_mb") is not None and x.get("device_mb_estimate") is not None:                           # G7
                 est = x["device_mb_estimate"]
                 if abs(x["mem_setup_mb"] - est) > max(0.05 * est, POOL_MIN_MB): add("G7", "FAIL", f"{tag}: setup {x['mem_setup_mb']:.1f} MB, parts {est:.1f} MB")
+                if x.get("live_setup_mb") is not None and abs(x["live_setup_mb"] - est) > max(0.01 * est, 1.0): add("G7", "FAIL", f"{tag}: live setup {x['live_setup_mb']:.1f} MB, parts {est:.1f} MB")
     for (k, s, ph), x in jax.items():
         tag = f"JAX {k} {s} {ph}"
         if not x.get("ok"): add("RUN", "FAIL" if "RESOURCE_EXHAUSTED" not in str(x.get("error")) else "NOTE", f"{tag}: {str(x.get('error'))[:120]}"); continue
         if x.get("grad_finite") is False: add("G3", "FAIL", f"{tag}: gradients not finite")                                                      # G3
         if ph == "time" and (x.get("primal") or {}).get("n") != 30: add("G5", "NOTE", f"{tag}: n = {(x.get('primal') or {}).get('n')}")
         if ph != "time" and x.get("mem_inputs_mb") is not None and x.get("input_mb") is not None and x["mem_inputs_mb"] < x["input_mb"] - 1.0:
-            add("G6", "FAIL", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
+            add("G6", "FAIL" if x["input_mb"] >= POOL_MIN_MB else "NOTE", f"{tag}: mem_inputs {x['mem_inputs_mb']:.1f} MB below input {x['input_mb']:.1f} MB")
         if ph == "mem_adjoint":                                                                                                                  # G8
             p = jax.get((k, s, "mem_primal"))
             if p and p.get("ok") and x.get("mem_peak_adjoint_mb") is not None and p.get("mem_peak_primal_mb") is not None \
@@ -120,6 +123,7 @@ def build_rows(stade, jax, head):
             if jt and jt.get("ok"): r["jp"] = med_ms(jt, "primal"); r["ja"] = med_ms(jt, "adjoint")
             mp = (stade.get(("C", k, "mem_primal")) or {}).get(sl); ma = (stade.get(("C", k, "mem_adjoint")) or {}).get(sl); mb = (stade.get(("A", k, "mem_adjoint")) or {}).get(sl)
             r["spk_p"] = (mp or {}).get("mem_peak_primal_mb"); r["spk_d"] = (ma or {}).get("mem_peak_adjoint_mb"); r["spk_b"] = (mb or {}).get("mem_peak_adjoint_mb")
+            r["spe_p"] = (mp or {}).get("peak_exact_primal_mb"); r["spe_d"] = (ma or {}).get("peak_exact_adjoint_mb"); r["spe_b"] = (mb or {}).get("peak_exact_adjoint_mb")
             r["sstack"] = (ma or {}).get("stack_mb"); r["sgrad"] = (ma or {}).get("grad_mb"); r["sin"] = (ma or mp or {}).get("input_mb")
             jmp = jax.get((k, s, "mem_primal")); jma = jax.get((k, s, "mem_adjoint"))
             if jmp and jmp.get("ok"): r["jpk_p"] = jmp.get("mem_peak_primal_mb"); r["jown_p"] = jmp.get("peak_mb")
@@ -175,28 +179,37 @@ def main():
         if r.get("ad") and r.get("pd") and r.get("ja") and r.get("jp"):
             P(f"| {r['k']} | {r['s']} | {r['ad']/r['pd']:.2f} | {r['ja']/r['jp']:.2f} |")
     P("\n## 4. Memory of the primal\n")
-    P("Readings come from the driver, above the baseline of the same process. Only the inputs are on the device. A STADE value below about 34 MB shows the pool minimum chunk: no gap is computed. `JAX own` is the XLA live-bytes peak.\n")
-    P("| kernel | size | inputs MB | STADE C MB | JAX MB | JAX own MB | gap |\n|---|---|---:|---:|---:|---:|---:|")
+    P("Only the inputs are on the device. Two readings. **Exact**: STADE = arrays alive in the pool + bytes that one call allocates; JAX = XLA live-bytes peak (`JAX own`). **Driver**: device memory in use above the baseline, as nvidia-smi shows it. The driver reading is rounded up by the allocators (the CUDA.jl pool chunk is 32 MiB = 33.6 MB, and the XLA pool grows in regions). It also holds one-time library memory. Use the exact gap for small cases. A driver gap is computed only if both readings are at least 34 MB.\n")
+    P("| kernel | size | inputs MB | STADE exact MB | JAX own MB | gap exact | STADE driver MB | JAX driver MB | gap driver |\n|---|---|---:|---:|---:|---:|---:|---:|---:|")
     mp = [r for r in rows if r.get("spk_p") is not None or r.get("jpk_p") is not None]
-    sigp = []
+    sigp, sigpe = [], []
     for r in mp:
-        small = r.get("spk_p") is not None and r["spk_p"] < POOL_MIN_MB
-        gap = None if small else ratio(r.get("spk_p"), r.get("jpk_p"))
+        ge = ratio(r.get("spe_p"), r.get("jown_p"))
+        ok = r.get("spk_p") is not None and r.get("jpk_p") is not None and r["spk_p"] >= POOL_MIN_MB and r["jpk_p"] >= POOL_MIN_MB
+        gap = ratio(r.get("spk_p"), r.get("jpk_p")) if ok else None
         if gap: sigp.append(gap)
-        P(f"| {r['k']} | {r['s']} | {g(r.get('sin'), 1)} | {g(r.get('spk_p'), 0)}{' (pool min)' if small else ''} | {g(r.get('jpk_p'), 0)} | {g(r.get('jown_p'), 0)} | {g(gap, 2)} |")
-    P(f"\nGeometric-mean primal memory gap over {len(sigp)} cases above the pool minimum: **{g(geo(sigp), 2)}**.\n" if sigp else "\nNo primal memory result.\n")
+        if ge: sigpe.append(ge)
+        P(f"| {r['k']} | {r['s']} | {g(r.get('sin'), 1)} | {g(r.get('spe_p'), 1)} | {g(r.get('jown_p'), 1)} | {g(ge, 2)} | {g(r.get('spk_p'), 0)} | {g(r.get('jpk_p'), 0)} | {g(gap, 2)} |")
+    P(f"\nGeometric-mean primal memory gap: exact **{g(geo(sigpe), 2)}** over {len(sigpe)} cases, driver **{g(geo(sigp), 2)}** over {len(sigp)} cases.\n")
     P("## 5. Memory of the adjoint\n")
-    P("Only the inputs, the gradient buffers and the stacks (STADE) or the cotangents (JAX) are on the device.\n")
-    P("| kernel | size | STADE stacks MB | STADE C MB | STADE A MB | JAX MB | JAX own MB | gap C | gap A |\n|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    P("Only the inputs, the gradient buffers and the stacks (STADE) or the cotangents (JAX) are on the device. Exact and driver readings as in section 4.\n")
+    P("| kernel | size | STADE stacks MB | STADE C exact MB | STADE A exact MB | JAX own MB | gap C exact | gap A exact | STADE C driver MB | STADE A driver MB | JAX driver MB | gap C driver |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     ma = [r for r in rows if r.get("spk_d") is not None or r.get("jpk_a") is not None]
-    sig = [r for r in ma if r.get("spk_d") and r.get("jpk_a") and r["spk_d"] >= POOL_MIN_MB]
+    sig, sige, sigeb = [], [], []
     for r in ma:
-        P(f"| {r['k']} | {r['s']} | {g(r.get('sstack'), 0)} | {g(r.get('spk_d'), 0)} | {g(r.get('spk_b'), 0)} | {g(r.get('jpk_a'), 0)} | {g(r.get('jown_a'), 0)} | {g(ratio(r.get('spk_d'), r.get('jpk_a')), 2)} | {g(ratio(r.get('spk_b'), r.get('jpk_a')), 2)} |")
-    P(f"\nGeometric-mean adjoint memory gap over the {len(sig)} cases with a STADE C peak at or above 34 MB: C **{g(geo([ratio(r['spk_d'], r['jpk_a']) for r in sig]), 2)}**, A **{g(geo([ratio(r['spk_b'], r['jpk_a']) for r in sig if r.get('spk_b')]), 2)}**.\n")
+        gce, gae = ratio(r.get("spe_d"), r.get("jown_a")), ratio(r.get("spe_b"), r.get("jown_a"))
+        ok = r.get("spk_d") is not None and r.get("jpk_a") is not None and r["spk_d"] >= POOL_MIN_MB and r["jpk_a"] >= POOL_MIN_MB
+        gd_ = ratio(r.get("spk_d"), r.get("jpk_a")) if ok else None
+        if gd_: sig.append(gd_)
+        if gce: sige.append(gce)
+        if gae: sigeb.append(gae)
+        P(f"| {r['k']} | {r['s']} | {g(r.get('sstack'), 1)} | {g(r.get('spe_d'), 1)} | {g(r.get('spe_b'), 1)} | {g(r.get('jown_a'), 1)} | {g(gce, 2)} | {g(gae, 2)} | {g(r.get('spk_d'), 0)} | {g(r.get('spk_b'), 0)} | {g(r.get('jpk_a'), 0)} | {g(gd_, 2)} |")
+    P(f"\nGeometric-mean adjoint memory gap: exact C **{g(geo(sige), 2)}**, exact A **{g(geo(sigeb), 2)}** over {len(sige)} cases; driver C **{g(geo(sig), 2)}** over {len(sig)} cases.\n")
     P("## 6. Summary\n")
     P(f"- Primal runtime: gap {g(geo(gp))}, STADE slower in {sum(x > 1 for x in gp)} of {len(gp)} cases.")
     P(f"- Adjoint runtime: gap C {g(geo(gd))}, best {g(geo(gb))}; STADE C slower in {sum(x > 1 for x in gd)} of {len(gd)} cases.")
-    P(f"- Primal memory: gap {g(geo(sigp), 2)} over {len(sigp)} cases. Adjoint memory: gap C {g(geo([ratio(r['spk_d'], r['jpk_a']) for r in sig]), 2)} over {len(sig)} cases.\n")
+    P(f"- Primal memory: exact gap {g(geo(sigpe), 2)} over {len(sigpe)} cases; driver gap {g(geo(sigp), 2)} over {len(sigp)} cases.")
+    P(f"- Adjoint memory: exact gap C {g(geo(sige), 2)}, A {g(geo(sigeb), 2)} over {len(sige)} cases; driver gap C {g(geo(sig), 2)} over {len(sig)} cases.\n")
     P("## 7. Checks and invalid cases\n")
     fails = [c for c in chk if c[1] == "FAIL"]; notes = [c for c in chk if c[1] == "NOTE"]
     P(f"{len(fails)} failed checks, {len(notes)} notes.\n")
@@ -205,7 +218,7 @@ def main():
     P("\n## 8. Limits\n")
     for t in ("One GPU model (V100, 16 GB), float64, batch size one. JAX appears as jit only.",
               "The two runtime timers differ. The caches are not flushed, and STADE copies its inputs between calls.",
-              "JAX memory comes from nvidia-smi and the JAX pool never shrinks. STADE readings below about 34 MB show the pool minimum.",
+              "The driver readings are rounded up by the allocators and hold one-time library memory. The exact readings are not. JAX driver readings come from nvidia-smi, and the JAX pool never shrinks.",
               "One job gives one run. The noise limit of 5 % is a working value. The STADE checkpoint option is off."):
         P(f"- {t}")
     open(os.path.join(o.out, "REPORT.md"), "w").write("\n".join(out) + "\n")
