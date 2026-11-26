@@ -353,12 +353,18 @@ State these limits in the report.
 
 ## 11. Decisions for the owner
 
-1. **Headline timer.** Use the STADE events and the JAX host clock (the pairing of the harness of this folder). Or use the host clock for both. This document shows both. It needs one choice for the headline.
-2. **One job or two.** Section 8 estimates 97 min for one job. Accept the risk, or split the job after the short test.
-3. **Phase split.** Accept the separate memory runs (section 4.3). They cost about 45 min. They remove the shared allocation in the primal reading.
-4. **STADE config `A` for the adjoint memory.** The adjoint memory of `A` and `C` can differ. This document measures both.
-5. **Scope of JAX styles.** Keep `jit` only, or add other JAX styles.
-6. **Launch approval.** Do not launch until the owner approves.
+Each decision has a recommendation. The owner decides.
+
+| Id | Decision | Recommendation | Reason |
+|---|---|---|---|
+| D1 | Headline timer | Use the host clock with a device synchronization for both frameworks. Report the STADE CUDA-event time as a second column. | The host clock measures the same thing in both frameworks. The JAX timer includes the host launch time. The STADE event timer does not. The second column shows how much of a small case is launch time. This needs change H3. |
+| D2 | One job or two | Use two jobs. Run the `time` phases first (about 52 min). Run the memory phases second (about 45 min). | The memory phases are not measured. The estimate for one job is 97 min, and the limit is 120 min. A time-out in one job loses the timing data too. Each run is its own process, so a split does not change what is measured. The cost is a second queue wait. Use one job only if the smoke job (D6) shows that the total stays well below 105 min. |
+| D3 | Phase split | Accept it. | The primal memory reading is not valid without it (section 4.3). The cost is about 45 min of job time. |
+| D4 | STADE config `A` for the adjoint memory | Measure `A` and `C`. Measure the primal memory with `C` only. | Config `A` is the setting that targets memory. The comparison with JAX is incomplete without it. The cost is 14 more STADE runs. Config `A` does not change the primal code. |
+| D5 | Scope of JAX styles | Keep `jit` only in this benchmark. | STADE runs with `checkpoint = false`. A `jax.checkpoint` or `lax.scan` variant is fair only against STADE with `checkpoint = true`. That is a separate study with its own cases. Do it as a follow-up if a reviewer asks. |
+| D6 | Launch approval | Approve in two steps. First, run a smoke job on the V100: one kernel (for example `heat3d_step`), all phases, both frameworks, and one repeated `time` phase. Then approve the full launch. | The smoke job checks G1 to G9. It measures the real duration of a memory run. It confirms the primal-memory fix. The repeated phase checks the 5 % noise limit, which is a working value. |
+
+Do not launch the full benchmark until the owner approves it.
 
 ## Appendix A. Files of this folder
 
