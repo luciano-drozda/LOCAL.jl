@@ -368,6 +368,7 @@ State these limits in the report.
 6. The JAX run of `euler2d_step` at `16e6` can run out of memory. The 16 GB card limits it.
 7. The result of one job comes from one run. The noise limit of 5 % is a working value.
 8. The STADE checkpointing option (`checkpoint = true`) is not part of this benchmark. It is off.
+9. Cases with a call time below about 100 µs (the small sizes of the stencil kernels) are dominated by launch overhead. The GPU idles between calls, and its clock can fall. The gaps of these cases show launch cost more than GPU speed. Do not read them as GPU speed.
 
 ## 11. Decisions for the owner
 
