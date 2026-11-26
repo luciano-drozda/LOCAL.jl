@@ -59,7 +59,8 @@
 - [x] ✅ [v0.4.0] Add support to `:while` statement\
   Fixed in v0.4.3: activity did not propagate into a `while` body, so a body local was treated as passive at every use and the tangent came out silently zero. Any kernel whose `while` body assigns a scalar that then feeds an array must be regenerated.\
   The forward sweep records each loop's trip count and the backward sweep replays it as a `for`. The forward sweep still contains the `while`, since it has to run the loop to learn the count. The gradient is therefore taken at a fixed trip count, which is correct almost everywhere and wrong where the count jumps. A `while` runs on the host and needs `keep_push_pop = true`, since no launch can size itself around an unknown trip count and that mode has no closed-form stack size to offer; loops inside the body still offload. A condition that assigns, or that reads nothing the body writes, is refused at parse time.
-- [ ] Add support to efficient differentiation of fixed-point loops 
+- [x] ✅ [v0.6.0] Add support to efficient differentiation of fixed-point loops\
+  The solve loop gets a fixed-point reverse in the tangent, the adjoint and the HVP, and a sequential loop that holds tape (a time loop) can be checkpointed with `checkpoint = true` (`stade_adjoint`, `stade_hvp`): the tape shrinks to about one segment, for one more forward run of each step.
 - [ ] Benchmark against mainstream frameworks (e.g., JAX, PyTorch)
 
 ### Acknowledgements
