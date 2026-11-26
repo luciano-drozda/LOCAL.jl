@@ -2,7 +2,8 @@
 # Checks the GPU split gate against a write index that two iterations can share (v0.5.56). CPU only, text of the generated CUDA and JACC code.
 # An array written through an index built from the loop variable by `mod` alone (`u[mod(3t, n) + 1]`) has colliding iterations once the trip count
 # passes the modulus. Equal read and write indices do not help: the loop must not become a parallel kernel, except an accumulate-only array, which
-# an atomic add serves. A `div` beside the `mod` (the digits of a fused nest), a dimension that is the loop variable, and an index read from an
+# an atomic add serves. A lone `mod` over a loop that visits at most as many consecutive values as the modulus (`for i = 1:n` and `mod(i, n)`, the periodic roll,
+# and its reversed sweep in the adjoint) is one-to-one and stays parallel. A `div` beside the `mod` (the digits of a fused nest), a dimension that is the loop variable, and an index read from an
 # array (a scatter-accumulate) keep their parallel kernel.
 #   1. REFUSED:  an in-place update, and a plain write, through a lone `mod` index: no parallel kernel holds the `mod`, on both backends.
 #   2. KEPT:     the accumulation, the fused nest, the loop-variable dimension, the gather: a parallel kernel holds the write.
@@ -13,7 +14,7 @@
 isdefined(Main, :STADE) || include(joinpath(@__DIR__, "..", "src", "STADE.jl"))
 using Logging
 
-# (name, source, expected): :refused or :kept
+# (name, source, expected[, parallel kernels wanted[, expected when checkpointed]]): :refused or :kept
 function mcl_cases()
     return Any[
         ("mc_rmw", """
@@ -40,6 +41,79 @@ function mc_branch(u, a, out, n, nt, lim)
     s = 0.0
     for i = 1:n
         s = s + u[i] * u[i]
+    end
+    out[1] = s
+    return nothing
+end""", :refused),
+        ("mc_roll", """
+function mc_roll(y, x, out, n)
+    for i = 1:n
+        y[mod(i, n) + 1] = x[i] * x[i]
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
+    end
+    out[1] = s
+    return nothing
+end""", :kept, 2),
+        ("mc_roll_shift", """
+function mc_roll_shift(y, x, out, n)
+    for i = 1:n
+        j = mod(i - 1, n) + 1
+        y[j] = y[j] * x[i] + sin(y[j])
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
+    end
+    out[1] = s
+    return nothing
+end""", :kept, 2, :refused),
+        ("mc_roll_long", """
+function mc_roll_long(y, x, out, n, nt)
+    for i = 1:nt
+        y[mod(i, n) + 1] = x[i] * x[i]
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
+    end
+    out[1] = s
+    return nothing
+end""", :refused),
+        ("mc_roll_lit_ok", """
+function mc_roll_lit_ok(y, x, out, n)
+    for i = 1:8
+        y[mod(i, 10) + 1] = x[i] * x[i]
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
+    end
+    out[1] = s
+    return nothing
+end""", :kept, 2),
+        ("mc_roll_lit_long", """
+function mc_roll_lit_long(y, x, out, n)
+    for i = 1:12
+        y[mod(i, 10) + 1] = x[i] * x[i]
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
+    end
+    out[1] = s
+    return nothing
+end""", :refused),
+        ("mc_roll_stride", """
+function mc_roll_stride(y, x, out, n)
+    for i = 1:n
+        y[mod(2 * i, n) + 1] = x[i] * x[i]
+    end
+    s = 0.0
+    for k = 1:n
+        s = s + y[k] * y[k]
     end
     out[1] = s
     return nothing
@@ -126,8 +200,10 @@ end
 function validate_mod_collide(; verbose::Bool = true)
     checks = 0; bad = 0
     say(ok, msg) = (checks += 1; ok || (bad += 1; verbose && println("NOT OK ", msg)))
-    for (name, src, expect) in mcl_cases()
+    for case in mcl_cases()
+        (name, src, expect0) = case[1:3]; kmin = length(case) >= 4 ? case[4] : 1
       for ckpt in (false, true)
+        expect = ckpt && length(case) >= 5 ? case[5] : expect0   # a strip-mined segment has a run-time length: no proof, stays sequential
         r = with_logger(NullLogger()) do
             ckpt ? STADE.agen_ckpt_adjoint(Meta.parse(src); min_trip = 0) : STADE.stade_adjoint(Meta.parse(src); keep_push_pop = false)
         end
@@ -137,11 +213,11 @@ function validate_mod_collide(; verbose::Bool = true)
         for (label, plan, prefix) in (("cuda", cu, "cuda_kernel_"), ("jacc", ja, "jacc_kernel_"))
             label = ckpt ? label * " checkpointed" : label
             ks = mcl_parallel_kernels(plan, prefix)
-            has = any(k -> occursin("mod(", k) || occursin("idx[", k), ks)
+            nk = count(k -> occursin("mod(", k) || occursin("idx[", k), ks)
             if expect === :refused
                 say(!any(k -> occursin("mod(", k), ks), "$name $label: a parallel kernel holds the colliding `mod` index")
             else
-                say(has, "$name $label: no parallel kernel holds the write (the guard refused a loop it should keep)")
+                say(nk >= kmin, "$name $label: $nk parallel kernel(s) hold the write, $kmin expected (the guard refused a loop it should keep)")
             end
         end
       end
@@ -150,20 +226,27 @@ function validate_mod_collide(; verbose::Bool = true)
     return bad
 end
 
-# the guard disabled: the refused cases must fail
+# a guard disabled, or the one-to-one proof made always true: the refused cases must fail
 function validate_mod_collide_sabotage(; verbose::Bool = true)
     here = abspath(@__FILE__)
     src = read(joinpath(@__DIR__, "..", "src", "STADE.jl"), String)
-    anchor = "        collide = cgen_writes_collide_by_mod(widxs, merge(summary.defs, cgen_nested_scalar_defs(body)), loopvar)\n"
-    count(anchor, src) == 1 || (verbose && println("sabotage anchor not found"); return 1)
-    dir = mktempdir()
-    mkpath(joinpath(dir, "src")); mkpath(joinpath(dir, "test"))
-    write(joinpath(dir, "src", "STADE.jl"), replace(src, anchor => "        collide = false\n"))
-    cp(here, joinpath(dir, "test", "validate_mod_collide.jl"))
-    out = read(ignorestatus(`$(Base.julia_cmd()) --startup-file=no $(joinpath(dir, "test", "validate_mod_collide.jl"))`), String)
-    failed = occursin(r"FAILED", out)
-    verbose && println(failed ? "sabotage caught: the guard disabled fails the validator" : "SABOTAGE NOT CAUGHT")
-    return failed ? 0 : 1
+    bad = 0
+    sabs = Any[("the guard disabled", "        collide = cgen_writes_collide_by_mod(widxs, merge(summary.defs, cgen_nested_scalar_defs(body)), loopvar, bounds)\n", "        collide = false\n"),
+               ("the proof always true", "    bounds === nothing && return false\n    while e isa Expr && e.head == :call && e.args[1] in (:+, :-) && length(e.args) == 3\n", "    return true\n    while e isa Expr && e.head == :call && e.args[1] in (:+, :-) && length(e.args) == 3\n"),
+               ("the trip count not checked", "        return m >= 1 && abs(hi - lo) + 1 <= m\n", "        return true\n"),
+               ("the modulus not compared", "        return lo isa Integer && lo >= 1 && hi == m\n", "        return lo isa Integer && lo >= 1\n")]
+    for (label, anchor, repl) in sabs
+        count(anchor, src) == 1 || (verbose && println("sabotage anchor not found: ", label); bad += 1; continue)
+        dir = mktempdir()
+        mkpath(joinpath(dir, "src")); mkpath(joinpath(dir, "test"))
+        write(joinpath(dir, "src", "STADE.jl"), replace(src, anchor => repl))
+        cp(here, joinpath(dir, "test", "validate_mod_collide.jl"))
+        out = read(ignorestatus(`$(Base.julia_cmd()) --startup-file=no $(joinpath(dir, "test", "validate_mod_collide.jl"))`), String)
+        failed = occursin(r"FAILED", out)
+        verbose && println(failed ? "sabotage caught: $label fails the validator" : "SABOTAGE NOT CAUGHT: $label")
+        failed || (bad += 1)
+    end
+    return bad
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

@@ -1873,9 +1873,19 @@ substituted (`cgen_nested_scalar_defs` also reads definitions inside branches, a
 or `rem` of an expression with the loop variable, and holds no `div`, no array read, and no dimension that is the loop variable itself. The array
 then passes only if it is accumulate-only (an atomic add serves it); consume-only is not enough, because the read-then-overwrite races. A `div`
 beside the `mod` is the digit decomposition of a fused nest and keeps the decoded-digit proof. An index read from an array is the scatter contract
-above and is not touched. The loop stays sequential (the serial track). Known cost: a periodic roll `y[mod(i, n) + 1] = x[i]` over `i = 1:n` is
-one-to-one but is not proven so, and stays sequential. `test/validate_mod_collide.jl` holds the cases and a sabotage run; `ck_index` of
-`ckpt_shapes.jl` is the V100 witness (plain and checkpointed, adjoint and HVP).
+above and is not touched. The loop stays sequential (the serial track).
+
+**The one-to-one proof (v0.6.1).** A periodic roll `y[mod(i, n) + 1] = x[i]` over `i = 1:n` has no collision: `m` consecutive integers have distinct
+residues modulo `m`. `cgen_mod_one_to_one` proves it for the shape `mod(X, m) ± literals` with `X` the loop variable plus or minus integer literals
+(coefficient one; `mod(2i, n)` stays refused), after substituting the scalar definitions. The proof holds when the trip count cannot pass the modulus:
+literal bounds with `|hi - lo| + 1 <= m`, or `lo >= 1` literal with `hi` the same expression as `m` (step 1), or the mirror `hi >= 1`, `lo == m` for
+the reversed sweep `n:-1:1` of the adjoint. A longer loop (`for i = 1:nt`), a bound that is not the modulus, and a strip-mined segment (its length `ck`
+is a run-time value, so nothing proves it is at most `n`) are not proven, and stay sequential. The gate passes `bounds = (lo, step, hi)` of the loop to
+`cgen_writes_collide_by_mod`. `test/validate_mod_collide.jl` holds the cases (kept: the roll, shifted and in place, literal short trip; refused: long
+trip, literal long trip, stride two, checkpointed in place) and four sabotage runs (guard off, proof always true, trip count unchecked, modulus not
+compared). `ck_index` and `ck_roll` of `ckpt_shapes.jl` are the V100 witnesses (plain and checkpointed, adjoint and HVP): `ck_index` must stay
+sequential, `ck_roll` runs as parallel kernels. The device text of every corpus kernel is byte-identical before and after (2442 sections), so no corpus
+loop changed; the proof only matters to a kernel written in this shape.
 
 ### Two refusals the trust needs
 

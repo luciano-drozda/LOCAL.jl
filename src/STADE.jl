@@ -9887,13 +9887,46 @@ end
 # A write index built from the loop variable by `mod`/`rem`, with no `div` beside it (the digits of a fused nest come in pairs), no array read
 # and no dimension that is the loop variable itself: two iterations reach one element once the trip count passes the modulus.
 # Equal read and write indices then do not make the iterations independent, so such an array must be accumulate-only.
-function cgen_writes_collide_by_mod(widxs, defs::Dict{Symbol,Any}, loopvar::Symbol)
+function cgen_writes_collide_by_mod(widxs, defs::Dict{Symbol,Any}, loopvar::Symbol, bounds = nothing)
     for w in widxs
         ex = Any[cgen_expand_scalar_defs(e, defs, 8) for e in w]
         any(e -> e === loopvar, ex) && continue
+        any(e -> cgen_mod_one_to_one(e, loopvar, bounds, defs), ex) && continue
         info = (mod = Ref(false), dv = Ref(false), ref = Ref(false), lv = Ref(false))
         for e in ex; cgen_mod_scan!(e, loopvar, info); end
         info.mod[] && info.lv[] && !info.dv[] && !info.ref[] && return true
+    end
+    return false
+end
+
+# `mod(loopvar + c, m) + k` (c and k integer literals) is one-to-one over a loop that visits at most m consecutive values, since m consecutive
+# integers have distinct residues mod m. The loop is `lo:hi` with an integer `lo >= 1` and `hi` the modulus, or `hi:-1:lo` with `hi` the
+# modulus and an integer `lo >= 1` (the reversed sweep), or three integer literals with a trip count within the modulus.
+function cgen_mod_one_to_one(e, loopvar::Symbol, bounds, defs::Dict{Symbol,Any})
+    bounds === nothing && return false
+    while e isa Expr && e.head == :call && e.args[1] in (:+, :-) && length(e.args) == 3
+        if e.args[1] == :+ && e.args[2] isa Integer; e = e.args[3]
+        elseif e.args[3] isa Integer; e = e.args[2]
+        else break
+        end
+    end
+    e isa Expr && e.head == :call && e.args[1] === :mod && length(e.args) == 3 || return false
+    x = e.args[2]; m = e.args[3]
+    while x isa Expr && x.head == :call && x.args[1] in (:+, :-) && length(x.args) == 3
+        if x.args[1] == :+ && x.args[2] isa Integer; x = x.args[3]
+        elseif x.args[3] isa Integer; x = x.args[2]
+        else break
+        end
+    end
+    x === loopvar || return false
+    (lo, step, hi) = bounds
+    m = cgen_expand_scalar_defs(m, defs, 8)   # the header bounds run before the body, so only the modulus reads the body's scalars
+    if lo isa Integer && hi isa Integer && m isa Integer && step in (1, -1)
+        return m >= 1 && abs(hi - lo) + 1 <= m
+    elseif step == 1
+        return lo isa Integer && lo >= 1 && hi == m
+    elseif step == -1
+        return hi isa Integer && hi >= 1 && lo == m
     end
     return false
 end
@@ -9962,7 +9995,7 @@ function cgen_split_loop_gate(body::Vector{NamedTuple}, loopvar::Symbol, known_c
     idiom = false
     for (arr, widxs) in summary.writes
         ridxs = get(summary.reads, arr, Any[])
-        collide = cgen_writes_collide_by_mod(widxs, merge(summary.defs, cgen_nested_scalar_defs(body)), loopvar)
+        collide = cgen_writes_collide_by_mod(widxs, merge(summary.defs, cgen_nested_scalar_defs(body)), loopvar, bounds)
         !collide && cgen_array_ok_strict(body, arr, widxs, ridxs, loopvar, summary.defs) && continue
         cgen_array_sliced_by_decoded_loopvar(widxs, ridxs, body, summary.defs, loopvar, bounds, protect) && continue
         if arr isa Symbol && (collide ? cgen_array_accumulate_only(body, arr) : cgen_array_ok_idiom(body, arr))

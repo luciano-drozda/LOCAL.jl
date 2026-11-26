@@ -33,11 +33,11 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 
 | file | what it checks |
 |---|---|
-| `validate_checkpoint.jl` | 21 kernel shapes, 0 to 10 steps, `ck` from 1 to above `nt`, bit for bit against the adjoint without checkpoints; sabotage cases |
+| `validate_checkpoint.jl` | 22 kernel shapes, 0 to 10 steps, `ck` from 1 to above `nt`, bit for bit against the adjoint without checkpoints; sabotage cases |
 | `validate_checkpoint_sets.jl` | the checkpoint set and the scratch rule |
 | `validate_checkpoint_fp.jl` | regions with solve loops, 144 checks |
 | `validate_checkpoint_corpus.jl` | forced region on every sequential loop of every corpus (139 kernels); `--device`, `--hvp`, `--zero` |
-| `validate_checkpoint_hvp.jl` | HVP, 340 checks, three seedings, 6 sabotage cases |
+| `validate_checkpoint_hvp.jl` | HVP, 344 checks, three seedings, 6 sabotage cases |
 | `validate_checkpoint_gpu_cpu.jl` | CUDA and JACC stand-ins against the CPU; `--hvp`, `--sabotage` |
 | `measure_checkpoint_device.jl` | stack size and time on a device |
 | `dump_generated_text.jl` | text of every corpus adjoint and HVP, for the byte-identity check |
@@ -52,11 +52,12 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 - Flag off: the generated adjoint and HVP are byte-identical to v0.5.46 for every corpus kernel (`dump_generated_text.jl`).
 - HVP memory on a V100 (v0.5.56, `measure_checkpoint_device.jl`, `phc_heat_steps`, 10^6 points, 100 steps; stack MiB from `initstacks` + MiB allocated inside the HVP for the shadow tape; CUDA and JACC agree): no checkpoints 1526 + 1533 (3.0 GiB), time 2.9 s; `ck` = 5: 412 + 76; `ck` = 10: 336 + 153 (0.5 GiB), time 4.0 s (1.41 times); `ck` = 20: 412 + 305; `ck` = 50: 824 + 763. 2500 steps: `ck` = 50: 1556 + 763 MiB, `ck` = 100: 1938 + 1526 MiB (the plain tape would not fit). Results bit for bit equal to the HVP without checkpoints (err 0.0).
 - v0.5.57: the GPU split gate keeps a loop sequential when it writes through a lone `mod` index (item 5.1 below, now fixed). `ck_index` is back in the V100 validator: adjoint and HVP 8 of 8 on CUDA and JACC (err 1e-16).
+- v0.6.1: the periodic roll offloads again (`cgen_mod_one_to_one`). Shape `ck_roll` added to `ckpt_shapes.jl` (22 shapes). V100 (Slurm 2099469 adjoint, HVP right after): `ck_roll` and `ck_index` 16 of 16 each on CUDA and JACC (err 1e-16). On the CPU stand-ins, the roll kernel count in the device text goes from 0 to 2 (plain) and 3 (checkpointed); the device text of every corpus kernel is byte-identical to v0.6.0 (2442 sections); `validate_offload` 998 of 998 (its "improved" notes are the same on v0.6.0). A checkpointed segment with a lone `mod` stays sequential (`ck` is a run-time value).
 - Full CPU regression on the rome partition (RALL55): see section 6.
 
 ## 5. Known limits and findings
 
-1. **GPU stage and non-injective indices (pre-existing, fixed in v0.5.57 for the `mod` case).** The GPU stage offloaded a loop whose written index is derived from the loop variable by `mod` alone (`ck_index`: `u[mod(3t, n) + 1]`); the plain adjoint raced on the device too. `cgen_writes_collide_by_mod` (with `cgen_nested_scalar_defs`, which reads definitions inside branches such as the segment guard) now keeps such a loop sequential unless its array is accumulate-only. `validate_mod_collide.jl` (20 checks, sabotage) holds it; `validate_offload.jl` is unchanged (998 of 998), so no corpus loop lost its kernel. Cost: a periodic roll `y[mod(i, n) + 1] = x[i]` stays sequential. Still open: an index that is a different non-one-to-one function (for example `div(i, 2)`) is covered only by the existing `div`/`mod` rule for atomic rewrites, and a gather from an array is trusted (the scatter contract).
+1. **GPU stage and non-injective indices (pre-existing, fixed in v0.5.57 for the `mod` case).** The GPU stage offloaded a loop whose written index is derived from the loop variable by `mod` alone (`ck_index`: `u[mod(3t, n) + 1]`); the plain adjoint raced on the device too. `cgen_writes_collide_by_mod` (with `cgen_nested_scalar_defs`, which reads definitions inside branches such as the segment guard) now keeps such a loop sequential unless its array is accumulate-only. `validate_mod_collide.jl` (34 checks, four sabotages) holds it; `validate_offload.jl` is unchanged (998 of 998), so no corpus loop lost its kernel. Cost in v0.5.57: a periodic roll `y[mod(i, n) + 1] = x[i]` stayed sequential; v0.6.1 proves it one-to-one and offloads it again (`cgen_mod_one_to_one`, manual section "A lone `mod` index"). Still open: an index that is a different non-one-to-one function (for example `div(i, 2)`) is covered only by the existing `div`/`mod` rule for atomic rewrites, and a gather from an array is trusted (the scatter contract).
 2. **Serial-track bug (fixed in v0.5.52).** `cgen_serial_plan` lost the value of an assigned scalar that is live on entry to a loop inside a repeating loop (`gat_reduce_scalar`, `so_inner`). The scalar is now live-out (copied back from its box). `validate_serial_loops.jl` holds the regression (a parallel inner loop is needed, or the outer loop turns serial and the test is vacuous).
 3. **Accumulators.** A variable that the reverse never restores (`loss[1] = loss[1] + ...`) keeps its forward value, as without checkpoints. An array that the reverse restores at some statements and not at others ends at the state after the first segment. The shadows are exact.
 4. **Not covered:** keep_push_pop = true, `fuse_ii_loops = true`, regions that are not at the top level of the kernel, nested time loops.
@@ -73,7 +74,7 @@ No modules, structs or global consts. Stage-prefixed names. No corpus-specific c
 ## 8. Next steps (suggestions)
 
 1. Ask the owner about a release tag.
-2. Prove one-to-one indices of the kind `mod(i, n)` over `1:n` (the periodic roll) so that they offload again.
+2. (Done in v0.6.1.) The periodic roll `mod(i, n)` over `1:n` offloads again. A strip-mined segment with a lone `mod` stays sequential, because `ck` is a run-time value. Proving `ck <= n` would need a guard or a launch-time check.
 3. Checkpointing for nested time loops and for regions below the top level.
 
 ## Regression result

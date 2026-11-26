@@ -80,6 +80,24 @@ function ck_index(u, a, out, n, nt)
     out[1] = s
     return nothing
 end""", :region),
+    # a periodic roll through a scratch array: one-to-one, so the device runs it as a parallel kernel
+    ("ck_roll", """
+function ck_roll(u, w, a, out, n, nt)
+    for t = 1:nt
+        for i = 1:n
+            w[mod(i, n) + 1] = u[i] * a + sin(u[i])
+        end
+        for i = 1:n
+            u[i] = w[i] * 0.5 + u[i] * 0.25
+        end
+    end
+    s = 0.0
+    for i = 1:n
+        s = s + u[i] * u[i]
+    end
+    out[1] = s
+    return nothing
+end""", :region),
     # an accumulator at a fixed index, and a counter-dependent forcing
     ("ck_accum", """
 function ck_accum(u, a, loss, n, nt)
