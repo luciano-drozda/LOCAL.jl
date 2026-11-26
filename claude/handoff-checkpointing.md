@@ -60,8 +60,7 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 2. **Serial-track bug (fixed in v0.5.52).** `cgen_serial_plan` lost the value of an assigned scalar that is live on entry to a loop inside a repeating loop (`gat_reduce_scalar`, `so_inner`). The scalar is now live-out (copied back from its box). `validate_serial_loops.jl` holds the regression (a parallel inner loop is needed, or the outer loop turns serial and the test is vacuous).
 3. **Accumulators.** A variable that the reverse never restores (`loss[1] = loss[1] + ...`) keeps its forward value, as without checkpoints. An array that the reverse restores at some statements and not at others ends at the state after the first segment. The shadows are exact.
 4. **Not covered:** keep_push_pop = true, `fuse_ii_loops = true`, regions that are not at the top level of the kernel, nested time loops.
-5. **`validate_split_real` fails (older than this work).** See the regression result: four layer-norm backward twins are missing on `transformer_block`, also on v0.5.46. Open.
-6. **Knowns from the GPU run:** the ingest drops `if cond; error("String") end`; the guard is put back only when its condition is arithmetic or comparison over scalar parameters.
+5. **Knowns from the GPU run:** the ingest drops `if cond; error("String") end`; the guard is put back only when its condition is arithmetic or comparison over scalar parameters.
 
 ## 6. Regression
 
@@ -90,7 +89,7 @@ The suites the sweep builder skips, run on the final tree (v0.5.58, 26a900f):
 - RSK58B (Slurm 2099074, krakenepyc2, 1669 s): the contraction slices, 167 of 167 passed.
 - RSK58A (Slurm 2099073, krakenepyc1, 1093 s): `validate_corpus_flags` passed (656 of 656). Five suites read kernel files from `/home/claude/bench/pkg/` of the author's sandbox, which the cluster does not have, so they fail there (missing file); run locally instead:
   - `validate_own_kit` passed (69 s), `validate_dead_stack_real` passed (104 s), `validate_contraction_real` passed (168 s).
-  - `validate_split_real` FAILS: "layer-norm backward twins missing" (`cuda_kernel_transformer_block_b_15_s!`, `_b_22_s!`, `_hv_15_s!`, `_hv_22_s!`). The same failure, with the same text, appears on the tree before the checkpointing work (7ee85ee^ = v0.5.46) and before the v0.5.57 gate, so it is older than this work. Cause not investigated. It is the one open failure of the regression; the input is `transformer_block` of `/home/claude/bench/pkg`, which may have changed since the suite last passed.
+  - `validate_split_real` passed (82 s) once run as its header says, with `OWN_SPLIT=4` (the split twins forced; 144 of 176 twin launches, four layer-norm twins present, parity and 2 of 2 ownership checks). The first run had no `OWN_SPLIT`, so no twin ran and the suite reported the twins missing: a wrong invocation, not a defect, on every tree tested (v0.5.46 included). The suite now defaults `OWN_SPLIT` to 4.
   - `validate_battle_random` is a generator (`OUT COUNT [MODES]`), not a pass/fail suite; it ran (40 kernels, 327 lines) and nothing was compared.
 
 Still not run: `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth` (they need a device). The V100 runs cover the device side (adjoint and HVP 248 of 248, `ck_index` 8 of 8 each).

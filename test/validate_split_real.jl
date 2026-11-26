@@ -1,8 +1,9 @@
 # ==================== validate_split_real.jl =============================
 # The real transformer_block adjoint and HVP of the kit (STADE_KIT_KERNELS/nn) through the CPU ownership shim with the split twins forced
 # (OWN_SPLIT=L): parity with the plain plan, no ownership conflict, and the twins of the two layer-norm backward kernels must have run.
-#   OWN_SPLIT=4 STADE_KIT_KERNELS=<kit kernels dir> julia validate_split_real.jl
+#   [OWN_SPLIT=4] STADE_KIT_KERNELS=<kit kernels dir> julia validate_split_real.jl   (OWN_SPLIT defaults to 4)
 get!(ENV, "OWN_FUSE", "1")   # the benchmark kernels are generated with fuse_ii_loops = true
+get!(ENV, "OWN_SPLIT", "4")  # force the split twins: without it none runs and the check below fails
 include(joinpath(@__DIR__, "validate_ownership.jl"))
 kd = joinpath(get(ENV, "STADE_KIT_KERNELS", "/home/claude/bench/pkg/kernels"), "nn")
 res = validate_ownership(kd; only = ["transformer_block"])
