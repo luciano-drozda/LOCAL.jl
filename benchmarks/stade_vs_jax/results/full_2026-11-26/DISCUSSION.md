@@ -12,13 +12,14 @@ A statement marked **Hypothesis** was not tested. The data fit the statement, an
 4. **Adjoint runtime, best of C and A.** The gap is 0.64. STADE is more than 5 % slower in 9 cases and more than 5 % faster in 29. Configuration A is never slower than C, and it saves more than 10 % in 31 of 42 cases.
 5. **Where STADE loses.** The NN kernels (mlp3, mlp3_push, transformer_block and unet2 at c16_n256) lose in the adjoint with C. Stencil kernels at large size and ufv_gather_step also lose with C. Configuration A removes the loss for most stencil cases. It does not remove the loss for the transformer, ufv_gather_step at 1e6, mlp3 at 13M and unet2 at c16_n256.
 6. **One case JAX cannot run.** JAX runs out of memory on euler2d_step at 16e6 (it asks for 8 GiB in one allocation). STADE runs this case and uses 2.0 GB for the adjoint. No gap exists for it.
+7. **Which option gives the gain of A.** Job ABL1 (section 4.3) shows that `primal_outputs = false` gives most of it (28 cases: 0.80 of the C time, against 0.94 for `fresh_gradient` alone and 0.76 for both). `fresh_gradient` is the gain for mlp3_push and adds to P for mlp3 and wave2d_step. Neither option changes unet2.
 
 ## 2. How to read the numbers
 
 - **Headline timer.** The runtime tables use the host clock with a device synchronization around one call. The event timer gives the same conclusions: the gap is 0.49 for the primal, 0.79 for the adjoint with C and 0.61 for the best of C and A.
 - **Adjoint definition.** JAX measures `jit(vjp)`, which includes the forward pass. STADE C measures the generated adjoint with its default options. STADE A drops the primal outputs and starts from a fresh gradient (`primal_outputs = false`, `fresh_gradient = true`). "Best" means the lower time of C and A for each case.
 - **Memory definition.** The exact reading is the memory that arrays and calls need, with no allocator rounding. For STADE it is the live arrays plus the bytes that one call allocates. For JAX it is the XLA peak of live bytes. The driver reading is what `nvidia-smi` shows. Allocators round it up, and it holds one-time library memory. The driver gap exists only for cases where both readings are at least 34 MB (23 primal cases, 27 adjoint cases). The exact gap is the headline (decision D7 in `PROCEDURE.md`).
-- **Noise.** One job gives one run per case. The earlier smoke jobs showed a cross-job spread up to 3.3 % for STADE and up to 11 % for JAX on one 1e5 adjoint case. Treat a difference below 5 % as a tie.
+- **Noise.** One job gives one run per case. The ablation job ABL1 ran config C again on 28 cases. Its adjoint times differ from FULLT1 by a median of 0.07 % and at most 3.8 % (wave2d_step 1e5, a 0.03 ms case). Config A differs by a median of 0.15 % and at most 7.4 % (heat3d_multi 1e5, a 0.08 ms case). So the STADE noise is below 1 % for cases above 0.1 ms. The JAX noise was not measured again. The earlier smoke jobs showed up to 11 % on one 1e5 JAX adjoint case. Treat a difference below 5 % as a tie for JAX and for the small STADE cases.
 - **Averages.** A geometric mean over cases treats each case equally. The case list holds 3 sizes for most kernels, so the mean depends on the case list. Use the per-case tables for any claim about one kernel.
 
 ## 3. Runtime of the primal
@@ -74,16 +75,38 @@ The table lists 13 of the 19 slower cases. The other six have gaps of 1.07 to 1.
 
 Three groups appear.
 
-1. **Stencil and MLP cases that A repairs.** The gap drops below or near 1 with A (for example heat3d_step 8e6 from 1.66 to 0.82). C pays something that A does not pay. A changes two options at the same time, so the data do not show which option costs the time. The extra time with C is about 0.4 ms for heat3d_step 8e6 (128 MB arrays) and about 0.9 ms for mlp3 79M (630 MB of inputs). These values are the order of magnitude of one more pass over arrays of the size of the gradient at V100 bandwidth. **Hypothesis.** The extra cost with C is one or two passes over gradient-sized arrays (writing the primal outputs, setting the gradient to zero, or both). A test with each option alone would show it (section 7, test 2).
-2. **Cases that A does not repair.** These are the transformer at d1024 and d2048 (1.17 to 1.21 with A), ufv_gather_step at 1e6 (1.26), mlp3 at 13M (1.29), mlp3_push at 79M (1.14) and unet2 at c16_n256 (1.17). A is not the cause of these gaps. The data show no cause. **Hypothesis.** The generated adjoint code or its device kernels are slower than the XLA code for these shapes.
+1. **Stencil and MLP cases that A repairs.** The gap drops below or near 1 with A (for example heat3d_step 8e6 from 1.66 to 0.82). C pays something that A does not pay. The ablation of section 4.3 shows which option removes the cost: `primal_outputs = false` for the stencil, ufv_gather_step and transformer cases, `fresh_gradient` for mlp3_push, and both options for mlp3 and wave2d_step.
+2. **Cases that A does not repair.** These are the transformer at d1024 and d2048 (1.17 to 1.21 with A), ufv_gather_step at 1e6 (1.26), mlp3 at 13M (1.29), mlp3_push at 79M (1.14) and unet2 at c16_n256 (1.17). The options are not the cause of these gaps, and no option removes them. The data show no cause. **Hypothesis.** The generated adjoint code or its device kernels are slower than the XLA code for these shapes.
 3. **Small effects.** unet2 at c32_n128, c64_n64 and c128_n32 is 9 to 14 % faster than JAX. mpnn_gather at 1e5 is a tie.
 
-### 4.3 Ratio of adjoint time to primal time
+### 4.3 Ablation of the two options (job ABL1)
+
+Job ABL1 (Slurm 2100116) ran four configs of the adjoint on 9 kernels (28 cases): C (defaults), P (`primal_outputs = false`), G (`fresh_gradient = true`) and A (P and G). The report is `../ablation_2026-11-26/ABLATION.md`.
+
+| Family | Cases | P / C | G / C | A / C |
+|---|---:|---:|---:|---:|
+| Stencil | 12 | 0.63 | 0.97 | 0.62 |
+| Unstructured (ufv_gather_step) | 3 | 0.85 | 1.00 | 0.85 |
+| NN | 13 | 0.97 | 0.91 | 0.88 |
+| All | 28 | 0.80 | 0.94 | 0.76 |
+
+The gap to JAX over these 28 cases is 1.01 for C, 0.81 for P, 0.95 for G and 0.77 for A. STADE is slower than JAX in 17 cases with C, 11 with P, 16 with G and 9 with A.
+
+- **P gives most of the gain.** In 14 cases P gives the gain and G gives less than 3 %. These are heat3d_multi, heat1d_multi, heat3d_step 1e5, wave2d_step 1e5, ufv_gather_step (11 to 22 %) and the transformer (5 to 8 %). P alone gives 35 to 54 % for the heat kernels at 1e6 and above.
+- **G gives the gain for mlp3_push (13 to 33 %).** P has no effect there, because the generated code is the same as C. G adds a part for mlp3 (7 to 20 %) and wave2d_step at 1e6 and 16e6 (14 %), where P gives its own part. G gives 3 to 5 % for heat3d_step at 1e6 and 8e6.
+- **Neither option changes unet2.** The four unet2 sizes show 0 % for both options.
+- **The two gains add up or overlap.** For mlp3 they add up (79M: 8 % and 20 % give 28 %). For wave2d_step and heat3d_step they overlap a little (wave2d_step 16e6: 25 % and 14 % give 30 %).
+- **Same code, same time.** For 5 of the 9 kernels, at least one pair of configs generates the same code. These 32 pairs differ by a median of 0.1 %. The largest difference is 6 % (heat3d_multi 1e5, a 0.05 ms case). The runs also reproduce FULLT1 (see section 2).
+- **What the options change in the contract.** With P, the adjoint call does not write the primal outputs of the kernel. A user who needs the primal values must call the primal. With G, the gradient arrays must be zero on entry, and each reset allows one adjoint call. A loop that accumulates gradients over several calls cannot use G. The JAX adjoint of this benchmark returns the gradient only, so both options fit the comparison. They change what a user can do with one call.
+
+The source of STADE explains the effect of G. A gradient update `g[k] = g[k] + e` becomes the store `g[k] = e` when the gradient is zero on entry, which saves one read pass over the array. G changes the code only when the analysis proves its conditions for a store. For heat1d_multi, heat3d_multi, the transformer and unet2 the pass left the code unchanged, so no gradient store met the conditions. The data do not show which condition failed.
+
+### 4.4 Ratio of adjoint time to primal time
 
 The geometric-mean ratio is 3.27 for STADE (C) and 2.09 for JAX. Two groups explain most of the difference.
 
 - **mpnn_gather.** The ratio is 11.2 (1e5) and 11.4 (1e6) for STADE, against 2.6 for JAX. The STADE primal is four times faster than JAX, and the STADE adjoint is as slow as the JAX adjoint (gap 1.00 and 1.08). The adjoint of a gather is a scatter-accumulate. The STADE adjoint compiles an accumulation with a data-dependent index to an atomic add. **Hypothesis.** Atomic adds with many conflicts limit the STADE adjoint on this kernel. A device profile would show it (section 7, test 3).
-- **NN kernels.** The ratio for mlp3 and mlp3_push is 2.9 to 5.0 (C), against 1.9 to 2.5 for JAX. The A configuration lowers the mlp3 13M ratio from 4.97 to 4.20. A explains part of the difference and not all of it.
+- **NN kernels.** The ratio for mlp3 and mlp3_push is 2.9 to 5.0 (C), against 1.9 to 2.5 for JAX. The A configuration lowers the mlp3 13M ratio from 4.97 to 4.20. The options explain part of the difference and not all of it.
 
 For unet2 the JAX ratio is higher than the STADE ratio (6.5, 5.5, 4.0 against 5.3, 3.5, 2.7 at three sizes). The JAX adjoint of unet2 is slow relative to its primal. This is why STADE is faster in its adjoint at three of four sizes while it is slower in its primal.
 
@@ -134,13 +157,13 @@ The driver gap is 0.42 for the primal (23 cases) and 0.45 for the adjoint with C
 | # | Question | Test | Cost |
 |---|---|---|---|
 | 1 | Does call overhead explain the small-case gaps? | Time each case with a loop of 20 calls inside one `jit` (JAX) and one launch sequence (STADE), or measure the launch overhead of an empty kernel in both. | One short job |
-| 2 | Which option makes C slower than A? | Run STADE with `primal_outputs = false` alone and `fresh_gradient = true` alone, on the 13 cases of section 4.2. | One time job on 13 cases (about 10 min) |
+| 2 | Which option makes C slower than A? | Done (job ABL1, section 4.3). `primal_outputs = false` gives most of the gain. `fresh_gradient` gives the rest for mlp3, mlp3_push and wave2d_step. | Done |
 | 3 | Do atomic adds limit mpnn_gather? | Profile the adjoint kernels with `nsys` or `ncu` (kernel time, atomic throughput). | One profiling job |
 | 4 | Why is the transformer adjoint 17 to 28 % slower? (The range covers A and C.) | Profile both adjoints and compare the time per kernel. Test the checkpoint option. | One profiling job |
 | 5 | Is the JAX swe2d_step 1e6 adjoint an outlier? | Repeat the case five times in separate jobs. | One short job |
 | 6 | How large is the noise? | Repeat the time job FULLT1 once. Compare each case. | One job (45 min) |
 
-Tests 2 and 6 are the most useful. Test 2 may give a default that removes the main loss of STADE in the stencil family. Test 6 gives the noise level for every number in this text.
+Test 6 is now the most useful. ABL1 already measured the STADE noise on 28 cases (median 0.07 %), so a repeat of the time job would mainly measure the JAX noise and the cases ABL1 did not cover. A decision about the default options of STADE belongs to the owner (section 8, item 7).
 
 ## 8. Conclusions
 
@@ -149,4 +172,6 @@ Tests 2 and 6 are the most useful. Test 2 may give a default that removes the ma
 3. With the default options, the adjoint is slower than JAX for the NN kernels (gap 1.14) and for several large stencil cases. Configuration A removes most of the loss for stencils. For the transformer (17 to 21 %) and for ufv_gather_step at 1e6 (26 %) a loss remains.
 4. The gap grows with size. The advantage at small sizes is partly a launch-cost effect and does not carry to large problems.
 5. The ratio of adjoint time to primal time is worse for STADE (3.27 against 2.09). The reason is mpnn_gather and the MLP cases. These are the first places to improve.
-6. The text does not claim a cause for any loss. Section 7 lists the tests that would give one.
+6. The ablation (section 4.3) shows that `primal_outputs = false` gives most of the gain of config A. The gap to JAX on the 9 ablated kernels is 1.01 with the defaults and 0.81 with this option alone. `fresh_gradient` adds a gain for mlp3, mlp3_push and wave2d_step. Neither option changes unet2. The options change the transformer by at most 8 % and ufv_gather_step at 1e6 and 4e6 by at most 13 %.
+7. The options change the contract of the adjoint call (section 4.3). Whether they should be the default is a decision for the owner. The data show a gain of 24 % on average (geometric mean over 28 cases) if both are on.
+8. The text claims no cause for the losses that remain after A. Section 7 lists the tests that would give one.
