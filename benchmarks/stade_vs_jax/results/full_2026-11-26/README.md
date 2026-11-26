@@ -5,7 +5,7 @@
 | FULLT1 | 2100092 | `time` (STADE C and A, JAX): 70 runs, 45 min | `FULLT1_time.json`, `plan_time.tsv`, `versions_time.json` |
 | FULLM1 | 2100097 | `mem_primal`, `mem_adjoint` (STADE C and A, JAX): 126 runs, 54 min | `FULLM1_mem.json`, `plan_mem.tsv`, `versions_mem.json` |
 
-`REPORT.md` and `rows.json` come from both jobs. Rebuild them with:
+`DISCUSSION.md` interprets the results. `REPORT.md` and `rows.json` come from both jobs. Rebuild them with:
 
 ```bash
 python3 cluster/report.py --results results/full_2026-11-26/FULLT1_time.json --results results/full_2026-11-26/FULLM1_mem.json --out OUTDIR
