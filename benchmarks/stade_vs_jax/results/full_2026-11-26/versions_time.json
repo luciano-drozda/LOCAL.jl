@@ -1,0 +1,26 @@
+{
+ "stade_commit": "d1663351bfbd8f89f68d84733696569ecdcb4835",
+ "stade_dirty": false,
+ "kit_hash": "5a6d98c18367b4a4",
+ "built_utc": "2026-11-26T19:23:50Z",
+ "phases": [
+  "time"
+ ],
+ "kernels": [
+  "heat3d_step",
+  "heat3d_multi",
+  "heat1d_multi",
+  "wave2d_step",
+  "burgers2d_step",
+  "swe2d_step",
+  "euler2d_step",
+  "ufv_scatter_step",
+  "ufv_gather_step",
+  "mlp3",
+  "mlp3_push",
+  "mpnn_gather",
+  "transformer_block",
+  "unet2"
+ ],
+ "limit_min": 120
+}
