@@ -60,7 +60,8 @@ Where the code is (all in `src/STADE.jl`): `agen_ckpt_*` (region choice, rewrite
 2. **Serial-track bug (fixed in v0.5.52).** `cgen_serial_plan` lost the value of an assigned scalar that is live on entry to a loop inside a repeating loop (`gat_reduce_scalar`, `so_inner`). The scalar is now live-out (copied back from its box). `validate_serial_loops.jl` holds the regression (a parallel inner loop is needed, or the outer loop turns serial and the test is vacuous).
 3. **Accumulators.** A variable that the reverse never restores (`loss[1] = loss[1] + ...`) keeps its forward value, as without checkpoints. An array that the reverse restores at some statements and not at others ends at the state after the first segment. The shadows are exact.
 4. **Not covered:** keep_push_pop = true, `fuse_ii_loops = true`, regions that are not at the top level of the kernel, nested time loops.
-5. **Knowns from the GPU run:** the ingest drops `if cond; error("String") end`; the guard is put back only when its condition is arithmetic or comparison over scalar parameters.
+5. **`validate_split_real` fails (older than this work).** See the regression result: four layer-norm backward twins are missing on `transformer_block`, also on v0.5.46. Open.
+6. **Knowns from the GPU run:** the ingest drops `if cond; error("String") end`; the guard is put back only when its condition is arithmetic or comparison over scalar parameters.
 
 ## 6. Regression
 
@@ -84,4 +85,12 @@ Two full sweeps of the CPU suites on the rome partition, each one process per su
 - RALL58 (tree 6c2ee0b = v0.5.57, Slurm 2099068, krakenepyc1, Julia 1.11.9, 3515 s, `--mem=100G`): 113 of 114 passed. The failure was `validate_colblock`, sabotage "the accumulated array may be used elsewhere": NOT CAUGHT. Cause: the unit input of that case reads the accumulated array beside its accumulation (`g[idx] = z[j]; z[j] = z[j] + ...`), a kernel that races on a device. The v0.5.57 gate (lone `mod` index, array not accumulate-only) now refuses that loop, so the column-block guard was no longer reached by any source. This is the new guard working, not a defect. Fixed in v0.5.58: `cb_mutants` holds a hand-edited kernel with that read, so the guard is tested directly; the sabotage is caught again (and the source case stays, wanting 0 twins).
 - The rome template `run_job_cpu_parallel_rome.sbatch` now asks for 100 GB instead of 240 GB (backup `.bak-20261126` beside it). Measured peak memory of eight heavy suites on a single process: 0.8 to 1.2 GiB each, so 64 at once need about 65 to 80 GiB. Slurm confirmed ReqMem 100G; no suite was killed for memory in RALL58.
 
-Not in the sweeps (they need a device or are skipped by `mk_all3.py`): `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth`, `validate_corpus_flags`, `validate_own_kit`, `validate_dead_stack_real`, `validate_contraction_real`, `validate_split_real`, `validate_battle_random`, and the contraction slices (`mk_slices.py`). The V100 runs cover the device side (adjoint and HVP 248 of 248, `ck_index` 8 of 8 each). The skipped CPU suites are the open item: they were submitted once on the pre-guard tree and cancelled while queued.
+The suites the sweep builder skips, run on the final tree (v0.5.58, 26a900f):
+
+- RSK58B (Slurm 2099074, krakenepyc2, 1669 s): the contraction slices, 167 of 167 passed.
+- RSK58A (Slurm 2099073, krakenepyc1, 1093 s): `validate_corpus_flags` passed (656 of 656). Five suites read kernel files from `/home/claude/bench/pkg/` of the author's sandbox, which the cluster does not have, so they fail there (missing file); run locally instead:
+  - `validate_own_kit` passed (69 s), `validate_dead_stack_real` passed (104 s), `validate_contraction_real` passed (168 s).
+  - `validate_split_real` FAILS: "layer-norm backward twins missing" (`cuda_kernel_transformer_block_b_15_s!`, `_b_22_s!`, `_hv_15_s!`, `_hv_22_s!`). The same failure, with the same text, appears on the tree before the checkpointing work (7ee85ee^ = v0.5.46) and before the v0.5.57 gate, so it is older than this work. Cause not investigated. It is the one open failure of the regression; the input is `transformer_block` of `/home/claude/bench/pkg`, which may have changed since the suite last passed.
+  - `validate_battle_random` is a generator (`OUT COUNT [MODES]`), not a pass/fail suite; it ran (40 kernels, 327 lines) and nothing was compared.
+
+Still not run: `validate_corpus_gpu`, `validate_cublas`, `validate_gpu_truth` (they need a device). The V100 runs cover the device side (adjoint and HVP 248 of 248, `ck_index` 8 of 8 each).
