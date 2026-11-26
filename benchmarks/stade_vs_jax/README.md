@@ -47,3 +47,7 @@ The V100 job needs the JAX virtualenv. Build it once on the cluster with `cluste
 ```bash
 python3 cluster/report.py --results work/results/time.json --results work/results/mem.json --out OUTDIR
 ```
+
+## Option ablation
+
+`CONFIGS="C A P G" bash cluster/gen_stade_scripts.sh OUTDIR "KERNELS"` also generates the configs P (`primal_outputs = false` alone) and G (`fresh_gradient = true` alone). Build a STADE-only time job with `build_job.py ... --no-jax --phases time --configs C,P,G,A`. Build the report with `python3 cluster/ablation_report.py --results RESULT.json --stade-dir OUTDIR/all --ref FULLT1.json --out OUTDIR`. `tools/test_ablation.sh` tests the chain on the CPU.

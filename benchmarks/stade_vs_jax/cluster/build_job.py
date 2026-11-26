@@ -5,11 +5,12 @@ Usage: STADE_SRC=/path/to/src/STADE.jl python3 build_job.py OUTDIR --stade-dir D
   --phases LIST     comma list of time, mem_primal, mem_adjoint (default: all three)
   --kernels K ...   only these kernels (default: all of gpu/specs.py)
   --max-sizes N     only the first N benchmark sizes of each kernel (a smoke job or a local test). Use the same N in gen_stade_scripts.sh (MAX_SIZES).
+  --configs LIST    comma list of STADE configs (default C,A). P and G are the ablation configs of gen_stade_scripts.sh.
   --no-stade, --no-jax   leave one framework out
   --limit-min N     the time limit of the V100 job (default 120). No new run starts 15 min before it.
   --stade-tmo S, --jax-tmo S   the time limit of one run (default 1800 and 500)
 Order of the runs: every STADE kernel (config C, then config A; the phases in the order given), then every JAX case (the phases in the order given).
-Config C runs every phase. Config A skips mem_primal, because it has the same primal code as config C. JAX runs every phase.
+Config C runs every phase. Every other config skips mem_primal, because it has the same primal code as config C. JAX runs every phase.
 Result: OUTDIR/job.json (the payload), OUTDIR/plan.tsv and OUTDIR/versions.json. Submit job.json with go.sh."""
 import argparse, base64, datetime, hashlib, json, os, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); PKG = os.path.normpath(os.path.join(HERE, ".."))
@@ -20,7 +21,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("--stade-dir"); ap.add_argument("--roles", required=True)
 ap.add_argument("--phases", default="time,mem_primal,mem_adjoint"); ap.add_argument("--kernels", nargs="*")
 ap.add_argument("--max-sizes", type=int, default=0); ap.add_argument("--no-stade", action="store_true"); ap.add_argument("--no-jax", action="store_true")
-ap.add_argument("--limit-min", type=int, default=120); ap.add_argument("--stade-tmo", type=int, default=1800); ap.add_argument("--jax-tmo", type=int, default=500)
+ap.add_argument("--configs", default="C,A"); ap.add_argument("--limit-min", type=int, default=120); ap.add_argument("--stade-tmo", type=int, default=1800); ap.add_argument("--jax-tmo", type=int, default=500)
 o = ap.parse_args()
 phases = o.phases.split(",")
 bad = [p for p in phases if p not in ("time", "mem_primal", "mem_adjoint")]
@@ -45,11 +46,11 @@ if not o.no_jax:
 plan = []
 if not o.no_stade:
     for k in kernels:
-        for cfg in ("C", "A"):
+        for cfg in o.configs.split(","):
             src = f"{o.stade_dir}/all/{k}_{cfg}.jl"
             if not os.path.isfile(src): sys.exit(f"missing {src}")
             shutil.copy(src, f"{B}/stade/{k}_{cfg}.jl")
-            ph = [p for p in phases if not (cfg == "A" and p == "mem_primal")]
+            ph = [p for p in phases if not (cfg != "C" and p == "mem_primal")]
             if ph: plan.append(("stade", cfg, k, "-", ",".join(ph)))
 if not o.no_jax:
     for k in kernels:
