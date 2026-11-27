@@ -4,7 +4,7 @@ log=""
 while [ $# -gt 0 ]; do
   case $1 in
     --log-file) log=$2; shift 2;;
-    --target-processes|--profile-from-start|--launch-count|--metrics|--page|--kernel-name|--print-units) shift 2;;
+    --target-processes|--profile-from-start|--launch-count|--metrics|--page|--kernel-name|--print-units|--replay-mode) shift 2;;
     --*) shift;;
     *) break;;
   esac

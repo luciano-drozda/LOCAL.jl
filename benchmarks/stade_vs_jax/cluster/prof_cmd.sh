@@ -16,7 +16,7 @@ done
 export PATH
 MODE=$1; shift
 D=$(mktemp -d "${BUNDLE:?set BUNDLE}/prof_XXXXXX")
-M=gpu__time_duration.sum,smsp__inst_executed_op_global_red.sum,smsp__inst_executed_op_global_atom.sum,lts__t_sectors_op_red.sum,lts__t_sectors_op_atom.sum,dram__bytes_read.sum,dram__bytes_write.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed
+M=gpu__time_duration.sum,smsp__inst_executed_op_global_red.sum,smsp__inst_executed_op_global_atom.sum,lts__t_sectors_op_red.sum,smsp__sass_inst_executed_op_global_atom.sum,smsp__sass_inst_executed_op_global_red.sum,lts__t_sectors_op_atom.sum,dram__bytes_read.sum,dram__bytes_write.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed
 CAPTURE=range; PEC=0
 case $MODE in
   nsys)
@@ -33,7 +33,8 @@ case $MODE in
   ncu)
     # only the generated kernels (not the fill kernels of the reset). No --launch-count: it kills the program and loses its result (exit 9).
     LC=(); [ -n "${NCU_LAUNCH_COUNT:-}" ] && LC=(--launch-count "$NCU_LAUNCH_COUNT")
-    ncu --target-processes all --profile-from-start off --kernel-name "regex:${NCU_KERNEL_REGEX:-cuda_kernel_}" "${LC[@]}" --metrics "$M" \
+    # Kernel replay failed on these kernels (LaunchFailed, exit 9: it saves and restores the device memory of the CUDA.jl pool). Application replay runs the program again for each pass and needs no restore.
+    ncu --target-processes all --profile-from-start off --replay-mode "${NCU_REPLAY:-application}" --kernel-name "regex:${NCU_KERNEL_REGEX:-cuda_kernel_}" "${LC[@]}" --metrics "$M" \
         --csv --page details --print-units base --log-file "$D/ncu.csv" "$@" > "$D/prog.out" 2> "$D/prog.err" < /dev/null
     PEC=$?
     ;;
