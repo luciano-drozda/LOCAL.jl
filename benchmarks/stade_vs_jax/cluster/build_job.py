@@ -57,6 +57,9 @@ if fplan:
             src = f"{o.stade_dir}/all/{k}_{cfg}.jl"
             if not os.path.isfile(src): sys.exit(f"missing {src}")
             shutil.copy(src, f"{B}/stade/{k}_{cfg}.jl")
+            # a script holds the runner of the time it was generated: a profile phase needs a script that knows it
+            if any(p.startswith(("prof", "ncu")) for p in ph.split(",")) and "prof_adjoint" not in open(src).read():
+                sys.exit(f"{src} was generated before the profile phases existed. Generate it again (gen_stade_scripts.sh).")
         plan.append((fw, cfg, k, sz, ph))
 elif not o.no_stade:
     for k in kernels:

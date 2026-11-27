@@ -3,7 +3,7 @@
 # calls to record). Prints ONE JSON line (see prof_pack.jl). The standard output of the command is kept in the file prog.out.
 # Usage: prof_cmd.sh nsys|ncu COMMAND...        Variables: BUNDLE (a folder for the files), JULIA_BIN
 # The exit code is the exit code of the profiled command (of the last run, if nsys ran twice).
-#   nsys  the kernel summary (cuda_gpu_kern_sum) and the CUDA API summary (cuda_api_sum) of the recorded calls.
+#   nsys  --cuda-graph-trace=node lists the kernels inside CUDA graphs (XLA runs repeated calls as graphs). The kernel summary (cuda_gpu_kern_sum) and the CUDA API summary (cuda_api_sum) of the recorded calls.
 #         If the capture range gives no kernel, the command runs again without a capture range (capture = none in the result).
 #   ncu   a counter set for each kernel of the recorded calls. NCU_LAUNCH_COUNT (default 300) is the largest number of kernels.
 set -u
@@ -21,7 +21,7 @@ case $MODE in
   nsys)
     nsys_run() {
       rm -f "$D"/prof.*
-      nsys profile --trace=cuda --sample=none --cpuctxsw=none $1 -o "$D/prof" --force-overwrite true "${@:2}" > "$D/prog.out" 2> "$D/prog.err" < /dev/null
+      nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none $1 -o "$D/prof" --force-overwrite true "${@:2}" > "$D/prog.out" 2> "$D/prog.err" < /dev/null
       PEC=$?
       nsys stats --force-export=true --report cuda_gpu_kern_sum --format csv "$D/prof.nsys-rep" > "$D/kern.csv" 2> "$D/stats.err"
     }
