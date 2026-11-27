@@ -81,7 +81,9 @@ function main()
     kern = kern_lines(rd(joinpath(d, "kern.csv")), 160, 400)
     api = lines(rd(joinpath(d, "api.csv")), l -> startswith(l, "Time (%)"), 200, 30)
     nraw = rd(joinpath(d, "ncu.csv")); ncu = ncu_lines(nraw, 160)
-    nhead = isempty(ncu) ? join((length(l) > 300 ? first(l, 300) : l for l in first(split(nraw, "\n"), 12)), "\n") : ""   # help to find the format if the table is empty
+    # the messages of ncu (lines that start with ==), and the first lines of the log if the table is empty
+    msgs = [length(l) > 400 ? first(l, 400) : l for l in split(nraw, "\n") if startswith(l, "==") && !startswith(l, "==PROF== Connected")]
+    nhead = join(vcat(msgs[1:min(end, 25)], isempty(ncu) ? [length(l) > 300 ? first(l, 300) : l for l in first(split(nraw, "\n"), 12)] : String[]), "\n")
     println("{\"mode\":" * esc(mode) * ",\"capture\":" * esc(capture) * ",\"prog_exit\":" * pec * ",\"prog\":" * prog * ",\"prog_err\":" * esc(err) *
             ",\"kern_csv\":" * esc(kern) * ",\"api_csv\":" * esc(api) * ",\"ncu_csv\":" * esc(ncu) * ",\"ncu_head\":" * esc(nhead) * "}")
 end
