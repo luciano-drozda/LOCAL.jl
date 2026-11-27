@@ -12,6 +12,9 @@ For every corpus kernel, adjoint and HVP (`keep_push_pop = false`, `fuse_ii_loop
      `warp_atomics = false`. The pass changes nothing but the atomic sites.
   2. HELPERS: the helper definitions are present exactly when a call is; `warp_atomics = false`, AMDGPU and Metal output have none.
   3. SABOTAGE: with the emission function swapped to put the index and the value in the wrong order, check 1 must fail on a kernel with an atomic.
+  4. GATE (v0.6.33): no warp call has an index that differs in adjacent lanes (class :D), hand-written kernels send each index shape to the right side, the classes equal
+     those of the JACC analysis under the renamed thread variable, and the helper definitions leave with the last call. Sabotage: a gate that calls everything uniform (:U)
+     leaves :D calls, and one that calls everything :D removes every call.
 """
 function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); only::Union{Vector{String},Nothing} = nothing, sabotage::Bool = true)
     bad = 0
@@ -45,6 +48,18 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
             check(same, "$name [$mode]: $n warp call(s), output equals the plain atomics after substitution")
             check((n > 0) == !isempty(on.helpers), "$name [$mode]: helpers present iff a call is ($(length(on.helpers)) definition(s))")
             check(isempty(off.helpers) && !any(k -> STADE.cgen_expr_calls(k, wa), off.kernels), "$name [$mode]: warp_atomics = false has no helper and no call")
+            gate_ok = true
+            for k in on.kernels
+                k.head === :function || continue
+                cls = STADE.cgen_warp_classes(k)
+                function walk(x)
+                    x isa Expr || return
+                    x.head == :call && length(x.args) == 4 && x.args[1] === wa && STADE.cgen_warp_class(x.args[3], cls) === :D && (gate_ok = false)
+                    foreach(walk, x.args)
+                end
+                walk(k)
+            end
+            check(gate_ok, "$name [$mode]: no warp call has a lane-distinct index")
             for (label, be) in (("amdgpu", STADE.cgen_backend_amdgpu()), ("metal", STADE.cgen_backend_metal()))
                 pl = try STADE.stade_gpu(e, be; inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0) catch; continue end
                 check(isempty(pl.helpers) && !any(k -> STADE.cgen_expr_calls(k, wa), pl.kernels), "$name [$mode]: $label output has no warp call")
@@ -53,6 +68,73 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
     end
     println("\n$total warp call(s) in $kernels_with kernel plan(s)")
     check(total > 0, "at least one corpus kernel emits a warp call")
+    # the gate on hand-written kernels: which indices reach the helper
+    tidline = "__tid = (blockIdx().x - 1) * blockDim().x + threadIdx().x"
+    function gate_kernel(body; tid = "__tid")
+        return Meta.parse("function k_g(A, B, idx, n, v)\n$(replace(tidline, "__tid" => tid))\n$body\nreturn nothing\nend")
+    end
+    function gate_case(label, body, want_warp, want_plain)
+        k = gate_kernel(body)
+        t = STADE.cgen_warp_gate(k, cuda)
+        nw = ncalls(t)
+        np = length(findall("CUDA.@atomic", src(t)))
+        check(nw == want_warp && np == want_plain, "gate: $label ($nw warp, $np plain; want $want_warp, $want_plain)")
+        # the classes agree with the JACC analysis on the same body with the launch index renamed
+        kj = gate_kernel(replace(body, "__tid" => "__jacc_i"); tid = "__jacc_i")
+        cc = STADE.cgen_warp_classes(k); cj = STADE.jgen_warp_classes(kj)
+        for v in (:j, :m, :c, :r, :q, :cur)
+            haskey(cc, v) || haskey(cj, v) || continue
+            check(get(cc, v, :U) === get(cj, v, :U), "gate: $label: class of `$v` equals the JACC class")
+        end
+    end
+    W = "__stade_wa_add!"
+    gate_case("a fixed address", "$W(A, 3, v)", 1, 0)
+    gate_case("the thread index", "$W(A, __tid, v)", 0, 1)
+    gate_case("a scalar assigned from the thread index", "j = __tid + 1\n$W(A, j, v)", 0, 1)
+    gate_case("a chain of two scalars", "j = __tid\nm = 2 * j\n$W(A, m, v)", 0, 1)
+    gate_case("a loop variable with fixed bounds", "for k = 1:n\n$W(A, k, v)\nend", 1, 0)
+    gate_case("a loop variable bounded by the thread index", "for k = 1:__tid\n$W(A, k, v)\nend", 1, 0)
+    gate_case("an index read at the thread index", "q = idx[__tid]\n$W(A, q, v)", 1, 0)
+    gate_case("an index read at a fixed position", "q = idx[2]\n$W(A, q, v)", 1, 0)
+    gate_case("one of each", "$W(A, 1, v)\n$W(B, __tid, v)", 1, 1)
+    gate_case("div of the thread index by a uniform value (lanes agree in runs)", "r = div(__tid - 1, n) + 1\n$W(A, r, v)", 1, 0)
+    gate_case("mod of the thread index (distinct lanes)", "c = mod(__tid - 1, n) + 1\n$W(A, c, v)", 0, 1)
+    gate_case("a flattened 2-D position", "c = mod(__tid - 1, n) + 1\nr = div(__tid - 1, n) + 1\n$W(A, c + (r - 1) * n, v)", 0, 1)
+    gate_case("the same position shifted by a neighbour offset", "c = mod(__tid - 1, n) + 1\nr = div(__tid - 1, n) + 1\n$W(A, c + (r - 1) * n + 1, v)", 0, 1)
+    gate_case("a row index times a width plus an inner loop variable", "r = div(__tid - 1, n) + 1\nfor k = 1:n\n$W(A, (r - 1) * n + k, v)\nend", 1, 0)
+    gate_case("the thread index scaled by a literal", "$W(A, 3 * __tid, v)", 0, 1)
+    gate_case("the sum of two lane-distinct values", "$W(A, __tid + mod(__tid, 7), v)", 1, 0)
+    gate_case("a scalar assigned twice, once from the thread index", "j = 1\nj = __tid\n$W(A, j, v)", 1, 0)
+    gate_case("the jam kernel index (a div part times a span plus a mod part)", "jb = div(__tid - 1, 32) * n + mod(__tid - 1, 32)\n$W(A, jb + 1, v)", 0, 1)
+    # an index that mentions another launch intrinsic is never :D: that kernel keeps the helper
+    let k = gate_kernel("jx = threadIdx().y\n$W(A, jx, v)")
+        t = STADE.cgen_warp_gate(k, cuda)
+        check(ncalls(t) == 1, "gate: an index from threadIdx().y keeps the helper")
+    end
+    let k = gate_kernel("for k = threadIdx().x:blockDim().x:n\n$W(A, k, v)\nend")
+        t = STADE.cgen_warp_gate(k, cuda)
+        check(ncalls(t) == 1, "gate: a block-strided loop variable keeps the helper")
+    end
+    # a kernel with no call, and a kernel list that loses its last call, lose the definitions
+    let ks = Expr[gate_kernel("$W(A, __tid, v)")], hs = STADE.cgen_warp_helper_exprs()
+        gk = Expr[STADE.cgen_warp_gate(k, cuda) for k in ks]
+        check(isempty(STADE.cgen_warp_helpers_prune(hs, gk)), "gate: the definitions leave with the last call")
+        check(STADE.cgen_warp_helpers_prune(hs, Expr[gate_kernel("$W(A, 3, v)")]) == hs, "gate: the definitions stay while a call is left")
+    end
+    if sabotage
+        for (label, sabfn, only) in (
+                ("every index calls itself uniform", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :U\nend", ["idm_tile"]),
+                ("every index calls itself lane-distinct", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :D\nend", ["idm_tile"]))
+            script = """
+                include($(repr(joinpath(@__DIR__, "validate_warp_atomics.jl"))))
+                Core.eval(STADE, Meta.parse($(repr(sabfn))))
+                println("RESULT ", validate_warp_atomics($(repr(dir)); only = $(repr(only)), sabotage = false))
+            """
+            out = sab_read(script)
+            m = match(r"RESULT (\d+)", out)
+            check(m !== nothing && parse(Int, m.captures[1]) > 0, "sabotage \"$label\": the gate checks fail")
+        end
+    end
     if sabotage
         sab = "function cgen_atomic_add(backend, target, other)\n" *
               "    if cgen_warp_atomics_on(backend) && target isa Expr && target.head == :ref && length(target.args) == 2 && target.args[1] isa Symbol\n" *

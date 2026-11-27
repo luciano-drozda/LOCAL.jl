@@ -12956,6 +12956,131 @@ function cgen_strip_macro_lines(expr)
     return Expr(expr.head, args...)
 end
 
+# ---- warp helper gate (CUDA) ----
+# The helper pays only where the 32 lanes can agree on the index. An index that differs in adjacent lanes (class :D) never does: the mask test, two shuffles and a vote are pure
+# cost and the plain atomic runs anyway, so the gate turns those calls back into plain atomics and the result is bit-identical. It runs on the finished kernels, after every pass that
+# makes one (private, coarsened, split, serial, glue twins carry calls too). The analysis is the one of jgen_warp_classes with the CUDA thread variable `__tid` as the :D seed
+# (a pair to keep equal, test/validate_warp_atomics.jl compares them). Classes of a scalar: :U the same in every lane, :S constant on runs of lanes, :D different in adjacent lanes,
+# :X anything else. Only :D is dropped; a wrong class costs speed, never correctness, because the helper is exact for any index. A launch-index intrinsic other than `__tid` (a
+# 2-D kernel, a block-strided loop) is :X, so those kernels keep the helper.
+cgen_warp_thread_syms() = (:threadIdx, :blockIdx, :blockDim, :gridDim, :workitemIdx, :workgroupIdx, :workgroupDim, :thread_position_in_grid)
+
+function cgen_warp_mentions_thread(e)
+    e isa Symbol && return e in cgen_warp_thread_syms()
+    e isa Expr || return false
+    return any(cgen_warp_mentions_thread, e.args)
+end
+
+function cgen_warp_class(e, cls::Dict{Symbol,Symbol})
+    e isa Number && return :U
+    e isa Symbol && return get(cls, e, :U)
+    e isa Expr || return :U
+    cgen_warp_mentions_thread(e) && return :X
+    if e.head === :ref
+        c = cgen_warp_join([cgen_warp_class(a, cls) for a in e.args[2:end]])
+        return c === :U ? :U : (c === :S ? :S : :X)
+    end
+    if e.head === :call && !isempty(e.args)
+        f = e.args[1]
+        args = Any[cgen_warp_class(a, cls) for a in e.args[2:end]]
+        all(==(:U), args) && return :U
+        if f === :+ || (f === :- && length(args) == 2)
+            acc = args[1]
+            for y in args[2:end]
+                acc = cgen_warp_add_class(acc, y)
+            end
+            return acc
+        elseif f === :- && length(args) == 1
+            return args[1]
+        elseif f === :*
+            acc = args[1]
+            for y in args[2:end]
+                acc = cgen_warp_mul_class(acc, y)
+            end
+            return acc
+        elseif f === :div && length(args) == 2 && args[2] === :U
+            return args[1] === :X ? :X : :S
+        elseif f === :mod && length(args) == 2 && args[2] === :U
+            return args[1]
+        end
+        return :X
+    end
+    return cgen_warp_join([cgen_warp_class(a, cls) for a in e.args])
+end
+
+function cgen_warp_add_class(x::Symbol, y::Symbol)
+    (x === :X || y === :X) && return :X
+    (x === :D && y === :D) && return :X
+    (x === :D || y === :D) && return :D
+    return (x === :S || y === :S) ? :S : :U
+end
+
+function cgen_warp_mul_class(x::Symbol, y::Symbol)
+    (x === :X || y === :X) && return :X
+    x === :U && return y
+    y === :U && return x
+    return (x === :D || y === :D) ? :X : :S
+end
+
+function cgen_warp_join(cs)
+    isempty(cs) && return :U
+    all(==(first(cs)), cs) && return first(cs)
+    return :X
+end
+
+# class of every scalar of a kernel function, to a fixed point; `seed` is the thread variable(s) and is never reassigned by a rule
+function cgen_warp_classes(k::Expr; seed::Vector{Symbol} = [:__tid])
+    cls = Dict{Symbol,Symbol}(s => :D for s in seed)
+    seen = Dict{Symbol,Vector{Symbol}}()
+    changed = true
+    rounds = 0
+    while changed && rounds < 20
+        changed = false; rounds += 1
+        empty!(seen)
+        function walk(e)
+            e isa Expr || return
+            if e.head === :(=) && length(e.args) == 2 && e.args[1] isa Symbol && !(e.args[1] in seed)
+                push!(get!(seen, e.args[1], Symbol[]), cgen_warp_class(e.args[2], cls))
+            elseif e.head === :for && length(e.args) == 2 && e.args[1] isa Expr && e.args[1].head === :(=) && e.args[1].args[1] isa Symbol
+                r = e.args[1].args[2]
+                rc = (r isa Expr && r.head === :call && r.args[1] === :(:)) ? [cgen_warp_class(a, cls) for a in r.args[2:end]] : [cgen_warp_class(r, cls)]
+                push!(get!(seen, e.args[1].args[1], Symbol[]), all(==(:U), rc) ? :U : :X)
+            end
+            foreach(walk, e.args)
+        end
+        walk(k)
+        for (v, cs) in seen
+            c = cgen_warp_join(cs)
+            if get(cls, v, :U) != c
+                cls[v] = c; changed = true
+            end
+        end
+    end
+    return cls
+end
+
+# a call `__stade_wa_add!(A, i, v)` whose index is :D becomes `backend.atomic_macro A[i] += v` again
+function cgen_warp_gate_rewrite(e, cls::Dict{Symbol,Symbol}, backend)
+    e isa Expr || return e
+    args = Any[cgen_warp_gate_rewrite(a, cls, backend) for a in e.args]
+    if e.head === :call && length(e.args) == 4 && e.args[1] === cgen_warp_add_name() && cgen_warp_class(e.args[3], cls) === :D
+        return Expr(:macrocall, backend.atomic_macro, nothing, Expr(:(+=), Expr(:ref, args[2], args[3]), args[4]))
+    end
+    return Expr(e.head, args...)
+end
+
+function cgen_warp_gate(k, backend)
+    (k isa Expr && k.head === :function && cgen_expr_calls(k, cgen_warp_add_name())) || return k
+    return cgen_warp_gate_rewrite(k, cgen_warp_classes(k), backend)
+end
+
+# the warp definitions leave the helper list when no kernel calls the helper any more
+function cgen_warp_helpers_prune(helpers::Vector{Expr}, kernels::Vector{Expr})
+    any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) && return helpers
+    warp = cgen_warp_helper_exprs()
+    return Expr[h for h in helpers if !any(w -> w == h, warp)]
+end
+
 # A write races across threads unless the enclosing device loop's thread-mapped variable occurs in the write's index, or through a chain of let-
 # bindings (`thread_dep`) -- a real occurs-check. Any thread-invariant-indexed write is a race regardless of pattern: an accumulation is fixable
 # with an atomic +=, a plain replacement is not, so it's refused outright. A thread-DEPENDENT index isn't automatically race-free either: a gather-
@@ -21569,12 +21694,17 @@ function stade_gpu(expr::Expr, backend; precision::Union{Nothing, Type{<:Abstrac
         (host, kernels) = cgen_glue_apply(host, kernels, backend)
         dead_scalars && (kernels = Expr[i > nk0 ? cgen_dead_scalars(k, inbounds) : k for (i, k) in enumerate(kernels)])
     end
+    # the gate runs last among the passes that make kernels; the helper definitions follow the calls that are left
+    if cgen_warp_atomics_on(backend)
+        kernels = Expr[cgen_warp_gate(k, backend) for k in kernels]
+        helpers = cgen_warp_helpers_prune(helpers, kernels)
+    end
     fresh_check && (host = cgen_fresh_check(host, fresh))
     host = cgen_guard_prepend(cgen_fp_raise_append(host, backend.allowscalar_macro), expr)
     inbounds && (kernels = Expr[cgen_inbounds_wrap(k) for k in kernels])
     p === Float64 && return (host = host, kernels = kernels, helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
     return (host = cgen_convert_precision(host, p),
-            kernels = Expr[cgen_convert_precision(k, p) for k in kernels], helpers = plan.helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
+            kernels = Expr[cgen_convert_precision(k, p) for k in kernels], helpers = helpers, dead_stacks = dead_stacks, compact_stacks = compact_stacks, stack_init = stack_init, fresh = fresh, empty_launches = empty_launches)
 end
 
 stade_cuda(expr::Expr; precision::Union{Nothing, Type{<:AbstractFloat}} = nothing, reduction_threshold::Int = cgen_reduction_threshold_default(), warp_atomics::Bool = true,
