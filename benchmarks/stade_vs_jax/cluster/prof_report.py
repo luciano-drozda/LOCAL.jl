@@ -154,16 +154,15 @@ def main():
     if ncu:
         w("\n## 3. Counters of ncu\n")
         w("ncu runs each kernel alone with the GPU clocks locked, so its times differ from the times of the benchmark. Use the counters, and use the times only to compare kernels with each other. "
-          "`red` and `atom` are the warp instructions of atomic reductions and atomic operations on global memory. `L2 red` and `L2 atom` are the L2 sectors they touch. "
+          "`atom` and `red` are the warp instructions (SASS) of atomic operations and of atomic reductions on global memory. "
           "Values are per call (the mean of the 3 calls).\n")
         for key, (agg, n) in sorted(ncu.items()):
             w(f"\n**{key[2]} {key[3][6:]}, adjoint, STADE {key[1]}** ({n} kernel launches recorded; {' '.join(ncu_info.get(key, []))})\n")
-            w("| kernel | per call | time us | red | atom | L2 red | L2 atom | DRAM MB | SM % | DRAM % |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            w("| kernel | per call | time us | atom warp inst | red warp inst | red warp inst (other counter) |\n|---|---:|---:|---:|---:|---:|")
             for nm, a in sorted(agg.items(), key=lambda kv: -(col(kv[1], "gpu__time_duration") or 0))[:10]:
-                c = a["n"] / NCALL; f = lambda key, sc=1.0: (col(a, key) or 0) / NCALL * sc
-                dram = ((col(a, "dram__bytes_read") or 0) + (col(a, "dram__bytes_write") or 0)) / NCALL / 1e6
-                w(f"| `{short(nm)}` | {c:.1f} | {f('gpu__time_duration') / 1e3:.1f} | {f('smsp__inst_executed_op_global_red'):.3g} | {f('smsp__inst_executed_op_global_atom'):.3g} | "
-                  f"{f('lts__t_sectors_op_red'):.3g} | {f('lts__t_sectors_op_atom'):.3g} | {dram:.1f} | {(col(a, 'sm__throughput') or 0) / a['n']:.0f} | {(col(a, 'dram__throughput') or 0) / a['n']:.0f} |")
+                c = a["n"] / NCALL; f = lambda key: (col(a, key) or 0) / NCALL
+                w(f"| `{short(nm)}` | {c:.1f} | {f('gpu__time_duration') / 1e3:.1f} | {f('smsp__sass_inst_executed_op_global_atom'):.3g} | "
+                  f"{f('smsp__sass_inst_executed_op_global_red'):.3g} | {f('smsp__inst_executed_op_global_red'):.3g} |")
     w("\n## 4. Checks\n")
     chk = []
     for r in bad: chk.append(("FAIL", f"RUN {r['fw']} {r['config']} {r['kernel']} {r['size']} {r['phase']}: status {r.get('status')}, exit {r.get('exit')}"))
