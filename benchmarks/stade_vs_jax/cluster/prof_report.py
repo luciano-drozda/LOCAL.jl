@@ -102,14 +102,14 @@ def main():
     w("\nEach profile run records 3 calls of one case between `cuProfilerStart` and `cuProfilerStop`. Values per call are the total of the 3 calls divided by 3. "
       "The kernels of the reset between calls (`gpu_fill_kernel_`) are not counted. The host time of a call includes the cost of the profiler.\n")
     bad = [r for r in runs if r.get("status") not in ("", None, "ok") or r.get("exit") not in (0, None)]
-    nsys = {}; ncu = {}; rows = []
+    nsys = {}; ncu = {}; ncu_info = {}; rows = []
     for r in runs:
         x = r.get("result") or {}
         key = (r["fw"], r["config"], r["kernel"], r["size"])
         if r["phase"] in ("prof_primal", "prof_adjoint") and x.get("kern_csv"):
             nsys[key + (r["phase"],)] = nsys_summary(x)
         elif r["phase"] == "ncu_adjoint" and x.get("ncu_csv"):
-            ncu[key] = ncu_summary(x)
+            ncu[key] = ncu_summary(x); ncu_info[key] = (x.get('ncu_head') or '').splitlines()[:1]
     ref = {}
     if o.time_ref:
         tr, _ = R.collect([o.time_ref]); st, jx = R.index(tr)
@@ -157,7 +157,7 @@ def main():
           "`red` and `atom` are the warp instructions of atomic reductions and atomic operations on global memory. `L2 red` and `L2 atom` are the L2 sectors they touch. "
           "Values are per call (the mean of the 3 calls).\n")
         for key, (agg, n) in sorted(ncu.items()):
-            w(f"\n**{key[2]} {key[3][6:]}, adjoint, STADE {key[1]}** ({n} kernel launches recorded)\n")
+            w(f"\n**{key[2]} {key[3][6:]}, adjoint, STADE {key[1]}** ({n} kernel launches recorded; {' '.join(ncu_info.get(key, []))})\n")
             w("| kernel | per call | time us | red | atom | L2 red | L2 atom | DRAM MB | SM % | DRAM % |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
             for nm, a in sorted(agg.items(), key=lambda kv: -(col(kv[1], "gpu__time_duration") or 0))[:10]:
                 c = a["n"] / NCALL; f = lambda key, sc=1.0: (col(a, key) or 0) / NCALL * sc

@@ -16,7 +16,7 @@ done
   echo "$P"',"gpu__time_duration.sum","msecond","2.55"'
   echo "$P"',"smsp__inst_executed_op_global_red.sum","inst","1,000,000"'
   echo "$P"',"dram__bytes_read.sum","Mbyte","12.5"'
-  P2=${P/\"0\",/\"1\",}
+  P2=$P   # the same ID again: in application replay the IDs may repeat
   echo "$P2"',"gpu__time_duration.sum","usecond","1500"'
   echo "$P2"',"smsp__inst_executed_op_global_red.sum","inst","5"'; } > "$log"
 exec "$@"

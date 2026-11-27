@@ -48,29 +48,36 @@ const UNIT = Dict("second" => 1e9, "msecond" => 1e6, "usecond" => 1e3, "nsecond"
                   "Kibyte" => 1024.0, "Mibyte" => 1048576.0, "Gibyte" => 1073741824.0)
 # The ncu log with the details page has one row per kernel and metric. This gives one CSV line per kernel: ID, Kernel Name, one column per metric.
 # Times are in ns and sizes are in bytes (the unit of each value is converted with the column Metric Unit).
+const NCU_STATS = Ref("")
 function ncu_lines(txt, w)
     L = split(txt, "\n"); i = findfirst(l -> startswith(l, "\"ID\""), L)
     i === nothing && return ""
     h = csvfields(L[i]); ix(nm) = findfirst(==(nm), h)
     ci, ck, cm, cu, cv = ix("ID"), ix("Kernel Name"), ix("Metric Name"), ix("Metric Unit"), ix("Metric Value")
     any(isnothing, (ci, ck, cm, cv)) && return ""
-    ids = String[]; name = Dict{String,String}(); val = Dict{String,Dict{String,String}}(); mets = String[]
+    # One record per launch. In application replay the IDs may repeat, so a new record starts when the ID or the kernel name changes
+    # or when a metric occurs a second time in the record.
+    recs = Vector{Tuple{String,String,Dict{String,String}}}(); mets = String[]; nrow = 0; ids = Set{String}()
     for l in L[i + 1:end]
         isempty(l) && continue
         f = csvfields(l); length(f) < cv && continue
         all(isdigit, f[ci]) || continue
+        nrow += 1; push!(ids, f[ci])
         id = f[ci]; m = f[cm]
-        haskey(name, id) || (push!(ids, id); name[id] = f[ck]; val[id] = Dict{String,String}())
+        if isempty(recs) || recs[end][1] != id || recs[end][2] != f[ck] || haskey(recs[end][3], m)
+            push!(recs, (id, f[ck], Dict{String,String}()))
+        end
         m in mets || push!(mets, m)
         v = replace(f[cv], "," => ""); u = cu === nothing ? "" : f[cu]
         x = tryparse(Float64, v)
-        val[id][m] = x === nothing ? "" : string(x * get(UNIT, u, 1.0))
+        recs[end][3][m] = x === nothing ? "" : string(x * get(UNIT, u, 1.0))
     end
     out = String["ID,Kernel Name," * join(mets, ",")]
-    for id in ids
-        nm = replace(name[id], '"' => '\''); nm = length(nm) > w ? first(nm, w) : nm
-        push!(out, id * ",\"" * nm * "\"," * join((get(val[id], m, "") for m in mets), ","))
+    for (k, (id, nm0, vals)) in enumerate(recs)
+        nm = replace(nm0, '"' => '\''); nm = length(nm) > w ? first(nm, w) : nm
+        push!(out, string(k - 1) * ",\"" * nm * "\"," * join((get(vals, m, "") for m in mets), ","))
     end
+    NCU_STATS[] = "ncu table: $nrow rows, $(length(ids)) distinct IDs, $(length(recs)) launches"
     return join(out, "\n")
 end
 function main()
@@ -83,7 +90,8 @@ function main()
     nraw = rd(joinpath(d, "ncu.csv")); ncu = ncu_lines(nraw, 160)
     # the messages of ncu (lines that start with ==), and the first lines of the log if the table is empty
     msgs = [length(l) > 400 ? first(l, 400) : l for l in split(nraw, "\n") if startswith(l, "==") && !startswith(l, "==PROF== Connected")]
-    nhead = join(vcat(msgs[1:min(end, 25)], isempty(ncu) ? [length(l) > 300 ? first(l, 300) : l for l in first(split(nraw, "\n"), 12)] : String[]), "\n")
+    filter!(l -> !startswith(l, "==PROF== Disconnected"), msgs)
+    nhead = join(vcat([NCU_STATS[]], msgs[1:min(end, 25)], isempty(ncu) ? [length(l) > 300 ? first(l, 300) : l for l in first(split(nraw, "\n"), 12)] : String[]), "\n")
     println("{\"mode\":" * esc(mode) * ",\"capture\":" * esc(capture) * ",\"prog_exit\":" * pec * ",\"prog\":" * prog * ",\"prog_err\":" * esc(err) *
             ",\"kern_csv\":" * esc(kern) * ",\"api_csv\":" * esc(api) * ",\"ncu_csv\":" * esc(ncu) * ",\"ncu_head\":" * esc(nhead) * "}")
 end
