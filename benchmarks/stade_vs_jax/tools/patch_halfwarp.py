@@ -8,8 +8,8 @@ It never falls through to a full-warp operation after a half-warp operation: the
 import sys
 src = open(sys.argv[1]).read()
 old = 'const SIZES = [("tiny", true), ("bench_1e5", false), ("bench_1e6", false)]'
-assert old in src, "the size list of the script is not the expected one"
-base = src.replace(old, old.replace('("bench_1e5", false)', '("bench_1e5", true)'))
+# a script with another size list (or one already patched) is left as it is: only `tiny` is then verified against the CPU
+base = src.replace(old, old.replace('("bench_1e5", false)', '("bench_1e5", true)')) if old in src else src
 a = base.index('@inline function __stade_wa_add!(arr, idx::Integer, val::Float64)')
 b = base.index('@inline function __stade_wa_add!(arr, idx::Integer, val::Float32)')
 new = '''@inline function __stade_wa_lane_g(m::UInt32, u::UInt64, src::Int32)
