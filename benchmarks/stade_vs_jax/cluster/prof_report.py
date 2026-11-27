@@ -6,7 +6,7 @@ Writes OUTDIR/PROFILE.md and OUTDIR/prof_rows.json.
 Each profile run records 3 calls. A value "per call" is the total over the 3 calls divided by 3.
 The kernels of the reset between calls (names that start with gpu_fill_kernel_) are not counted in the calls. The report lists them apart.
 The host time of a call during profiling includes the cost of the profiler, so it is larger than the time of the benchmark."""
-import argparse, csv, io, json, math, os, sys
+import argparse, csv, io, json, math, os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import report as R
 
@@ -14,13 +14,16 @@ NCALL = 3
 RESET = ("gpu_fill_kernel_",)
 
 
+KROW = re.compile(r'^([\d.]+),(\d+),(\d+),([\d.]+),([\d.]+),(\d+),(\d+),([\d.]+),(.*)$')
+
+
 def kern_rows(txt):
+    """Rows of the kernel table of nsys. A regular expression, not a CSV reader: the last column is a long name with commas, and an old
+    result file has names that are cut inside their quotes, which would make a CSV reader merge the following rows."""
     out = []
-    for row in csv.DictReader(io.StringIO(txt or "")):
-        try:
-            out.append(dict(name=row["Name"], total=float(row["Total Time (ns)"]), n=int(row["Instances"]), avg=float(row["Avg (ns)"])))
-        except (KeyError, ValueError):
-            pass
+    for l in (txt or "").splitlines():
+        m = KROW.match(l.strip())
+        if m: out.append(dict(name=m.group(9).strip('"'), total=float(m.group(2)), n=int(m.group(3)), avg=float(m.group(4)), pct=float(m.group(1))))
     return out
 
 
@@ -69,6 +72,7 @@ def ncu_summary(x):
         a = agg.setdefault(nm, dict(n=0, v={}))
         a["n"] += 1
         for k, v in r.items():
+            if k == "ID": continue
             try: a["v"][k] = a["v"].get(k, 0.0) + float(v.replace(",", ""))
             except (ValueError, AttributeError): pass
     return agg, len(rows)

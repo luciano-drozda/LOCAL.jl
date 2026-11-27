@@ -4,12 +4,19 @@ log=""
 while [ $# -gt 0 ]; do
   case $1 in
     --log-file) log=$2; shift 2;;
-    --target-processes|--profile-from-start|--launch-count|--metrics|--page) shift 2;;
+    --target-processes|--profile-from-start|--launch-count|--metrics|--page|--kernel-name|--print-units) shift 2;;
     --*) shift;;
     *) break;;
   esac
 done
 { echo '==PROF== Connected to process 1'
-  echo '"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","gpu__time_duration.sum","smsp__inst_executed_op_global_red.sum"'
-  echo '"0","1","julia","h","k_","1","7","(256, 1, 1)","(3907, 1, 1)","0","7.0","2550000","1000000"'; } > "$log"
+  H='"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"'
+  echo "$H"
+  P='"0","1","julia","h","k_(CuDeviceArray<Float64, (int)1, (int)1>, Float64)","1","7","(256, 1, 1)","(3907, 1, 1)","0","7.0",""'
+  echo "$P"',"gpu__time_duration.sum","msecond","2.55"'
+  echo "$P"',"smsp__inst_executed_op_global_red.sum","inst","1,000,000"'
+  echo "$P"',"dram__bytes_read.sum","Mbyte","12.5"'
+  P2=${P/\"0\",/\"1\",}
+  echo "$P2"',"gpu__time_duration.sum","usecond","1500"'
+  echo "$P2"',"smsp__inst_executed_op_global_red.sum","inst","5"'; } > "$log"
 exec "$@"

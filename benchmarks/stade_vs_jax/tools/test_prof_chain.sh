@@ -41,6 +41,24 @@ sys.exit(1 if bad else 0)
 PY
 }
 echo "== main job"; run_job main; check main range
+python3 - "$W/main/result.json" "$PKG" <<'PY'
+# the parsers of the report: a long kernel name (with commas) must not hide the next row, and the compact ncu table must give the sums
+import json, sys
+sys.path.insert(0, sys.argv[2] + "/cluster"); import prof_report as P
+d = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); bad = 0
+for r in d["runs"]:
+    x = r["result"] or {}
+    if r["phase"] == "ncu_adjoint":
+        agg, n = P.ncu_summary(x); a = list(agg.values())[0] if agg else None
+        ok = a is not None and n == 2 and a["n"] == 2 and abs(P.col(a, "gpu__time_duration") - 4.05e6) < 1 and P.col(a, "smsp__inst_executed_op_global_red") == 1000005 and abs(P.col(a, "dram__bytes_read") - 1.25e7) < 1
+        print(("ok  " if ok else "BAD ") + "ncu table", n, None if a is None else a["v"])
+    elif x.get("kern_csv"):
+        K = P.kern_rows(x["kern_csv"]); ok = len(K) == 3 and K[1]["name"].startswith("long_kernel_name_") and len(K[1]["name"]) <= 160 and K[2]["name"].startswith("gpu_fill")
+        print(("ok  " if ok else "BAD ") + f"kernel table {r['fw']} {r['phase']}: {len(K)} rows") if r["fw"] == "stade" and r["phase"] == "prof_primal" else None
+    else: ok = True
+    bad += not ok
+sys.exit(1 if bad else 0)
+PY
 echo "== fallback job (the capture range gives no kernel)"; run_job fb FAKE_NSYS_NO_RANGE=1; check fb none || true
 python3 - "$W/fb/result.json" <<'PY'
 import json, sys

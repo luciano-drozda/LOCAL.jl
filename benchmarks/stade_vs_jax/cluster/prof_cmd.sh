@@ -5,7 +5,8 @@
 # The exit code is the exit code of the profiled command (of the last run, if nsys ran twice).
 #   nsys  --cuda-graph-trace=node lists the kernels inside CUDA graphs (XLA runs repeated calls as graphs). The kernel summary (cuda_gpu_kern_sum) and the CUDA API summary (cuda_api_sum) of the recorded calls.
 #         If the capture range gives no kernel, the command runs again without a capture range (capture = none in the result).
-#   ncu   a counter set for each kernel of the recorded calls. NCU_LAUNCH_COUNT (default 300) is the largest number of kernels.
+#   ncu   a counter set for each kernel of the recorded calls whose name matches NCU_KERNEL_REGEX (default cuda_kernel_). NCU_LAUNCH_COUNT, if set, is the largest number of kernels.
+#         The details page gives one row per kernel and metric. prof_pack.jl turns it into one line per kernel.
 set -u
 # nsys and ncu are on the PATH of a login shell (the module of the HPC SDK) and not on the PATH of the job: find them through a login shell.
 for tool in nsys ncu; do
@@ -30,8 +31,10 @@ case $MODE in
     nsys stats --force-export=true --report cuda_api_sum --format csv "$D/prof.nsys-rep" > "$D/api.csv" 2>> "$D/stats.err"
     ;;
   ncu)
-    ncu --target-processes all --profile-from-start off --launch-count "${NCU_LAUNCH_COUNT:-300}" --metrics "$M" --csv --page raw \
-        --log-file "$D/ncu.csv" "$@" > "$D/prog.out" 2> "$D/prog.err" < /dev/null
+    # only the generated kernels (not the fill kernels of the reset). No --launch-count: it kills the program and loses its result (exit 9).
+    LC=(); [ -n "${NCU_LAUNCH_COUNT:-}" ] && LC=(--launch-count "$NCU_LAUNCH_COUNT")
+    ncu --target-processes all --profile-from-start off --kernel-name "regex:${NCU_KERNEL_REGEX:-cuda_kernel_}" "${LC[@]}" --metrics "$M" \
+        --csv --page details --print-units base --log-file "$D/ncu.csv" "$@" > "$D/prog.out" 2> "$D/prog.err" < /dev/null
     PEC=$?
     ;;
   *) echo "usage: prof_cmd.sh nsys|ncu COMMAND..." >&2; exit 2;;

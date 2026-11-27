@@ -23,6 +23,7 @@ case ${1:-} in
     if [ "$rep" = cuda_gpu_kern_sum ]; then
       [ "${FAKE_NSYS_NO_RANGE:-0}" = 1 ] && [ -f "${f%.nsys-rep}.cap" ] && exit 0
       echo '97.2,7653270,3,2551090.0,2550567.0,2550504,2552199,960.9,"k_(CuDeviceArray<Float64, (int)1, (int)1>)"'
+      echo '0.0,1000,1,1000.0,1000.0,1000,1000,0.0,"long_kernel_name_(CuDeviceArray<Float64, (int)1, (int)1>, CuDeviceArray<Float64, (int)1, (int)1>, CuDeviceArray<Float64, (int)1, (int)1>, CuDeviceArray<Float64, (int)1, (int)1>, CuDeviceArray<Float64, (int)1, (int)1>, CuDeviceArray<Float64, (int)1, (int)1>)"'
       echo '2.8,200413,1,200413.0,200413.0,200413,200413,0.0,"gpu_fill_kernel_(CuDeviceArray<Float64, (int)1, (int)1>, Float64)"'
     else
       echo '90.0,1000000,30,33333.0,30000.0,20000,90000,100.0,cuLaunchKernel'
