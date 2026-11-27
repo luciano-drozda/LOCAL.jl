@@ -351,7 +351,7 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
                               int_lo::Int = 3, int_hi::Int = 5, grow_max::Int = 512, max_output_magnitude::Float64 = 1e6, scale::Float64 = 1.0,
                               reduction_threshold::Int = STADE.cgen_reduction_threshold_default(),
                               fresh_gradient::Bool = false, serial_loops::Bool = true, glue_kernels::Bool = true, jacc_glue::Bool = glue_kernels, jacc_async::Bool = true, jacc_async_wait::Bool = true,
-                              jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
+                              jacc_split_min_inner::Int = 256, jacc_split_max_out::Int = 32768, jacc_split_reduce::Int = 16, jacc_warp::Bool = true, warp_runs::Bool = true, jacc_contraction::Int = 256, jacc_dead_pops::Bool = true, jacc_tile_fill::Int = 64,
                               truth::Union{Bool,Symbol} = :on_fail, int_pin::Dict{Symbol,Int} = Dict{Symbol,Int}(),
                               float_range::Dict{Symbol,Tuple{Float64,Float64}} = Dict{Symbol,Tuple{Float64,Float64}}())
     # truth: :off, :on_fail (the BigFloat truth decides a trial that differs from the CPU by more than rtol), :always; true and false mean :always and :off
@@ -443,8 +443,8 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # ---- step 2 + 3: CUDA codegen, then execute ------------------
         if run_cuda
             try
-                plan_init = STADE.stade_gpu(gen_out.initstacks, cuda_backend)
-                plan_gen  = STADE.stade_gpu(gen_expr, cuda_backend; reduction_threshold, fresh_gradient, serial_loops, glue_kernels, init_hosts = Dict{Symbol,Expr}(plan_init.host.args[1].args[1] => plan_init.host))
+                plan_init = STADE.stade_gpu(gen_out.initstacks, cuda_backend; warp_runs)
+                plan_gen  = STADE.stade_gpu(gen_expr, cuda_backend; warp_runs, reduction_threshold, fresh_gradient, serial_loops, glue_kernels, init_hosts = Dict{Symbol,Expr}(plan_init.host.args[1].args[1] => plan_init.host))
                 plan_init = merge(plan_init, (host = STADE.cgen_shrink_stacks(plan_init.host, plan_gen.dead_stacks, plan_gen.compact_stacks),))
                 if write_generated
                     open(joinpath(dir, name * suffix * "_cuda.jl"), "w") do f

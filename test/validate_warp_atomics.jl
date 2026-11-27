@@ -49,6 +49,12 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
             total += n; n > 0 && (kernels_with += 1)
             same = length(on.kernels) == length(off.kernels) && all(src(unwa(a)) == src(b) for (a, b) in zip(on.kernels, off.kernels)) && src(on.host) == src(off.host)
             check(same, "$name [$mode]: $n warp call(s), output equals the plain atomics after substitution")
+            # warp_runs = false: the full-warp helper where the run helper would go, nothing else changes
+            offr = STADE.stade_gpu(e, cuda; warp_runs = false, serial_loops = false, glue_kernels = false, reduce_block = false, inbounds = false, dead_scalars = false, split_reduce = 0, contraction = 0)
+            torun(x) = x isa Expr ? Expr(x.head, Any[a === wr && x.head == :call ? wa : torun(a) for a in x.args]...) : x
+            check(length(on.kernels) == length(offr.kernels) && all(src(torun(a)) == src(b) for (a, b) in zip(on.kernels, offr.kernels)) && !any(k -> STADE.cgen_expr_calls(k, wr), offr.kernels),
+                  "$name [$mode]: warp_runs = false equals the output with each run call renamed to the full-warp call")
+            check((sum(ncallsof(k, wr) for k in offr.kernels; init = 0) == 0) && ((sum(ncallsof(k, wa) for k in offr.kernels; init = 0) > 0) == !isempty(offr.helpers)), "$name [$mode]: warp_runs = false carries the full-warp definitions only")
             check((n > 0) == !isempty(on.helpers), "$name [$mode]: helpers present iff a call is ($(length(on.helpers)) definition(s))")
             check(isempty(off.helpers) && !any(k -> STADE.cgen_expr_calls(k, wa) || STADE.cgen_expr_calls(k, wr), off.kernels), "$name [$mode]: warp_atomics = false has no helper and no call")
             gate_ok = true
@@ -137,7 +143,9 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
     if sabotage
         for (label, sabfn, only) in (
                 ("every index calls itself uniform", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :U\nend", ["idm_tile"]),
-                ("every index calls itself lane-distinct", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :D\nend", ["idm_tile"]))
+                ("every index calls itself lane-distinct", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :D\nend", ["idm_tile"]),
+                ("the run switch is ignored", "cgen_warp_runs_on(backend) = true", ["idm_tile"]),
+                ("the run switch is always off", "cgen_warp_runs_on(backend) = false", ["idm_tile"]))
             script = """
                 include($(repr(joinpath(@__DIR__, "validate_warp_atomics.jl"))))
                 Core.eval(STADE, Meta.parse($(repr(sabfn))))
