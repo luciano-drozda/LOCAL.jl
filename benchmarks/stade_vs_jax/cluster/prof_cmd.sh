@@ -7,6 +7,12 @@
 #         If the capture range gives no kernel, the command runs again without a capture range (capture = none in the result).
 #   ncu   a counter set for each kernel of the recorded calls. NCU_LAUNCH_COUNT (default 300) is the largest number of kernels.
 set -u
+# nsys and ncu are on the PATH of a login shell (the module of the HPC SDK) and not on the PATH of the job: find them through a login shell.
+for tool in nsys ncu; do
+  p=$(command -v $tool 2>/dev/null) || p=$(bash -lc "command -v $tool" 2>/dev/null | tail -n 1)
+  [ -n "$p" ] && PATH="$(dirname "$p"):$PATH"
+done
+export PATH
 MODE=$1; shift
 D=$(mktemp -d "${BUNDLE:?set BUNDLE}/prof_XXXXXX")
 M=gpu__time_duration.sum,smsp__inst_executed_op_global_red.sum,smsp__inst_executed_op_global_atom.sum,lts__t_sectors_op_red.sum,lts__t_sectors_op_atom.sum,dram__bytes_read.sum,dram__bytes_write.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed
