@@ -12476,7 +12476,7 @@ cgen_hoist_max_sites() = 16
 # `__stade_wa_add!(A, idx, val)` or `<macro> A[idx] += val` for a single-index ref of a named array, as cgen_atomic_add and jgen_device_assign emit
 function cgen_atomic_site(e)
     e isa Expr || return nothing
-    if e.head == :call && length(e.args) == 4 && e.args[1] === cgen_warp_add_name() && e.args[2] isa Symbol
+    if e.head == :call && length(e.args) == 4 && (e.args[1] === cgen_warp_add_name() || e.args[1] === cgen_warp_runs_name()) && e.args[2] isa Symbol
         return (arr = e.args[2], idx = e.args[3], val = e.args[4])
     end
     if e.head == :macrocall && length(e.args) == 3 && e.args[3] isa Expr && e.args[3].head == :(+=)
@@ -12864,6 +12864,8 @@ end
 # lanes are active and agree on the index, and issues the plain atomic otherwise. The summation order changes, so results differ from the plain atomic
 # in the last bits; stade_gpu(...; warp_atomics = false) restores the plain atomic exactly.
 cgen_warp_add_name() = :__stade_wa_add!
+cgen_warp_runs_name() = :__stade_wa_runs!
+cgen_warp_runs_on(backend) = get(backend, :warp_runs, true) === true
 cgen_warp_atomics_on(backend) = get(backend, :warp_atomics, false) === true
 
 # `backend.atomic_macro arr[idx] += val`, or a call of the warp helper for a single-index ref of a named array on a backend that has it
@@ -12882,6 +12884,75 @@ end
 
 # Definitions the helper calls need, in file order. Shuffles move 32 bits at a time, so a Float64 or an index travels as two UInt32 halves. Lane ids
 # assume the one-dimensional blocks cgen_launch_expr emits. The lane is 1-based for shfl_sync.
+# The second helper sums over each RUN of adjacent lanes that add to one address and lets the last lane of the run do one atomic add. It is a segmented inclusive scan with
+# shfl_up (five steps, a run never reads across its first lane), so it is exact for any pattern of addresses, with a run of one lane costing one plain atomic. Like the first
+# helper it acts only when all 32 lanes are active, and that test is the same for every lane of the warp, so every shuffle and ballot below is reached by all 32 lanes;
+# otherwise, and when no run has two lanes, the plain atomic runs. Lane ids assume the one-dimensional blocks cgen_launch_expr emits.
+function cgen_warp_runs_helper_exprs()
+    src = """
+    @inline function __stade_wa_up(m::UInt32, u::UInt64, k::Int32)
+        lo = shfl_up_sync(m, UInt32(u & 0x00000000ffffffff), k)
+        hi = shfl_up_sync(m, UInt32(u >> 32), k)
+        return (UInt64(hi) << 32) | UInt64(lo)
+    end
+    @inline function __stade_wa_runs!(arr, idx::Integer, val::Float64)
+        m = active_mask()
+        if m == 0xffffffff
+            i = Int64(idx)
+            lane = UInt32((threadIdx().x - 1) & 31)
+            prev = reinterpret(Int64, __stade_wa_up(m, reinterpret(UInt64, i), Int32(1)))
+            hb = vote_ballot_sync(m, lane == 0x00000000 || i != prev)
+            if hb != 0xffffffff
+                start = 31 - leading_zeros(hb & (0xffffffff >> (31 - lane)))
+                v = val
+                for d in (Int32(1), Int32(2), Int32(4), Int32(8), Int32(16))
+                    n = reinterpret(Float64, __stade_wa_up(m, reinterpret(UInt64, v), d))
+                    if Int32(lane) - d >= Int32(start)
+                        v += n
+                    end
+                end
+                if lane == 0x0000001f || ((hb >> (lane + 0x00000001)) & 0x00000001) != 0x00000000
+                    CUDA.@atomic arr[idx] += v
+                end
+                return nothing
+            end
+        end
+        CUDA.@atomic arr[idx] += val
+        return nothing
+    end
+    @inline function __stade_wa_runs!(arr, idx::Integer, val::Float32)
+        m = active_mask()
+        if m == 0xffffffff
+            i = Int64(idx)
+            lane = UInt32((threadIdx().x - 1) & 31)
+            prev = reinterpret(Int64, __stade_wa_up(m, reinterpret(UInt64, i), Int32(1)))
+            hb = vote_ballot_sync(m, lane == 0x00000000 || i != prev)
+            if hb != 0xffffffff
+                start = 31 - leading_zeros(hb & (0xffffffff >> (31 - lane)))
+                v = val
+                for d in (Int32(1), Int32(2), Int32(4), Int32(8), Int32(16))
+                    n = shfl_up_sync(m, v, d)
+                    if Int32(lane) - d >= Int32(start)
+                        v += n
+                    end
+                end
+                if lane == 0x0000001f || ((hb >> (lane + 0x00000001)) & 0x00000001) != 0x00000000
+                    CUDA.@atomic arr[idx] += v
+                end
+                return nothing
+            end
+        end
+        CUDA.@atomic arr[idx] += val
+        return nothing
+    end
+    @inline function __stade_wa_runs!(arr, idx, val)
+        CUDA.@atomic arr[idx] += val
+        return nothing
+    end
+    """
+    return Expr[cgen_strip_macro_lines(Base.remove_linenums!(a)) for a in Meta.parseall(src).args if a isa Expr]
+end
+
 function cgen_warp_helper_exprs(; jacc::Bool = false)
     src = """
     @inline function __stade_wa_xor(m::UInt32, u::UInt64, k::Int32)
@@ -13059,12 +13130,15 @@ function cgen_warp_classes(k::Expr; seed::Vector{Symbol} = [:__tid])
     return cls
 end
 
-# a call `__stade_wa_add!(A, i, v)` whose index is :D becomes `backend.atomic_macro A[i] += v` again
+# a call `__stade_wa_add!(A, i, v)` is sorted by the class of its index: :D (never equal in adjacent lanes) becomes `backend.atomic_macro A[i] += v` again, :U (equal in every lane)
+# keeps the full-warp helper, and :S or :X (equal in runs of lanes, or unknown) goes to the run-summing helper `__stade_wa_runs!`, unless backend.warp_runs is false
 function cgen_warp_gate_rewrite(e, cls::Dict{Symbol,Symbol}, backend)
     e isa Expr || return e
     args = Any[cgen_warp_gate_rewrite(a, cls, backend) for a in e.args]
-    if e.head === :call && length(e.args) == 4 && e.args[1] === cgen_warp_add_name() && cgen_warp_class(e.args[3], cls) === :D
-        return Expr(:macrocall, backend.atomic_macro, nothing, Expr(:(+=), Expr(:ref, args[2], args[3]), args[4]))
+    if e.head === :call && length(e.args) == 4 && e.args[1] === cgen_warp_add_name()
+        c = cgen_warp_class(e.args[3], cls)
+        c === :D && return Expr(:macrocall, backend.atomic_macro, nothing, Expr(:(+=), Expr(:ref, args[2], args[3]), args[4]))
+        c !== :U && cgen_warp_runs_on(backend) && return Expr(:call, cgen_warp_runs_name(), args[2], args[3], args[4])
     end
     return Expr(e.head, args...)
 end
@@ -13074,11 +13148,13 @@ function cgen_warp_gate(k, backend)
     return cgen_warp_gate_rewrite(k, cgen_warp_classes(k), backend)
 end
 
-# the warp definitions leave the helper list when no kernel calls the helper any more
+# each definition group is present exactly when a kernel calls it
 function cgen_warp_helpers_prune(helpers::Vector{Expr}, kernels::Vector{Expr})
-    any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) && return helpers
     warp = cgen_warp_helper_exprs()
-    return Expr[h for h in helpers if !any(w -> w == h, warp)]
+    runs = cgen_warp_runs_helper_exprs()
+    rest = Expr[h for h in helpers if !any(w -> w == h, warp) && !any(w -> w == h, runs)]
+    return vcat(any(k -> cgen_expr_calls(k, cgen_warp_add_name()), kernels) ? warp : Expr[],
+                any(k -> cgen_expr_calls(k, cgen_warp_runs_name()), kernels) ? runs : Expr[], rest)
 end
 
 # A write races across threads unless the enclosing device loop's thread-mapped variable occurs in the write's index, or through a chain of let-
@@ -22341,7 +22417,7 @@ end
 function val_count_atomic_sites(expr, atomic_macro)
     expr isa Expr || return 0
     n = (expr.head == :macrocall && !isempty(expr.args) && expr.args[1] == atomic_macro) ? 1 : 0
-    n += (expr.head == :call && !isempty(expr.args) && expr.args[1] === cgen_warp_add_name()) ? 1 : 0
+    n += (expr.head == :call && !isempty(expr.args) && (expr.args[1] === cgen_warp_add_name() || expr.args[1] === cgen_warp_runs_name())) ? 1 : 0
     n += (expr.head == :(=) && expr.args[1] isa Expr && expr.args[1].head === :ref && expr.args[1].args[1] === :__shr) ? 4 : 0
     for a in expr.args
         n += val_count_atomic_sites(a, atomic_macro)

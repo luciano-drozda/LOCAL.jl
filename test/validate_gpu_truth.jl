@@ -21,7 +21,7 @@ function validate_gpu_truth(dir::String = joinpath(@__DIR__, "val-corpus"); only
         init_name = match(r"stacks_cpu = _val_init_stacks_local\((\w+), Any\[", txt).captures[1]
         out = String[]; cut = false
         for l in lines
-            if startswith(l, "@inline function __stade_wa_xor") || startswith(l, "function $(init_name)_cuda(")
+            if startswith(l, "@inline function __stade_wa_xor") || startswith(l, "@inline function __stade_wa_up") || startswith(l, "function $(init_name)_cuda(")
                 cut = true
             end
             cut && startswith(l, "function _val_init_stacks_local") && (cut = false)
