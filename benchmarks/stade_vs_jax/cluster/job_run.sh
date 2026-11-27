@@ -5,13 +5,15 @@
 #   JOB_BUDGET_S   no new run starts after this many seconds. Later runs get status skipped_budget.
 #   STADE_RUN_TMO, JAX_RUN_TMO   time limit of one run, in seconds
 #   STADE_COMMIT, KIT_HASH       recorded in the results
-# plan.tsv, tab separated: fw config kernel size phases. For STADE the size is "-". phases is a comma list.
+# plan.tsv, tab separated: fw config kernel size phases. For STADE the size is "-" (a profile phase gives the size label, for example bench_1e6). phases is a comma list.
+# The phases prof_primal and prof_adjoint run under nsys, the phase ncu_adjoint runs the adjoint under ncu (cluster/prof_cmd.sh).
 # Each run is one process. Each run writes OUT/NNNN/{info.txt,out.json,err.txt,gpu_before.json,gpu.json}.
 set -u
 OUT=$BUNDLE/out; mkdir -p "$OUT"
 T0=$(date +%s); DEADLINE=$((T0 + ${JOB_BUDGET_S:-6300}))
 GS="bash $BUNDLE/cluster/gpu_state.sh"
-export STADE_COMMIT KIT_HASH
+export STADE_COMMIT KIT_HASH BUNDLE JULIA_BIN
+PROF="bash $BUNDLE/cluster/prof_cmd.sh"
 
 # run_one FW CONFIG KERNEL SIZE PHASE TIMEOUT COMMAND...
 run_one() {
@@ -41,8 +43,14 @@ run_one() {
 while IFS=$'\t' read -r fw cfg k sz phases; do
   [ "$fw" = stade ] || continue
   for ph in ${phases//,/ }; do
-    run_one stade "$cfg" "$k" "" "$ph" "${STADE_RUN_TMO:-1800}" \
-      env STADE_PHASE="$ph" BENCH_CONFIG="$cfg" "$JULIA_BIN" --startup-file=no --project="$JPROJ" "$BUNDLE/stade/${k}_${cfg}.jl"
+    case $ph in
+      prof_*) run_one stade "$cfg" "$k" "$sz" "$ph" "${STADE_RUN_TMO:-1800}" $PROF nsys \
+                env STADE_PHASE="$ph" STADE_SIZE="$sz" BENCH_CONFIG="$cfg" "$JULIA_BIN" --startup-file=no --project="$JPROJ" "$BUNDLE/stade/${k}_${cfg}.jl";;
+      ncu_*)  run_one stade "$cfg" "$k" "$sz" "$ph" "${STADE_RUN_TMO:-1800}" $PROF ncu \
+                env STADE_PHASE="prof_${ph#ncu_}" STADE_SIZE="$sz" BENCH_CONFIG="$cfg" "$JULIA_BIN" --startup-file=no --project="$JPROJ" "$BUNDLE/stade/${k}_${cfg}.jl";;
+      *)      run_one stade "$cfg" "$k" "" "$ph" "${STADE_RUN_TMO:-1800}" \
+                env STADE_PHASE="$ph" BENCH_CONFIG="$cfg" "$JULIA_BIN" --startup-file=no --project="$JPROJ" "$BUNDLE/stade/${k}_${cfg}.jl";;
+    esac
   done
 done < "$BUNDLE/plan.tsv"
 
@@ -64,8 +72,12 @@ if grep -q '^jax' "$BUNDLE/plan.tsv"; then
       rm -rf "$D"; continue
     fi
     for ph in ${phases//,/ }; do
-      run_one jax J "$k" "$sz" "$ph" "${JAX_RUN_TMO:-500}" \
-        env -u LD_LIBRARY_PATH python reference/time_fw.py --case "$D" --roles "roles/$k.small" --phase "$ph"
+      case $ph in
+        prof_*) run_one jax J "$k" "$sz" "$ph" "${JAX_RUN_TMO:-500}" $PROF nsys \
+                  env -u LD_LIBRARY_PATH python reference/time_fw.py --case "$D" --roles "roles/$k.small" --phase "$ph";;
+        *)      run_one jax J "$k" "$sz" "$ph" "${JAX_RUN_TMO:-500}" \
+                  env -u LD_LIBRARY_PATH python reference/time_fw.py --case "$D" --roles "roles/$k.small" --phase "$ph";;
+      esac
     done
     rm -rf "$D"
   done < "$BUNDLE/plan.tsv"

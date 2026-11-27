@@ -51,3 +51,7 @@ python3 cluster/report.py --results work/results/time.json --results work/result
 ## Option ablation
 
 `CONFIGS="C A P G" bash cluster/gen_stade_scripts.sh OUTDIR "KERNELS"` also generates the configs P (`primal_outputs = false` alone) and G (`fresh_gradient = true` alone). Build a STADE-only time job with `build_job.py ... --no-jax --phases time --configs C,P,G,A`. Build the report with `python3 cluster/ablation_report.py --results RESULT.json --stade-dir OUTDIR/all --ref FULLT1.json --out OUTDIR`. `tools/test_ablation.sh` tests the chain on the CPU.
+
+## Profiling
+
+The phases `prof_primal` and `prof_adjoint` record 3 calls of one case between `cuProfilerStart` and `cuProfilerStop`. `cluster/prof_cmd.sh` runs them under `nsys` (kernel and API summary), and the phase `ncu_adjoint` runs the adjoint under `ncu` (counters). Write a plan file (tab separated: fw, config, kernel, size label, phases), then `python3 cluster/build_job.py OUTDIR --stade-dir DIR --roles work --plan-file PLAN --limit-min 90`, and build the report with `python3 cluster/prof_report.py --results RESULT.json --time-ref FULLT1.json --out OUTDIR`. `tools/test_prof_chain.sh` tests the chain on the CPU with fake `nsys` and `ncu`.

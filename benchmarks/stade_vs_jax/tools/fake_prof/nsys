@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fake nsys for the CPU test of the profile chain. profile: runs the command. stats: prints a small CSV table.
+# FAKE_NSYS_NO_RANGE=1: a run with a capture range gives an empty kernel table (the case that prof_cmd.sh must repair by running again without it).
+case ${1:-} in
+  profile)
+    shift; out=""; cap=0
+    while [ $# -gt 0 ]; do
+      case $1 in
+        -o) out=$2; shift 2;;
+        --force-overwrite) shift 2;;
+        --capture-range=*) cap=1; shift;;
+        --*) shift;;
+        *) break;;
+      esac
+    done
+    [ "$cap" = 1 ] && echo cap > "$out.cap" || rm -f "$out.cap"
+    touch "$out.nsys-rep"; exec "$@";;
+  stats)
+    shift; rep=""; f=""
+    while [ $# -gt 0 ]; do case $1 in --report) rep=$2; shift 2;; --format|--force-export) shift 2;; --force-export=*) shift;; *) f=$1; shift;; esac; done
+    echo "Generating SQLite file x.sqlite from $f"; echo "Processing [x.sqlite] with [$rep.py]..."
+    echo "Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name"
+    if [ "$rep" = cuda_gpu_kern_sum ]; then
+      [ "${FAKE_NSYS_NO_RANGE:-0}" = 1 ] && [ -f "${f%.nsys-rep}.cap" ] && exit 0
+      echo '97.2,7653270,3,2551090.0,2550567.0,2550504,2552199,960.9,"k_(CuDeviceArray<Float64, (int)1, (int)1>)"'
+      echo '2.8,200413,1,200413.0,200413.0,200413,200413,0.0,"gpu_fill_kernel_(CuDeviceArray<Float64, (int)1, (int)1>, Float64)"'
+    else
+      echo '90.0,1000000,30,33333.0,30000.0,20000,90000,100.0,cuLaunchKernel'
+    fi;;
+  *) exit 2;;
+esac

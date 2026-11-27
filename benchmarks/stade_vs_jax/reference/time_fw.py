@@ -6,7 +6,9 @@ the same roles that STADE uses. Prints one JSON line. Run one case and one phase
 Phases:
   time        timed calls of the primal and of the adjoint (host clock around one call and block_until_ready). No memory reading.
   mem_primal  only the inputs are on the device. First call, 3 calls, memory reading. No timing.
-  mem_adjoint the inputs and the cotangents are on the device. First call, 3 calls, memory reading. No timing."""
+  mem_adjoint the inputs and the cotangents are on the device. First call, 3 calls, memory reading. No timing.
+  prof_primal, prof_adjoint  First call, 2 warm-up calls, then 3 calls between cuProfilerStart and cuProfilerStop (through the CUDA driver library),
+              so that nsys or ncu with a capture range = profiler API records only these calls. No timing, no memory reading."""
 import argparse, gc, json, os, platform, subprocess, sys, time
 import numpy as np
 
@@ -47,6 +49,16 @@ def smi_driver():
         return None
 
 
+def prof_api():
+    # start and stop functions of the CUDA profiler range. They do nothing if the driver library is absent (a CPU test).
+    try:
+        import ctypes
+        cu = ctypes.CDLL("libcuda.so.1")
+        return (lambda: cu.cuProfilerStart()), (lambda: cu.cuProfilerStop())
+    except OSError:
+        return (lambda: None), (lambda: None)
+
+
 def _sub(a, b):
     return None if a is None or b is None else a - b
 
@@ -85,13 +97,14 @@ def run_jax(meta, args, roles, warmup, reps, phase):
 
     res = {"phase": phase, "outputs": outk, "differentiated": keys, "versions": versions(jax),
            "input_mb": sum(v.nbytes for v in args.values() if isinstance(v, np.ndarray)) / 1e6}
-    if phase != "time":
+    memph = phase in ("mem_primal", "mem_adjoint")
+    if memph:
         res["mem_context_mb"] = mem0
         res["mem_inputs_mb"] = _sub(smi_mb(), mem0)
     primal = jax.jit(outs)
     adjoint = jax.jit(lambda xs, cot: jax.vjp(outs, xs)[1](cot)[0])
     cot = None
-    if phase != "mem_primal":
+    if phase in ("time", "mem_adjoint", "prof_adjoint"):
         rng = np.random.default_rng(7)
         oshapes = [shp[k].shape for k in outk]
         cot = tuple(jax.device_put(rng.standard_normal(int(np.prod(sh)))).reshape(sh) for sh in oshapes)
@@ -100,7 +113,9 @@ def run_jax(meta, args, roles, warmup, reps, phase):
         res["mem_setup_mb"] = _sub(smi_mb(), mem0)
     todo = {"time": (("primal", primal, (xs,)), ("adjoint", adjoint, (xs, cot))),
             "mem_primal": (("primal", primal, (xs,)),),
-            "mem_adjoint": (("adjoint", adjoint, (xs, cot)),)}[phase]
+            "mem_adjoint": (("adjoint", adjoint, (xs, cot)),),
+            "prof_primal": (("primal", primal, (xs,)),),
+            "prof_adjoint": (("adjoint", adjoint, (xs, cot)),)}[phase]
     for name, fn, a in todo:
         t0 = time.perf_counter(); r = fn(*a); jax.block_until_ready(r); first = time.perf_counter() - t0
         if name == "adjoint":
@@ -116,13 +131,22 @@ def run_jax(meta, args, roles, warmup, reps, phase):
             for _ in range(reps):
                 t0 = time.perf_counter(); jax.block_until_ready(fn(*a)); ts.append(time.perf_counter() - t0)
             res[name] = stats(ts); res[name]["first_call_s"] = first
+        elif phase.startswith("prof"):
+            for _ in range(2):
+                jax.block_until_ready(fn(*a))
+            start, stop = prof_api(); ts = []
+            start()
+            for _ in range(3):
+                t0 = time.perf_counter(); jax.block_until_ready(fn(*a)); ts.append(time.perf_counter() - t0)
+            stop()
+            res["prof_calls_s"] = ts; res["first_call_s"] = first
         else:
             for _ in range(3):
                 jax.block_until_ready(fn(*a))
             gc.collect()
             res["mem_peak_%s_mb" % name] = _sub(smi_mb(), mem0)
             res["first_%s_call_s" % name] = first
-    if phase != "time":
+    if memph:
         st = jax.devices()[0].memory_stats() or {}
         res["peak_mb"] = st.get("peak_bytes_in_use", 0) / 1e6
         res["pool_mb"] = st.get("pool_bytes", 0) / 1e6
@@ -133,7 +157,7 @@ def run_jax(meta, args, roles, warmup, reps, phase):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--case", required=True); p.add_argument("--roles", required=True)
-    p.add_argument("--phase", default="time", choices=["time", "mem_primal", "mem_adjoint"])
+    p.add_argument("--phase", default="time", choices=["time", "mem_primal", "mem_adjoint", "prof_primal", "prof_adjoint"])
     p.add_argument("--warmup", type=int, default=5); p.add_argument("--reps", type=int, default=30)
     o = p.parse_args()
     meta, args = load_case(o.case)

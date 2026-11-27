@@ -15,6 +15,7 @@ end
 CuArray(x::AbstractArray) = reg!(copy(x))
 zeros(::Type{T}, dims...) where {T} = reg!(Base.zeros(T, dims...))
 synchronize() = nothing
+module Profile; start() = nothing; stop() = nothing; end   # the profiler range of the prof phases
 reclaim() = (filter!(w -> w.value !== nothing, REG); nothing)
 used_bytes() = sum((sizeof(w.value) for w in REG if w.value !== nothing); init = 0)
 total_memory() = 16 * 10^9

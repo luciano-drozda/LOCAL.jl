@@ -6,6 +6,8 @@ Usage: STADE_SRC=/path/to/src/STADE.jl python3 build_job.py OUTDIR --stade-dir D
   --kernels K ...   only these kernels (default: all of gpu/specs.py)
   --max-sizes N     only the first N benchmark sizes of each kernel (a smoke job or a local test). Use the same N in gen_stade_scripts.sh (MAX_SIZES).
   --configs LIST    comma list of STADE configs (default C,A). P and G are the ablation configs of gen_stade_scripts.sh.
+  --plan-file FILE  use the lines of this file as the plan (fw, config, kernel, size, phases; tab separated) instead of the plan made from the options above.
+                    Used for the profile job (phases prof_primal, prof_adjoint, ncu_adjoint).
   --no-stade, --no-jax   leave one framework out
   --limit-min N     the time limit of the V100 job (default 120). No new run starts 15 min before it.
   --stade-tmo S, --jax-tmo S   the time limit of one run (default 1800 and 500)
@@ -21,12 +23,17 @@ ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("--stade-dir"); ap.add_argument("--roles", required=True)
 ap.add_argument("--phases", default="time,mem_primal,mem_adjoint"); ap.add_argument("--kernels", nargs="*")
 ap.add_argument("--max-sizes", type=int, default=0); ap.add_argument("--no-stade", action="store_true"); ap.add_argument("--no-jax", action="store_true")
-ap.add_argument("--configs", default="C,A"); ap.add_argument("--limit-min", type=int, default=120); ap.add_argument("--stade-tmo", type=int, default=1800); ap.add_argument("--jax-tmo", type=int, default=500)
+ap.add_argument("--configs", default="C,A"); ap.add_argument("--plan-file"); ap.add_argument("--limit-min", type=int, default=120); ap.add_argument("--stade-tmo", type=int, default=1800); ap.add_argument("--jax-tmo", type=int, default=500)
 o = ap.parse_args()
 phases = o.phases.split(",")
-bad = [p for p in phases if p not in ("time", "mem_primal", "mem_adjoint")]
+bad = [p for p in phases if p not in ("time", "mem_primal", "mem_adjoint", "prof_primal", "prof_adjoint", "ncu_adjoint")]
 if bad: sys.exit(f"unknown phase {bad}")
-kernels = o.kernels or list(SZ)
+fplan = [l.rstrip("\n").split("\t") for l in open(o.plan_file) if l.strip() and not l.startswith("#")] if o.plan_file else None
+if fplan:
+    for r in fplan:
+        if len(r) != 5 or r[0] not in ("stade", "jax"): sys.exit(f"bad plan line {r}")
+    o.no_stade = not any(r[0] == "stade" for r in fplan); o.no_jax = not any(r[0] == "jax" for r in fplan)
+kernels = o.kernels or (sorted({r[2] for r in fplan}) if fplan else list(SZ))
 for k in kernels:
     if k not in SZ: sys.exit(f"unknown kernel {k}")
 if not o.no_stade and not o.stade_dir: sys.exit("--stade-dir is required unless --no-stade")
@@ -35,7 +42,7 @@ out = os.path.abspath(o.out); B = out + "/bundle"
 shutil.rmtree(B, ignore_errors=True)
 for d in ("tools", "roles", "stade", "cluster"): os.makedirs(f"{B}/{d}")
 for f in ("inputs.jl", "dump_inputs.jl"): shutil.copy(f"{PKG}/tools/{f}", f"{B}/tools/{f}")
-for f in ("gpu_state.sh", "job_run.sh"): shutil.copy(f"{HERE}/{f}", f"{B}/cluster/{f}")
+for f in ("gpu_state.sh", "job_run.sh", "prof_cmd.sh", "prof_pack.jl"): shutil.copy(f"{HERE}/{f}", f"{B}/cluster/{f}")
 if not o.no_jax:
     shutil.copytree(f"{PKG}/kernels", f"{B}/kernels")
     shutil.copytree(f"{PKG}/reference", f"{B}/reference", ignore=shutil.ignore_patterns("__pycache__"))
@@ -44,7 +51,14 @@ if not o.no_jax:
         shutil.copy(f"{o.roles}/roles/{k}.small/meta.json", f"{B}/roles/{k}.small/meta.json")
 
 plan = []
-if not o.no_stade:
+if fplan:
+    for fw, cfg, k, sz, ph in fplan:
+        if fw == "stade":
+            src = f"{o.stade_dir}/all/{k}_{cfg}.jl"
+            if not os.path.isfile(src): sys.exit(f"missing {src}")
+            shutil.copy(src, f"{B}/stade/{k}_{cfg}.jl")
+        plan.append((fw, cfg, k, sz, ph))
+elif not o.no_stade:
     for k in kernels:
         for cfg in o.configs.split(","):
             src = f"{o.stade_dir}/all/{k}_{cfg}.jl"
@@ -52,7 +66,7 @@ if not o.no_stade:
             shutil.copy(src, f"{B}/stade/{k}_{cfg}.jl")
             ph = [p for p in phases if not (cfg != "C" and p == "mem_primal")]
             if ph: plan.append(("stade", cfg, k, "-", ",".join(ph)))
-if not o.no_jax:
+if not o.no_jax and not fplan:
     for k in kernels:
         for s in SZ[k][:o.max_sizes or None]: plan.append(("jax", "J", k, s, ",".join(phases)))
 plan_txt = "".join("\t".join(r) + "\n" for r in plan)

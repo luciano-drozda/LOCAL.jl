@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake ncu for the CPU test of the profile chain: writes one CSV row to the log file and runs the command.
+log=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --log-file) log=$2; shift 2;;
+    --target-processes|--profile-from-start|--launch-count|--metrics|--page) shift 2;;
+    --*) shift;;
+    *) break;;
+  esac
+done
+{ echo '==PROF== Connected to process 1'
+  echo '"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","gpu__time_duration.sum","smsp__inst_executed_op_global_red.sum"'
+  echo '"0","1","julia","h","k_","1","7","(256, 1, 1)","(3907, 1, 1)","0","7.0","2550000","1000000"'; } > "$log"
+exec "$@"

@@ -5,16 +5,23 @@
 #               CUDA events (CUDA.@elapsed) and the host clock with a device synchronization. No memory reading.
 #   mem_primal  only the inputs are on the device. First call, 3 calls, memory reading. No timing.
 #   mem_adjoint the inputs, the gradient buffers and the stacks are on the device. First call, 3 calls, memory reading. No timing.
+#   prof_primal, prof_adjoint  one size (environment STADE_SIZE, for example bench_1e6). First call, one warm-up call, then 3 calls between
+#               cuProfilerStart and cuProfilerStop, so that nsys or ncu (capture range = profiler API) records only these calls. No timing.
 # The reset of the inputs is outside every timer.
 # ======================================================================================
 using Statistics
 const PHASE = get(ENV, "STADE_PHASE", "time")
-PHASE in ("time", "mem_primal", "mem_adjoint") || error("STADE_PHASE must be time, mem_primal or mem_adjoint, got $PHASE")
+PHASE in ("time", "mem_primal", "mem_adjoint", "prof_primal", "prof_adjoint") || error("STADE_PHASE must be time, mem_primal, mem_adjoint, prof_primal or prof_adjoint, got $PHASE")
+const ISMEM = PHASE in ("mem_primal", "mem_adjoint")
+const ISPROF = startswith(PHASE, "prof")
 const HAVE_CUDA = isdefined(@__MODULE__, :CUDA)   # the CPU stand-in (tools/cpu_standin.py) defines a CUDA module too
 const SUFFIX = "cuda"
 _arr(x) = CuArray(x)
 const ON_DEVICE = HAVE_CUDA
 _sync() = (ON_DEVICE && CUDA.synchronize(); nothing)
+# the profiler range: the device calls between start and stop are the ones that nsys or ncu records
+_pstart() = (ON_DEVICE && Base.invokelatest(CUDA.Profile.start); nothing)
+_pstop() = (ON_DEVICE && Base.invokelatest(CUDA.Profile.stop); nothing)
 # CUDA.@elapsed is a macro; parse it from a string so a machine without CUDA can still load this file
 const _ELAPSED = ON_DEVICE ? Core.eval(@__MODULE__, Meta.parse("f -> CUDA.@elapsed f()")) : nothing
 _dtime(f) = ON_DEVICE ? Base.invokelatest(_ELAPSED, f) : _wtime(f)
@@ -94,8 +101,8 @@ _alloc_mb(f) = ON_DEVICE ? Base.invokelatest(Core.eval(@__MODULE__, Meta.parse("
 
 function run_size(label, verify)
     res = Dict{String,Any}("size" => label, "phase" => PHASE)
-    _settle(); mem0 = PHASE == "time" ? nothing : _used_dev()   # the time phase reads no memory
-    PHASE == "time" || (res["mem_context_mb"] = mem0)
+    _settle(); mem0 = ISMEM ? _used_dev() : nothing   # only the memory phases read memory
+    ISMEM && (res["mem_context_mb"] = mem0)
     args = bench_inputs(NAME, label)
     host = Dict{Symbol,Any}(args)
     rng = MersenneTwister(7)
@@ -103,12 +110,28 @@ function run_size(label, verify)
     orig = Dict{Symbol,Any}(n => copy(v) for (n, v) in args if v isa AbstractArray)
     dev = Dict{Symbol,Any}(n => (v isa AbstractArray ? _arr(v) : v) for (n, v) in args)
     res["input_mb"] = _nbytes(args) / 1e6
-    if PHASE != "time"; _settle(); res["mem_inputs_mb"] = _rd(_used_dev(), mem0); res["live_inputs_mb"] = _live_mb(); end
+    if ISMEM; _settle(); res["mem_inputs_mb"] = _rd(_used_dev(), mem0); res["live_inputs_mb"] = _live_mb(); end
     fp = getfield(@__MODULE__, Symbol(NAME * "_" * SUFFIX))
     fb = getfield(@__MODULE__, Symbol(NAME * "_b_" * SUFFIX))
     fi = getfield(@__MODULE__, Symbol("initstacks_" * NAME * "_b_" * SUFFIX))
     pargs = [dev[nm] for nm in _ckname(fp)]
     reset_p!() = (for n in DEPS; copyto!(dev[n], orig[n]); end; nothing)
+
+    # profile phases: 3 calls inside the profiler range. The reset before each call (outside the call) is inside the range too, so the kernels
+    # of the reset (fill!) appear in the trace. The report sets them apart by name.
+    function prof_calls(f, reset!)
+        reset!(); res["first_call_s"] = @elapsed (f(); _sync())
+        reset!(); f(); _sync()
+        ts = Float64[]
+        _pstart()
+        for _ in 1:3
+            reset!(); _sync(); push!(ts, _wtime(f))
+        end
+        _pstop()
+        res["prof_calls_s"] = ts
+        return res
+    end
+    PHASE == "prof_primal" && return prof_calls(() -> fp(pargs...), reset_p!)
 
     if PHASE == "mem_primal"
         # only the inputs are on the device: no gradient buffers, no stacks
@@ -133,6 +156,8 @@ function run_size(label, verify)
     res["stack_mb"] = sum((sizeof(s) for s in st if s isa AbstractArray); init = 0) / 1e6
     res["grad_mb"] = sum((sizeof(b) for (_, b) in g); init = 0) / 1e6
     res["device_mb_estimate"] = res["input_mb"] + res["grad_mb"] + res["stack_mb"]
+
+    PHASE == "prof_adjoint" && return prof_calls(() -> fb(vals...), reset_a!)
 
     if PHASE == "mem_adjoint"
         _settle(); res["mem_setup_mb"] = _rd(_used_dev(), mem0)   # inputs + gradient buffers + stacks, nothing else live
@@ -220,12 +245,15 @@ _json(x::AbstractDict) = "{" * join((_jstr(string(k)) * ":" * _json(v) for (k, v
 
 results = Any[]
 # memory phases: one throwaway pass on the first size, so the one-time memory of code modules and libraries is not in the readings
-if PHASE != "time"
+if ISMEM
     wl = filter(x -> !x[2], SIZES)
     isempty(wl) || (try; run_size(first(wl)[1], false); catch; end; _settle())
 end
 # the memory phases skip the verify sizes (the time phase checks them)
-for (label, verify) in (PHASE == "time" ? SIZES : filter(x -> !x[2], SIZES))
+# a profile phase runs the one size named in STADE_SIZE
+_psz = get(ENV, "STADE_SIZE", "")
+ISPROF && ((!isempty(_psz) && any(x -> x[1] == _psz, SIZES)) || error("STADE_SIZE=\"$_psz\" is not a size of $NAME"))
+for (label, verify) in (PHASE == "time" ? SIZES : ISPROF ? filter(x -> x[1] == _psz, SIZES) : filter(x -> !x[2], SIZES))
     r = try
         run_size(label, verify)
     catch err
