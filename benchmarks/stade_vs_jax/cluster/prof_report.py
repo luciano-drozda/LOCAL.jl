@@ -1,6 +1,6 @@
 """Builds the report of the profile job: per-kernel device times from nsys, and counters from ncu.
 Usage: python3 prof_report.py --results FILE [--time-ref FILE] --out OUTDIR
-  --results   the result file of the profile job (phases prof_primal, prof_adjoint, ncu_adjoint)
+  --results   one or more result files of profile jobs (phases prof_primal, prof_adjoint, ncu_adjoint)
   --time-ref  a result file with time runs (FULLT1), for the time of one call without a profiler. Optional.
 Writes OUTDIR/PROFILE.md and OUTDIR/prof_rows.json.
 Each profile run records 3 calls. A value "per call" is the total over the 3 calls divided by 3.
@@ -86,9 +86,9 @@ def col(a, key):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", required=True); ap.add_argument("--time-ref"); ap.add_argument("--out", required=True)
+    ap.add_argument("--results", required=True, nargs="+"); ap.add_argument("--time-ref"); ap.add_argument("--out", required=True)
     o = ap.parse_args()
-    runs, jobs = R.collect([o.results])
+    runs, jobs = R.collect(o.results)
     P = []; w = P.append
     w("# Profile of the adjoint and the primal on a V100\n")
     for j in jobs:
@@ -155,13 +155,13 @@ def main():
         w("\n## 3. Counters of ncu\n")
         w("ncu runs each kernel alone with the GPU clocks locked, so its times differ from the times of the benchmark. Use the counters, and use the times only to compare kernels with each other. "
           "`atom` and `red` are the warp instructions (SASS) of atomic operations and of atomic reductions on global memory. "
-          "Values are per call (the mean of the 3 calls).\n")
+          "Values are the mean over the launches that ncu recorded (the column says how many). Some launches of a profiled range may be missing: see the README of the job folder.\n")
         for key, (agg, n) in sorted(ncu.items()):
             w(f"\n**{key[2]} {key[3][6:]}, adjoint, STADE {key[1]}** ({n} kernel launches recorded; {' '.join(ncu_info.get(key, []))})\n")
-            w("| kernel | per call | time us | atom warp inst | red warp inst | red warp inst (other counter) |\n|---|---:|---:|---:|---:|---:|")
+            w("| kernel | launches recorded | time us | atom warp inst | red warp inst | red warp inst (other counter) |\n|---|---:|---:|---:|---:|---:|")
             for nm, a in sorted(agg.items(), key=lambda kv: -(col(kv[1], "gpu__time_duration") or 0))[:10]:
-                c = a["n"] / NCALL; f = lambda key: (col(a, key) or 0) / NCALL
-                w(f"| `{short(nm)}` | {c:.1f} | {f('gpu__time_duration') / 1e3:.1f} | {f('smsp__sass_inst_executed_op_global_atom'):.3g} | "
+                c = a["n"]; f = lambda key: (col(a, key) or 0) / a["n"]
+                w(f"| `{short(nm)}` | {c} | {f('gpu__time_duration') / 1e3:.1f} | {f('smsp__sass_inst_executed_op_global_atom'):.3g} | "
                   f"{f('smsp__sass_inst_executed_op_global_red'):.3g} | {f('smsp__inst_executed_op_global_red'):.3g} |")
     w("\n## 4. Checks\n")
     chk = []

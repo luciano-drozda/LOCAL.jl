@@ -13,6 +13,7 @@ A statement marked **Hypothesis** was not tested. The data fit the statement, an
 5. **Where STADE loses.** The NN kernels (mlp3, mlp3_push, transformer_block and unet2 at c16_n256) lose in the adjoint with C. Stencil kernels at large size and ufv_gather_step also lose with C. Configuration A removes the loss for most stencil cases. It does not remove the loss for the transformer, ufv_gather_step at 1e6, mlp3 at 13M and unet2 at c16_n256.
 6. **One case JAX cannot run.** JAX runs out of memory on euler2d_step at 16e6 (it asks for 8 GiB in one allocation). STADE runs this case and uses 2.0 GB for the adjoint. No gap exists for it.
 7. **Which option gives the gain of A.** Job ABL1 (section 4.3) shows that `primal_outputs = false` gives most of it (28 cases: 0.80 of the C time, against 0.94 for `fresh_gradient` alone and 0.76 for both). `fresh_gradient` is the gain for mlp3_push and adds to P for mlp3 and wave2d_step. Neither option changes unet2.
+8. **Profile.** The `nsys` profile of four cases (section 4.5) shows that the remaining losses are device time and not call overhead. Three of the cases that lose are the transformer adjoint (generated kernels, 5 ms), the mpnn_gather adjoint (three kernels with atomic adds, 92 % of the time) and the mlp3 adjoint (kernels at 3.5 to 5 passes over the weights). `ncu` gave no counter.
 
 ## 2. How to read the numbers
 
@@ -110,6 +111,47 @@ The geometric-mean ratio is 3.27 for STADE (C) and 2.09 for JAX. Two groups expl
 
 For unet2 the JAX ratio is higher than the STADE ratio (6.5, 5.5, 4.0 against 5.3, 3.5, 2.7 at three sizes). The JAX adjoint of unet2 is slow relative to its primal. This is why STADE is faster in its adjoint at three of four sizes while it is slower in its primal.
 
+### 4.5 Profile of four cases (jobs PROF3 and PROF8)
+
+The profile used `nsys` for the device time of each kernel (job PROF3, `results/profile_2026-11-27/`). Four cases were profiled in the primal and in the adjoint, for STADE (C and A) and for JAX: mpnn_gather 1e6, transformer_block d1024_T1024, mlp3 13M and swe2d_step 1e6. A value is the mean of 3 calls. "Kernel ms" is the sum of the device times of all kernels of one call. "Bench ms" is the time of one call in FULLT1 (host clock). The tool `ncu` gave no usable counter for the kernels that matter (see the end of this section).
+
+| case (adjoint) | STADE C kernel ms (launches) | STADE A kernel ms (launches) | JAX kernel ms (launches) | STADE C / A / JAX bench ms |
+|---|---:|---:|---:|---:|
+| mpnn_gather 1e6 | 40.1 (5) | 39.4 (5) | 35.9 (36) | 39.7 / 39.6 / 36.8 |
+| transformer_block d1024_T1024 | 23.9 (41) | 21.9 (39) | 16.6 (59) | 22.3 / 21.0 / 17.4 |
+| mlp3 13M | 0.60 (5) | 0.49 (5) | 0.35 (12) | 0.72 / 0.61 / 0.47 |
+| swe2d_step 1e6 | 0.73 (1) | - | 5.41 (9) | 0.80 / - / 5.52 |
+
+In the primal, STADE uses 1 to 15 launches and JAX uses 6 to 25. The kernel times are 3.5 against 14.7 ms for mpnn_gather, 0.14 against 0.62 ms for swe2d_step, 0.133 against 0.132 ms for mlp3 and 6.7 against 6.0 ms for the transformer.
+
+**Time outside the kernels (test 1, in part).** The bench time of a call minus its kernel time is small for both frameworks. Over the 8 primal and 8 adjoint (C) comparisons, it is between -1.7 and +0.12 ms for STADE and between -0.6 and +0.9 ms for JAX. For the calls shorter than 1 ms the difference is 0.01 to 0.12 ms for both. For the longer calls it is below 5 % of the call. (A negative value means that the kernels took longer in the profile run than in the benchmark.) At these sizes both frameworks are limited by device work, and the call overhead of STADE is not larger than the call overhead of JAX. This does not test the small cases, where the whole call lasts 0.02 to 0.1 ms. The host time during profiling is not usable for JAX: the trace of CUDA graphs makes it 1.1 to 35 times the bench time.
+
+**mpnn_gather (test 3).** The STADE adjoint is limited by device work and not by launches or host time: the kernels take 40.1 ms of a call of 39.7 ms. Three kernels (`b_3_p`, `b_4_p` and `b_5_p`) take 13.5, 15.1 and 8.5 ms, which is 92 % of the device time (92 % also for A). Each of them accumulates into arrays with atomic adds (the weight gradients go through shared memory first). A count of the global atomic adds in their source, for nn = 1e6, nm = nf = 16 and a mean in-degree of 6 (6e6 edges), gives:
+
+| kernel | global atomic adds per call (estimate) | ms | ms per 1e8 adds |
+|---|---:|---:|---:|
+| `b_3_p` | 5.1e8 | 13.5 | 2.6 |
+| `b_4_p` | 4.8e8 | 15.1 | 3.1 |
+| `b_5_p` | 2.6e8 | 8.5 | 3.3 |
+
+The time of the three kernels grows with the number of atomic adds (3.0 to 3.8e10 adds per second). In `b_3_p` and `b_5_p` all global adds, and in `b_4_p` four adds of five, go from 16 consecutive threads to the same address in the same step. A warp holds two such groups, so the warp-level pre-reduction of STADE (`__stade_wa_add!`, which needs all 32 lanes on one address) does not apply. The other two kernels (`b_1`, `b_2`) have no atomic in their source, and `ncu` shows 0 atomic instructions for them. These numbers fit the hypothesis that atomic adds limit the adjoint of mpnn_gather. They do not prove it: the counts come from the source and not from a counter, and the pre-reduction was read in the code and not measured. JAX uses 15.7 ms in cuBLAS kernels and 20.2 ms in 13 other kernels (scatter fusions), so its adjoint does the same accumulations in a different way and is 10 % faster in device time.
+
+**transformer_block (test 4).** The excess of STADE is device time, and launches do not cause it. STADE has fewer launches than JAX (41 against 59) and 1.44 times the kernel time with C (1.32 with A). Two parts make the difference:
+
+| adjoint | GEMM ms (launches) | other kernels ms (launches) |
+|---|---:|---:|
+| STADE C | 16.4 (13) | 7.5 (28) |
+| STADE A | 14.6 (12) | 7.3 (27) |
+| JAX | 14.3 (18) | 2.4 (41) |
+
+Both frameworks call the same cuBLAS routines (`volta_dgemm_*`). STADE spends 2.1 ms (C) or 0.3 ms (A) more in GEMMs than JAX. The larger part is in the kernels that STADE generates: 5.1 ms (C) and 4.9 ms (A) more than the other kernels of JAX. The three largest of them take 0.65 to 0.73 ms each (`b_6_t`, `b_17_f_t`, `b_19_a`). The primal shows the same split in a smaller form (other kernels 1.8 ms for STADE and 0.7 ms for JAX). The option A lowers the generated-kernel part only by 0.2 ms, so the transformer loss that remains with A is in these kernels. The checkpoint option was not tested.
+
+**swe2d_step 1e6 (test 5).** The JAX adjoint is slow because of device work. Its 9 kernels take 5.41 ms, and two fused kernels take 5.03 ms of them (2.84 and 2.20 ms). The bench time (5.52 ms) is almost the same, so the cost is not host time or launch count. The XLA kernels of the primal take 0.62 ms in total, so the adjoint costs 8.7 times the primal in JAX. STADE does the adjoint in one kernel of 0.73 ms (5.3 times the primal of 0.14 ms). The profile does not say why XLA builds these two kernels. The HLO of the program was not read.
+
+**mlp3 13M.** The STADE adjoint has 5 kernels and uses 0.60 ms (C) and 0.49 ms (A). JAX has 12 kernels and uses 0.35 ms. A weight matrix has 2048 x 2048 float64 values (33.5 MB), and one pass over it takes about 37 us at 900 GB/s. Most JAX kernels take 41 to 49 us, which is one pass. The three largest STADE kernels (`b_3`, `b_4` and `b_5`) take 190, 157 and 157 us with C and about 130 us each with A, which is 3.5 to 5 passes. This suggests that these kernels read or write the matrices more than once or access them badly. The profile does not show which, and `ncu` could not measure it.
+
+**What `ncu` could not do.** `ncu` failed on the STADE kernels in all attempts (jobs PROF3 to PROF9). Kernel replay ends with `LaunchFailed` for the second kernel of the range. Application replay records only the first 1 or 2 kernels of the range. The cause is not known. The details are in `results/profile_2026-11-27/README.md`.
+
 ## 5. Memory
 
 ### 5.1 Results
@@ -156,14 +198,14 @@ The driver gap is 0.42 for the primal (23 cases) and 0.45 for the adjoint with C
 
 | # | Question | Test | Cost |
 |---|---|---|---|
-| 1 | Does call overhead explain the small-case gaps? | Time each case with a loop of 20 calls inside one `jit` (JAX) and one launch sequence (STADE), or measure the launch overhead of an empty kernel in both. | One short job |
+| 1 | Does call overhead explain the small-case gaps? | Time each case with a loop of 20 calls inside one `jit` (JAX) and one launch sequence (STADE), or measure the launch overhead of an empty kernel in both. | Partly done (section 4.5). At the large sizes of the profile, the time outside the kernels is at most 0.12 ms for both. The small cases were not profiled. |
 | 2 | Which option makes C slower than A? | Done (job ABL1, section 4.3). `primal_outputs = false` gives most of the gain. `fresh_gradient` gives the rest for mlp3, mlp3_push and wave2d_step. | Done |
-| 3 | Do atomic adds limit mpnn_gather? | Profile the adjoint kernels with `nsys` or `ncu` (kernel time, atomic throughput). | One profiling job |
-| 4 | Why is the transformer adjoint 17 to 28 % slower? (The range covers A and C.) | Profile both adjoints and compare the time per kernel. Test the checkpoint option. | One profiling job |
-| 5 | Why is the JAX swe2d_step 1e6 adjoint slow relative to its primal? | The repeat FULLT2 reproduced it (5.517 and 5.516 ms), so it is not noise. Profile the XLA kernels of this case. | One profiling job |
+| 3 | Do atomic adds limit mpnn_gather? | Profile the adjoint kernels with `nsys` or `ncu` (kernel time, atomic throughput). | Partly done (section 4.5). Three kernels with atomic adds take 92 % of the device time, and their time follows the number of adds. `ncu` gave no counter, so the hypothesis is not proven. |
+| 4 | Why is the transformer adjoint 17 to 28 % slower? (The range covers A and C.) | Profile both adjoints and compare the time per kernel. Test the checkpoint option. | Profile done (section 4.5). The excess is device time: 5 ms in the kernels that STADE generates and 0.3 to 2 ms in GEMMs. The checkpoint option is not tested. |
+| 5 | Why is the JAX swe2d_step 1e6 adjoint slow relative to its primal? | The repeat FULLT2 reproduced it (5.517 and 5.516 ms), so it is not noise. Profile the XLA kernels of this case. | Profile done (section 4.5). Two fused XLA kernels take 5.0 of 5.4 ms. The reason that XLA builds them was not read from the HLO. |
 | 6 | How large is the noise? | Done (job FULLT2, section 2). | Done |
 
-Tests 2 and 6 are done. The remaining tests (1, 3, 4 and 5) look for causes. A decision about the default options of STADE belongs to the owner (section 8, item 7). A run on a second node or a second GPU would test the limit that FULLT2 leaves open.
+Tests 2 and 6 are done. Tests 3, 4 and 5 are profiled and locate the cost (section 4.5). Test 1 is done only for the large sizes. The tests that remain: `ncu` counters for the atomic kernels (the tool failed, section 4.5), the HLO of the JAX swe2d_step adjoint, a profile of the small cases and the checkpoint option for the transformer. A decision about the default options of STADE belongs to the owner (section 8, item 7). A run on a second node or a second GPU would test the limit that FULLT2 leaves open.
 
 ## 8. Conclusions
 
@@ -175,4 +217,5 @@ Tests 2 and 6 are done. The remaining tests (1, 3, 4 and 5) look for causes. A d
 6. The ablation (section 4.3) shows that `primal_outputs = false` gives most of the gain of config A. The gap to JAX on the 9 ablated kernels is 1.01 with the defaults and 0.81 with this option alone. `fresh_gradient` adds a gain for mlp3, mlp3_push and wave2d_step. Neither option changes unet2. The options change the transformer by at most 8 % and ufv_gather_step at 1e6 and 4e6 by at most 13 %.
 7. The options change the contract of the adjoint call (section 4.3). Whether they should be the default is a decision for the owner. The data show a gain of 24 % on average (geometric mean over 28 cases) if both are on.
 8. The repeat FULLT2 gives the same results as FULLT1 (section 2), so none of the conclusions above depends on noise in this node.
-9. The text claims no cause for the losses that remain after A. Section 7 lists the tests that would give one.
+9. The profile (section 4.5) locates the losses that remain after A, and it shows that device work causes them and not call overhead. In the transformer adjoint, STADE spends 5 ms more than JAX in the kernels that it generates, and 0.3 to 2 ms more in GEMMs. In the mpnn_gather adjoint, three kernels with atomic adds hold 92 % of the device time, and their time follows the number of adds. In the mlp3 13M adjoint, the three largest kernels take 3.5 to 5 times the time of one pass over a weight matrix.
+10. The profile gives no proof of a mechanism. `ncu` failed on the STADE kernels, so the atomic counts come from the source. The HLO of the JAX swe2d_step adjoint was not read, and the small cases were not profiled. Section 7 lists these tests.

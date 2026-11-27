@@ -1,0 +1,11 @@
+stade	C	mpnn_gather	bench_1e6	prof_primal,prof_adjoint,ncu_adjoint
+stade	A	mpnn_gather	bench_1e6	prof_adjoint
+stade	C	transformer_block	bench_d1024_T1024	prof_primal,prof_adjoint
+stade	A	transformer_block	bench_d1024_T1024	prof_adjoint
+stade	C	mlp3	bench_13M	prof_primal,prof_adjoint,ncu_adjoint
+stade	A	mlp3	bench_13M	prof_adjoint
+stade	C	swe2d_step	bench_1e6	prof_primal,prof_adjoint
+jax	J	mpnn_gather	bench_1e6	prof_primal,prof_adjoint
+jax	J	transformer_block	bench_d1024_T1024	prof_primal,prof_adjoint
+jax	J	mlp3	bench_13M	prof_primal,prof_adjoint
+jax	J	swe2d_step	bench_1e6	prof_primal,prof_adjoint
