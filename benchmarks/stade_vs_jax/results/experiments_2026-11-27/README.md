@@ -64,3 +64,67 @@ Reading (1e6):
 - The version without any of these adds and without the helper checks (Z) takes 22.6 ms. That is 57 % of the time of C. So the atomic adds and the checks around them cost 17.1 ms (43 %) of the 39.7 ms of C, and the half-warp reduction removes 5.7 ms of it.
 - Z is 3.7 ms faster than N (26.3 ms, job ATOM2). N keeps the helper calls and only removes the atomic add inside them. So the check of the helper in C (the full-warp test, which never succeeds in these kernels) costs about 3.7 ms by itself.
 - The test cannot separate the atomic add from the helper check inside S and R. The cause of the cost of the shared-memory adds was not measured. One possible cause is that an atomic add of a float64 on shared memory is slow on this GPU, which was not checked.
+
+## Gate of the warp helper, Part A (job GATE1)
+
+Job GATE1 (Slurm 2100933, one V100, 4356 s): the time phase of 8 kernels, run in the order C, G, C, G, C, G for each kernel. C = the scripts of the commit before v0.6.33 (helper on every atomic add of a named array). G = the scripts of v0.6.33 (`cgen_warp_gate`: the helper only where the index can be equal in the lanes of a warp). Both sets were generated from the same sources with `gen_stade_scripts.sh`, config C. The C scripts come from `git show HEAD~1:src/STADE.jl`, and the job records the commit of G (d94a8a5). All 48 runs ended with exit 0. Table made with `python3 tools/gate_report.py GATE1_time.json`. Times are the adjoint, median of the call, in ms. Files: `GATE1_time.json`, `GATE1_table.md`, `plan_gate1.tsv`, `versions_gate1.json`.
+
+Helper calls in the generated scripts (the three definitions included), C to G: euler2d_step 39 to 0, swe2d_step 18 to 0, mpnn_gather 58 to 32, transformer_block 90 to 51, mlp3_push 27 to 15, ufv_gather_step 9 to 6, unet2 101 to 91, mlp3 15 to 15 (unchanged). Over the corpus (adjoint and HVP) the count falls from 2168 to 1553.
+
+| kernel | size | C (ms) | G (ms) | change | spread of C |
+|---|---|---:|---:|---:|---:|
+| euler2d_step | 1e5 | 0.421 | 0.305 | -27.6 % | 0.1 % |
+| euler2d_step | 1e6 | 3.652 | 2.587 | -29.1 % | 0.1 % |
+| euler2d_step | 16e6 | 60.055 | 42.199 | -29.7 % | 0.0 % |
+| swe2d_step | 1e5 | 0.085 | 0.082 | -3.6 % | 1.2 % |
+| swe2d_step | 1e6 | 0.691 | 0.667 | -3.6 % | 0.0 % |
+| swe2d_step | 16e6 | 10.668 | 10.302 | -3.4 % | 0.0 % |
+| mpnn_gather | 1e5 | 4.034 | 4.015 | -0.5 % | 0.0 % |
+| mpnn_gather | 1e6 | 39.575 | 39.549 | -0.1 % | 0.0 % |
+| transformer_block | d1024_T1024 | 22.163 | 22.143 | -0.1 % | 0.1 % |
+| unet2 | c16_n256 | 13.150 | 13.145 | -0.0 % | 0.0 % |
+| mlp3_push, mlp3, ufv_gather_step | all | | | within +0.1 % | |
+
+The full table (every size, every run) is in `GATE1_table.md`.
+
+Reading:
+- The gate removes the helper from euler2d_step and swe2d_step completely, and euler2d_step is 28 to 30 % faster at every size. This is the case predicted by the JACC path (36 scatter sites, all with an index that differs in adjacent lanes).
+- mpnn_gather does not gain. The scope document expected up to 3.7 ms (9 %). The gate changed 26 of its 55 call sites and the 1e6 time moved by 0.03 ms. So the check cost of the experiment ATOM3 (3.7 ms) is most likely in the sites that the gate keeps (not measured per site): the sites whose index is the same in runs of lanes (class S) or anything else (class X). The sites of class D are cheap. This is the first measurement that says where the cost is, and it points at Part B (a group reduction for S and X sites).
+- transformer_block, unet2, mlp3, mlp3_push and ufv_gather_step do not change by more than the spread of C (the spread is 0.0 to 1.2 % for the sizes above 1e5). No case is slower.
+- Output: every run writes the same number of elements as the baseline run of its kernel, and the error against the CPU is below 1e-9 in all 48 runs (the check of the table, column "same output"). Bitwise equality is not testable on the device, because atomic adds land in any order. The bit-equality is shown by the structural test: with the calls replaced by plain atomics, the gated output equals the output of `warp_atomics = false` (`test/validate_warp_atomics.jl`, 1127 calls, 216 kernel plans).
+- Not done: the GPU corpus (`validate_corpus_gpu.jl`) on the V100. The 8 kernels of this job passed the verification of the time phase at the size `tiny` and at `bench_1e5`.
+
+| kernel | size | base runs (ms) | new runs (ms) | base med | new med | change | base spread | same output |
+|---|---|---|---|---|---|---|---|---|
+| swe2d_step | tiny | 0.024 0.022 0.023 | 0.020 0.019 0.021 | 0.023 | 0.020 | -9.1 % | 4.7 % | yes |
+| swe2d_step | bench_1e5 | 0.085 0.085 0.086 | 0.081 0.082 0.082 | 0.085 | 0.082 | -3.6 % | 1.2 % | yes |
+| swe2d_step | bench_1e6 | 0.691 0.691 0.691 | 0.667 0.670 0.667 | 0.691 | 0.667 | -3.6 % | 0.0 % | yes |
+| swe2d_step | bench_16e6 | 10.668 10.668 10.668 | 10.303 10.302 10.302 | 10.668 | 10.302 | -3.4 % | 0.0 % | yes |
+| euler2d_step | tiny | 0.037 0.038 0.039 | 0.034 0.035 0.034 | 0.038 | 0.034 | -10.9 % | 5.5 % | yes |
+| euler2d_step | bench_1e5 | 0.421 0.421 0.421 | 0.305 0.305 0.305 | 0.421 | 0.305 | -27.6 % | 0.1 % | yes |
+| euler2d_step | bench_1e6 | 3.650 3.654 3.652 | 2.587 2.588 2.587 | 3.652 | 2.587 | -29.1 % | 0.1 % | yes |
+| euler2d_step | bench_16e6 | 60.055 60.043 60.057 | 42.202 42.195 42.199 | 60.055 | 42.199 | -29.7 % | 0.0 % | yes |
+| ufv_gather_step | tiny | 0.011 0.011 0.012 | 0.012 0.012 0.011 | 0.011 | 0.012 | +8.5 % | 8.8 % | yes |
+| ufv_gather_step | bench_1e5 | 0.066 0.066 0.066 | 0.066 0.066 0.066 | 0.066 | 0.066 | -0.0 % | 0.0 % | yes |
+| ufv_gather_step | bench_1e6 | 1.483 1.483 1.484 | 1.483 1.485 1.484 | 1.483 | 1.484 | +0.1 % | 0.1 % | yes |
+| ufv_gather_step | bench_4e6 | 10.979 10.978 10.979 | 10.984 10.986 10.981 | 10.979 | 10.984 | +0.0 % | 0.0 % | yes |
+| mlp3 | tiny | 0.035 0.034 0.033 | 0.035 0.036 0.036 | 0.034 | 0.036 | +6.0 % | 6.0 % | yes |
+| mlp3 | bench_3M | 0.265 0.266 0.265 | 0.265 0.265 0.266 | 0.265 | 0.265 | +0.0 % | 0.4 % | yes |
+| mlp3 | bench_13M | 0.609 0.611 0.610 | 0.610 0.610 0.611 | 0.610 | 0.610 | +0.0 % | 0.3 % | yes |
+| mlp3 | bench_79M | 3.039 3.040 3.038 | 3.040 3.043 3.040 | 3.039 | 3.040 | +0.0 % | 0.1 % | yes |
+| mlp3_push | tiny | 0.081 0.082 0.084 | 0.082 0.082 0.080 | 0.082 | 0.082 | +0.0 % | 3.8 % | yes |
+| mlp3_push | bench_3M | 0.185 0.186 0.187 | 0.186 0.187 0.185 | 0.186 | 0.186 | +0.0 % | 1.1 % | yes |
+| mlp3_push | bench_13M | 0.572 0.573 0.573 | 0.574 0.573 0.571 | 0.573 | 0.573 | -0.0 % | 0.2 % | yes |
+| mlp3_push | bench_79M | 3.100 3.100 3.100 | 3.099 3.099 3.099 | 3.100 | 3.099 | -0.0 % | 0.0 % | yes |
+| mpnn_gather | tiny | 0.048 0.047 0.050 | 0.048 0.046 0.047 | 0.048 | 0.047 | -2.1 % | 6.6 % | yes |
+| mpnn_gather | bench_1e5 | 4.034 4.034 4.034 | 4.015 4.018 4.015 | 4.034 | 4.015 | -0.5 % | 0.0 % | yes |
+| mpnn_gather | bench_1e6 | 39.577 39.575 39.572 | 39.556 39.549 39.549 | 39.575 | 39.549 | -0.1 % | 0.0 % | yes |
+| transformer_block | tiny | 0.146 0.153 0.151 | 0.154 0.148 0.150 | 0.151 | 0.150 | -0.7 % | 4.2 % | yes |
+| transformer_block | bench_d512_T512 | 3.697 3.666 3.668 | 3.660 3.666 3.696 | 3.668 | 3.666 | -0.1 % | 0.8 % | yes |
+| transformer_block | bench_d1024_T1024 | 22.168 22.163 22.153 | 22.143 22.147 22.127 | 22.163 | 22.143 | -0.1 % | 0.1 % | yes |
+| transformer_block | bench_d2048_T1024 | 66.791 66.789 66.789 | 66.738 66.737 66.730 | 66.789 | 66.737 | -0.1 % | 0.0 % | yes |
+| unet2 | tiny | 0.393 0.391 0.392 | 0.391 0.390 0.388 | 0.392 | 0.390 | -0.5 % | 0.5 % | yes |
+| unet2 | bench_c16_n256 | 13.147 13.151 13.150 | 13.145 13.139 13.145 | 13.150 | 13.145 | -0.0 % | 0.0 % | yes |
+| unet2 | bench_c32_n128 | 7.887 7.888 7.889 | 7.890 7.890 7.886 | 7.888 | 7.890 | +0.0 % | 0.0 % | yes |
+| unet2 | bench_c64_n64 | 6.548 6.549 6.551 | 6.546 6.533 6.545 | 6.549 | 6.545 | -0.1 % | 0.0 % | yes |
+| unet2 | bench_c128_n32 | 7.031 7.033 7.034 | 7.016 7.016 7.016 | 7.033 | 7.016 | -0.3 % | 0.0 % | yes |

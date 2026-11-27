@@ -1,6 +1,6 @@
 # Scope: a proper `STADE.jl` change for the CUDA warp-atomic helper
 
-Status: scope only. Nothing in `src/STADE.jl` has been changed. This document says what to change, where, how to test it and what gain to expect. The numbers come from the experiments ATOM1, ATOM2 and ATOM3 in `README.md` of this folder (V100, float64, mpnn_gather adjoint).
+Status: Part A is done (v0.6.33) and measured in job GATE1, see `README.md` of this folder: euler2d_step -28 to -30 %, swe2d_step -3.5 %, mpnn_gather -0.1 %, no case slower. The expected gain for mpnn_gather in section 3 (up to 3.7 ms) did not appear: the check cost is in the sites of class S and X, which Part B treats. Part B is not started. Below is the scope as it was written, before Part A. This document says what to change, where, how to test it and what gain to expect. The numbers come from the experiments ATOM1, ATOM2 and ATOM3 in `README.md` of this folder (V100, float64, mpnn_gather adjoint).
 
 ## 1. Why
 
