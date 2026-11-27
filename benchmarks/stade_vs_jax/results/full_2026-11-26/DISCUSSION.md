@@ -49,7 +49,7 @@ A statement marked **Hypothesis** was not tested. The data fit the statement, an
 
 ### 4.1 Where STADE is faster
 
-- **Flow solvers.** swe2d_step runs at 0.15 to 0.42 of the JAX time (0.23 at 16e6). euler2d_step at 1e6 runs at 0.61 (0.55 with A). These are the largest wins at scale. After v0.6.33 (job GATE1 of `results/experiments_2026-11-27`) the euler2d_step adjoint is 28 to 30 % faster than the time in this job and swe2d_step 3.5 %. The tables of this report are not changed.
+- **Flow solvers.** swe2d_step runs at 0.15 to 0.42 of the JAX time (0.23 at 16e6). euler2d_step at 1e6 runs at 0.61 (0.55 with A). These are the largest wins at scale. After v0.6.33 (job GATE1 of `results/experiments_2026-11-27`) the euler2d_step adjoint is 28 to 30 % faster than the time in this job and swe2d_step 3.5 %. The tables of this report are not changed. After v0.6.36 the mpnn_gather adjoint at 1e6 takes 26.97 ms instead of 39.57 ms (job GATE2), 0.75 of the JAX time of the profile in section 4.5.
 - **Small stencil and scatter cases.** The gap is 0.2 to 0.6 at 1e5 for burgers2d_step, heat3d_step, wave2d_step, ufv_scatter_step and ufv_gather_step. Section 3 gives a possible part of the reason (dispatch cost).
 - **ufv_scatter_step at 4e6.** The gap is 0.61 with C and 0.39 with A.
 - **JAX swe2d_step at 1e6.** The JAX adjoint takes 5.5 ms, which is 8.1 times its primal. At 16e6 the JAX ratio is 5.4. The 1e6 ratio is out of line with the other sizes. The data give no cause. Check this case again before it appears in a text (section 7, test 5).

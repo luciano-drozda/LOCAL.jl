@@ -1,0 +1,20 @@
+{
+ "stade_commit": "875f67721012f85cd327f925307e3fa414f7d60b",
+ "stade_dirty": false,
+ "kit_hash": "b5e1f11470b4653f",
+ "built_utc": "2026-11-27T16:37:30Z",
+ "phases": [
+  "time",
+  "mem_primal",
+  "mem_adjoint"
+ ],
+ "kernels": [
+  "mlp3",
+  "mlp3_push",
+  "mpnn_gather",
+  "transformer_block",
+  "ufv_gather_step",
+  "unet2"
+ ],
+ "limit_min": 120
+}
