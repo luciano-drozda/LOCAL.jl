@@ -1,0 +1,15 @@
+{
+ "stade_commit": "7d89b5717558a9cd9ec2055ef8da5173a6593ca2",
+ "stade_dirty": true,
+ "kit_hash": "a627e9ea4b8d67a1",
+ "built_utc": "2026-11-27T09:57:10Z",
+ "phases": [
+  "time",
+  "mem_primal",
+  "mem_adjoint"
+ ],
+ "kernels": [
+  "mpnn_gather"
+ ],
+ "limit_min": 60
+}
