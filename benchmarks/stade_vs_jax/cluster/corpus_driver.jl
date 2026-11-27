@@ -19,7 +19,9 @@ function main()
     write(joinpath(dir, "b.tgz"), base64decode(TGZ))
     run(`tar xzf $(joinpath(dir, "b.tgz")) -C $dir`)
     tdir = joinpath(dir, "test")
-    code = "include(\"validate_corpus_gpu.jl\"); validate_corpus_gpu(\"val-corpus\"; $CALL)"
+    # The test file ends with a bare call validate_corpus_gpu() that runs the corpus with the defaults when the file is included.
+    # The mapexpr drops that call, so the corpus runs once, with CALL only (CORP1 to CORP3 ran the default run first, a duplicate).
+    code = "include(ex -> (ex isa Expr && ex.head === :call && ex.args[1] === :validate_corpus_gpu) ? :nothing : ex, \"validate_corpus_gpu.jl\"); validate_corpus_gpu(\"val-corpus\"; $CALL)"
     logf = joinpath(dir, "corpus.log")
     t0 = time()
     cmd = setenv(`timeout -k 30 $HARD_S $(Base.julia_cmd()) --project=$(Base.active_project()) -e $code`, merge(ENV, Dict("JULIA_PKG_OFFLINE" => "true")); dir = tdir)
