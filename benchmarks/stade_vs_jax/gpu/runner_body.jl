@@ -93,8 +93,10 @@ function _live_mb()
     ON_DEVICE || return nothing
     try return CUDA.used_memory() / 1e6 catch; return nothing end
 end
+# CUDA.reclaim() throws under the application replay of ncu: a failed reclaim only leaves the pool as it is
+_reclaim() = try CUDA.reclaim() catch; nothing end
 function _settle()
-    GC.gc(); ON_DEVICE && CUDA.reclaim(); GC.gc(); ON_DEVICE && CUDA.reclaim()
+    GC.gc(); ON_DEVICE && _reclaim(); GC.gc(); ON_DEVICE && _reclaim()
     nothing
 end
 _alloc_mb(f) = ON_DEVICE ? Base.invokelatest(Core.eval(@__MODULE__, Meta.parse("f -> CUDA.@allocated f()")), f) / 1e6 : nothing
@@ -260,7 +262,7 @@ for (label, verify) in (PHASE == "time" ? SIZES : ISPROF ? filter(x -> x[1] == _
         Dict{String,Any}("size" => label, "error" => first(sprint(showerror, err), 600))
     end
     push!(results, r)
-    GC.gc(); ON_DEVICE && CUDA.reclaim()
+    GC.gc(); ON_DEVICE && _reclaim()
 end
 out = Dict{String,Any}("kernel" => NAME, "backend" => string(BACKEND), "fuse" => FUSE, "host" => gethostname(), "phase" => PHASE,
                        "config" => get(ENV, "BENCH_CONFIG", ""), "versions" => _versions(),
