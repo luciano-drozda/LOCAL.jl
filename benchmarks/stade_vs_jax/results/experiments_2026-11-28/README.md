@@ -29,6 +29,23 @@ Reading:
 - **ufv_gather_step at 1e5 is +1.6 %**, which is one microsecond of 0.066 ms. The timer step is 1 microsecond. D is faster than O at 1e6 and 4e6 (-4.4 % and -3.3 %), as in FULLT3.
 - The gains of D against O for ufv_scatter_step and ufv_gather_step at 1e5 to 1e6 (3.3 to 6.1 %) are the gains of FULLT3 (3.6 to 7.1 %), now with three runs of each.
 
+## The fix for mlp3: block and grid fields are warp-uniform (STADE v0.6.46, job SCAT2, Slurm 2102388, 2939 s)
+
+The change of `cgen_warp_class` (v0.6.46): a launch field that every lane of a warp reads alike (`blockIdx`, `blockDim`, `gridDim` and `threadIdx().y`, `.z`) has class :U. `threadIdx().x` stays :X. The sites with such an index keep the full-warp helper, and a sum of such a field and the thread index is :D (plain atomic add). Tests: `test/validate_warp_atomics.jl` (nine new hand-written cases, two new sabotage cases: all fields uniform, no field uniform; 1127 calls in 216 kernel plans, all checks pass).
+
+Job SCAT2: D = the default code of v0.6.39 (the scripts of FULLT3), E = the default code of v0.6.46, O = the code of FULLT1 (for mlp3 only). Three runs of each in the order D, E (and O) for each kernel, repeated three times (27 runs, all with exit 0, `plan_scat2.tsv`). Helper calls in the generated scripts, D to E: mlp3 12 (6 add, 6 run) to 12 (all add), mlp3_push 12 run to 3 add and 9 run, transformer_block 48 to 38 (ten calls became plain atomic adds), unet2 88 to 86. All 12 runs of E (every kernel, every size) have the same count of elements written as D and a gradient error below 1e-9.
+
+| kernel | size | D (ms) | E (ms) | E against D | E against O | spread of the three runs of D |
+|---|---|---:|---:|---:|---:|---:|
+| mlp3 | 3M | 0.271 | 0.265 | -2.3 % | 0.0 % | 0.4 % |
+| mlp3 | 13M | 0.617 | 0.609 | -1.3 % | -0.2 % | 0.3 % |
+| mlp3 | 79M | 3.038 | 3.038 | 0.0 % | 0.0 % | 0.1 % |
+| mlp3_push | 3M, 13M, 79M | 0.185, 0.573, 3.099 | 0.185, 0.571, 3.099 | 0.0, -0.3, 0.0 % | | 0.0 to 0.6 % |
+| transformer_block | d512, d1024, d2048 | 3.661, 22.146, 66.735 | 3.661, 22.132, 66.734 | 0.0, -0.1, 0.0 % | | 0.0 to 0.1 % |
+| unet2 | c16, c32, c64, c128 | 13.159, 7.895, 6.549, 7.028 | 13.162, 7.896, 6.549, 7.027 | 0.0 % in all | | 0.0 to 0.1 % |
+
+Reading: the mlp3 slowdown is gone (E equals O within 0.2 %, the spread of the runs). The other three kernels do not change, also not transformer_block with its ten sites that left the run helper. The tiny sizes (0.03 to 0.5 ms) show the timer noise (up to 6 %) and are not a result.
+
 ## Where the time of the mpnn_gather adjoint goes (jobs MPNN1 and MPNN2)
 
 The adjoint of `mpnn_gather` at 1e6 takes 27.0 ms (config C of FULLT3 and of these jobs: 26.97 ms). The generated code has five kernels: `b_1` and `b_2` recompute the forward values (the node projections, the edge loop), `b_4_p` is the reverse edge loop, `b_3_p` and `b_5_p` are the reverse node update and the reverse node projection. Question: what is the cost of the 22.5 ms that remained in the earlier experiments (job ATOM3, `../experiments_2026-11-27/`)?
