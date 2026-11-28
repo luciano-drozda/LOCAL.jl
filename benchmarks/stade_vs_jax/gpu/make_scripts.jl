@@ -5,6 +5,7 @@
 # Environment:
 #   STADE_PO=0       generate the adjoint with primal_outputs = false
 #   STADE_FRESHKW=1  generate the adjoint with fresh_gradient = true
+#   STADE_WARPRUNS=0 generate with warp_runs = false (STADE v0.6.39 and later)
 #   STADE_RUNNER     path of the runner body, default gpu/runner_body.jl of this folder
 haskey(ENV, "STADE_SRC") || error("set STADE_SRC to the path of STADE.jl/src/STADE.jl")
 const PKG = normpath(joinpath(@__DIR__, ".."))
@@ -16,6 +17,8 @@ function gen_files(k, fuse, gendir)
     STADE.stade_adjoint_file(f, b; keep_push_pop = false, fuse_ii_loops = fuse, primal_outputs = get(ENV, "STADE_PO", "1") == "1")
     c = joinpath(gendir, "$(k).f$(Int(fuse)).b.cuda.jl")
     kg = haskey(ENV, "STADE_FRESHKW") ? (fresh_gradient = ENV["STADE_FRESHKW"] == "1",) : NamedTuple()
+    # only STADE v0.6.39 and later has the keyword
+    haskey(ENV, "STADE_WARPRUNS") && (kg = merge(kg, (warp_runs = ENV["STADE_WARPRUNS"] == "1",)))
     STADE.stade_cuda_file(b, c; kg...)
     return b, c
 end
