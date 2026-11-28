@@ -1,0 +1,13 @@
+stade	C	mpnn_gather	-	time
+stade	X16	mpnn_gather	-	time
+stade	C	mpnn_gather	-	time
+stade	G0	mpnn_gather	-	time
+stade	W0	mpnn_gather	-	time
+stade	Z0	mpnn_gather	-	time
+stade	C	mpnn_gather	-	time
+stade	X16	mpnn_gather	-	time
+stade	C	mpnn_gather	bench_1e6	prof_adjoint
+stade	X16	mpnn_gather	bench_1e6	prof_adjoint
+stade	G0	mpnn_gather	bench_1e6	prof_adjoint
+stade	W0	mpnn_gather	bench_1e6	prof_adjoint
+stade	Z0	mpnn_gather	bench_1e6	prof_adjoint

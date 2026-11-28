@@ -1,0 +1,13 @@
+{
+ "stade_commit": "868d9183326dc6622e8cd76056ce7a7851c7e38e",
+ "stade_dirty": false,
+ "kit_hash": "595be17830ec4b50",
+ "built_utc": "2026-11-28T03:03:52Z",
+ "phases": [
+  "time"
+ ],
+ "kernels": [
+  "mpnn_gather"
+ ],
+ "limit_min": 120
+}
