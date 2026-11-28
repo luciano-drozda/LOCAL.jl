@@ -121,15 +121,16 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
     gate_case("the sum of two lane-distinct values", "$W(A, __tid + mod(__tid, 7), v)", 0, 1, 0)
     gate_case("a scalar assigned twice, once from the thread index", "j = 1\nj = __tid\n$W(A, j, v)", 0, 1, 0)
     gate_case("the jam kernel index (a div part times a span plus a mod part)", "jb = div(__tid - 1, 32) * n + mod(__tid - 1, 32)\n$W(A, jb + 1, v)", 0, 0, 1)
-    # an index that mentions another launch intrinsic is never :D: that kernel keeps the helper
-    let k = gate_kernel("jx = threadIdx().y\n$W(A, jx, v)")
-        t = STADE.cgen_warp_gate(k, cuda)
-        check(ncallsof(t, wr) == 1 && ncallsof(t, wa) == 0, "gate: an index from threadIdx().y goes to the run helper, never plain")
-    end
-    let k = gate_kernel("for k = threadIdx().x:blockDim().x:n\n$W(A, k, v)\nend")
-        t = STADE.cgen_warp_gate(k, cuda)
-        check(ncallsof(t, wr) == 1 && ncallsof(t, wa) == 0, "gate: a block-strided loop variable goes to the run helper, never plain")
-    end
+    # launch intrinsics other than the thread index: a field that every lane of a warp reads alike is uniform (:U, the full-warp helper), the lane coordinate threadIdx().x is :X (the run helper)
+    gate_case("threadIdx().y (the rows of a 2-D block)", "jx = threadIdx().y\n$W(A, jx, v)", 1, 0, 0)
+    gate_case("threadIdx().z", "$W(A, threadIdx().z, v)", 1, 0, 0)
+    gate_case("blockIdx().x", "$W(A, blockIdx().x, v)", 1, 0, 0)
+    gate_case("a block-strided loop over the rows of a 2-D block", "ly = threadIdx().y\nfor i = 1 + (ly - 1):16:n\n$W(A, i, v)\nend", 1, 0, 0)
+    gate_case("threadIdx().x (the lane)", "$W(A, threadIdx().x, v)", 0, 1, 0)
+    gate_case("a block-strided loop over the lanes", "for k = threadIdx().x:blockDim().x:n\n$W(A, k, v)\nend", 0, 1, 0)
+    gate_case("a uniform field plus the thread index (lane-distinct)", "$W(A, threadIdx().y + __tid, v)", 0, 0, 1)
+    gate_case("a uniform field times a lane coordinate stays unknown", "$W(A, threadIdx().y * threadIdx().x, v)", 0, 1, 0)
+    gate_case("a call that is not a launch field", "$W(A, threadIdx(), v)", 0, 1, 0)
     # a kernel with no call, and a kernel list that loses its last call, lose the definitions
     let ks = Expr[gate_kernel("$W(A, __tid, v)")], hs = STADE.cgen_warp_helper_exprs()
         gk = Expr[STADE.cgen_warp_gate(k, cuda) for k in ks]
@@ -145,7 +146,9 @@ function validate_warp_atomics(dir::String = joinpath(@__DIR__, "val-corpus"); o
                 ("every index calls itself uniform", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :U\nend", ["idm_tile"]),
                 ("every index calls itself lane-distinct", "function cgen_warp_class(e, cls::Dict{Symbol,Symbol})\n    return :D\nend", ["idm_tile"]),
                 ("the run switch is ignored", "cgen_warp_runs_on(backend) = true", ["idm_tile"]),
-                ("the run switch is always off", "cgen_warp_runs_on(backend) = false", ["idm_tile"]))
+                ("the run switch is always off", "cgen_warp_runs_on(backend) = false", ["idm_tile"]),
+                ("every launch field calls itself uniform", "cgen_warp_thread_uniform_field(root::Symbol, fld) = true", ["idm_tile"]),
+                ("no launch field calls itself uniform", "cgen_warp_thread_uniform_field(root::Symbol, fld) = false", ["idm_tile"]))
             script = """
                 include($(repr(joinpath(@__DIR__, "validate_warp_atomics.jl"))))
                 Core.eval(STADE, Meta.parse($(repr(sabfn))))

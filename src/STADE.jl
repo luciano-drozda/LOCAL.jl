@@ -13032,13 +13032,30 @@ end
 # cost and the plain atomic runs anyway, so the gate turns those calls back into plain atomics and the result is bit-identical. It runs on the finished kernels, after every pass that
 # makes one (private, coarsened, split, serial, glue twins carry calls too). The analysis is the one of jgen_warp_classes with the CUDA thread variable `__tid` as the :D seed
 # (a pair to keep equal, test/validate_warp_atomics.jl compares them). Classes of a scalar: :U the same in every lane, :S constant on runs of lanes, :D different in adjacent lanes,
-# :X anything else. Only :D is dropped; a wrong class costs speed, never correctness, because the helper is exact for any index. A launch-index intrinsic other than `__tid` (a
-# 2-D kernel, a block-strided loop) is :X, so those kernels keep the helper.
+# :X anything else. Only :D is dropped; a wrong class costs speed, never correctness, because the helper is exact for any index. A launch-index intrinsic other than `__tid` is :U when
+# every lane of a warp reads it alike (the block and grid fields, threadIdx().y and .z: the rows of a 2-D block), and :X otherwise (threadIdx().x, a block-strided loop), so those keep the helper.
 cgen_warp_thread_syms() = (:threadIdx, :blockIdx, :blockDim, :gridDim, :workitemIdx, :workgroupIdx, :workgroupDim, :thread_position_in_grid)
 
+# what a warp reads alike: the block and grid coordinates and sizes, and the y and z coordinates of the thread (a launch has blockDim.x equal to a multiple of 32, so the lanes of a warp
+# share y and z). threadIdx().x is the lane. A misjudged field costs speed only, because the helper votes at run time that the lanes agree.
+cgen_warp_thread_uniform_field(root::Symbol, fld) =
+    root in (:blockIdx, :blockDim, :gridDim, :workgroupIdx, :workgroupDim) || (root in (:threadIdx, :workitemIdx) && fld in (:y, :z))
+
+# `threadIdx().y` and the like: :U for a field every lane reads alike, :X for the others, nothing for any other expression
+function cgen_warp_thread_leaf(e)
+    e isa Expr && e.head === :. && length(e.args) == 2 || return nothing
+    c = e.args[1]
+    (c isa Expr && c.head === :call && length(c.args) == 1 && c.args[1] in cgen_warp_thread_syms()) || return nothing
+    f = e.args[2]
+    f isa QuoteNode && (f = f.value)
+    return cgen_warp_thread_uniform_field(c.args[1], f) ? :U : :X
+end
+
+# true when a launch intrinsic occurs outside a field that every lane reads alike
 function cgen_warp_mentions_thread(e)
     e isa Symbol && return e in cgen_warp_thread_syms()
     e isa Expr || return false
+    cgen_warp_thread_leaf(e) === :U && return false
     return any(cgen_warp_mentions_thread, e.args)
 end
 
@@ -13046,6 +13063,7 @@ function cgen_warp_class(e, cls::Dict{Symbol,Symbol})
     e isa Number && return :U
     e isa Symbol && return get(cls, e, :U)
     e isa Expr || return :U
+    cgen_warp_thread_leaf(e) === :U && return :U
     cgen_warp_mentions_thread(e) && return :X
     if e.head === :ref
         c = cgen_warp_join([cgen_warp_class(a, cls) for a in e.args[2:end]])
