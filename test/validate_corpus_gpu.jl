@@ -45,6 +45,7 @@ include(joinpath(@__DIR__, "..", "src", "STADE.jl"))
 # `preamble` field and STADE.jgen_preamble() build for a remotely
 # submitted script. The `using`/`import` lines below are the live-
 # execution equivalent of that preamble text.
+using Random
 using CUDA
 import JACC
 JACC.@init_backend
@@ -392,6 +393,9 @@ function validate_corpus_gpu(dir::String = "val-corpus"; trials::Int = 3,
         # draws every integer from [0, 2] and leaves its baselines behind, and a GPU
         # run inheriting that draw executes no device code and reports a pass
         yp = STADE.io_gpu_yaml_path(path)
+        # one seed per kernel name: a run draws the same baselines every time, so a difference between two runs comes from the code and not from the draw
+        # (CORP4 drew u <= 0 for clamped_sumsq from the unseeded generator and reported four VACUOUS checks)
+        Random.seed!(STADE.val_stable_seed(name))
         # int_lo/int_hi reach the draw so a run can be forced past one warp. A race between
         # threads of the same warp is serialised by the hardware, so every integer argument a
         # corpus baseline draws by default (3 to 5) hides a lost-update race completely --

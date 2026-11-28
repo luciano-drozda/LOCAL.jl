@@ -18128,6 +18128,12 @@ function val_generate_baseline(kernel, primal_expr::Expr;
                     error("candidate baseline's observed primal output is identically zero -- " *
                           "nothing would be exercised, so every derivative check would pass vacuously")
                 end
+# The same hazard in a milder form: the output is not zero, but the primal wrote nothing new (clamped_sumsq with every u[i] <= 0 adds 0.0 to a
+# loss that starts nonzero). The device run then reports changed = 0 and VACUOUS, although the code under test is fine.
+                if y0 == x0
+                    error("candidate baseline is left unchanged by the primal -- " *
+                          "no array element or scalar result differs from its input, so every derivative check would pass vacuously")
+                end
                 if !(all(isfinite, y0) && maximum(abs.(y0); init = 0.0) <= max_output_magnitude)
                     cur_hi = max(1, div(cur_hi + 1, 2))
                     error("candidate baseline's own primal output is non-finite or too large " *
